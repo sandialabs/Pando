@@ -98,6 +98,7 @@ class ParDB : public PandoParticipant {
             sub(INSTALL_FILTER);
             sub(CLEAR_FILTERS);
             sub(EXPORT_DB);
+            sub(EXPORT_DB_WITH_TAG);
 
             if (skip_group_filters_) db_.disable_group_filters();
         }
@@ -176,6 +177,10 @@ class ParDB : public PandoParticipant {
                 recv_export_db(sock, data, end);
             else if (type == EXPORT_DB_BROADCAST)
                 recv_export_db_broadcast(sock, data, end);
+            else if (type == EXPORT_DB_WITH_TAG)
+                recv_export_db_with_tag(sock, data, end);
+            else if (type == EXPORT_DB_WITH_TAG_BROADCAST)
+                recv_export_db_with_tag_broadcast(sock, data, end);
             else if (type == IMPORT_DB)
                 recv_import_db(sock, data, end);
             else if (type == IMPORT_DB_DISTRIBUTE)
@@ -523,12 +528,11 @@ class ParDB : public PandoParticipant {
         void recv_export_db_with_tag_broadcast(zmq_socket_t sock, const char* data, const char* end) {
             string data_str {data, end};
 
-
             size_t msg_size = sizeof(msg_type_t) + data_str.size();
             char* msg = new char[msg_size];
             char* msg_ptr = msg;
 
-            pack_msg(msg_ptr, EXPORT_DB);
+            pack_msg(msg_ptr, EXPORT_DB_WITH_TAG);
             pack_string(msg_ptr, data_str);
 
             pub(msg, msg_size);
