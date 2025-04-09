@@ -304,6 +304,30 @@ class ParDBClient : ZMQChatterbox {
             req_.wait_ack();
         }
 
+        void export_db_with_tag(string dir, string tag) {
+            char sep = '|';
+            if (dir.find(sep) != string::npos || tag.find(sep) != string::npos) {
+                throw runtime_error("The character '|' is not allowed in export directory or tag");
+            }
+
+            string data = dir + sep + tag;
+
+            size_t msg_size = data.size() + sizeof(msg_type_t);
+            char* msg = new char[msg_size];
+            char* msg_ptr = msg;
+
+            pack_msg(msg_ptr, EXPORT_DB_WITH_TAG_BROADCAST);
+
+            strncpy(msg_ptr, data.c_str(), data.size());
+
+            // Send it to the ParDB
+            req_.send(msg, msg_size);
+
+            delete [] msg;
+
+            req_.wait_ack();
+        }
+
         /** @brief Instruct the par DB to stage_close (DEBUGGING) */
         void stage_close() {
             req_.send(STAGE_CLOSE);

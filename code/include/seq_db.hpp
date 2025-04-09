@@ -827,6 +827,19 @@ class SeqDB {
             serialize_entries(data_ptr);
         }
 
+        void export_db_with_tag(string export_fn, string tag) {
+            set<string> tags {tag};
+            auto keys = get_entry_by_tags(tags);
+
+            size_t ssize = serialize_size(keys);
+
+            pigo::WFile out_f {export_fn, ssize};
+
+            char* data_ptr = (char*)out_f.fp();
+
+            serialize_entries(data_ptr, keys);
+        }
+
         void import_db(string import_fn) {
             pigo::ROFile in_f {import_fn};
             const char* data_ptr = in_f.fp();

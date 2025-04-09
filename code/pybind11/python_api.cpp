@@ -111,6 +111,7 @@ PYBIND11_MODULE(PYBIND_MODULE_NAME, m) {
         .def("clear_filters", &ParDBClient::clear_filters)
         .def("installed_filters", &ParDBClient::installed_filters)
         .def("export_db", static_cast<void (ParDBClient::*)(string)>(&ParDBClient::export_db))
+        .def("export_db_with_tag", static_cast<void (ParDBClient::*)(string, string)>(&ParDBClient::export_db_with_tag))
         .def("import_db", static_cast<void (ParDBClient::*)(string)>(&ParDBClient::import_db))
         .def("add_entry", &ParDBClient::add_entry)
         .def("get_state", &ParDBClient::get_state)

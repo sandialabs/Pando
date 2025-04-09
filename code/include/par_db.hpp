@@ -520,6 +520,57 @@ class ParDB : public PandoParticipant {
             db_.export_db(dir + "/pando-export-" + addr_.get_addr_str());
         }
 
+        ///////////////////////////////////////////////////////////
+        void recv_export_db_with_tag_broadcast(zmq_socket_t sock, const char* data, const char* end) {
+            string data_str {data, end};
+
+
+            size_t msg_size = sizeof(msg_type_t) + data_str.size();
+            char* msg = new char[msg_size];
+            char* msg_ptr = msg;
+
+            pack_msg(msg_ptr, EXPORT_DB);
+            pack_string(msg_ptr, data_str);
+
+            pub(msg, msg_size);
+            // Also, send to ourselves
+            auto req = get_req(addr_.serialize());
+            req->send(msg, msg_size);
+
+            delete [] msg;
+
+            // If necessary, respond with an acknowledgement
+            if (ZMQRequester::is_reqrep_sock(sock))
+                ack(sock);
+        }
+
+        void recv_export_db_with_tag(zmq_socket_t sock, const char* data, const char* end) {
+            string data_str {data, end};
+
+            std::vector<std::string> data_vec;
+            boost::split(data_vec, data_str, boost::is_any_of("|"));
+            if (data_vec.size() != 2) {
+                cerr << "Received bad data for export_db_with_tag" << endl;
+                if (ZMQRequester::is_reqrep_sock(sock))
+                    ack(sock);
+                return;
+            }
+
+            string dir = data_vec[0];
+            string tag = data_vec[1];
+
+            export_db_with_tag(dir, tag);
+
+            // If necessary, respond with an acknowledgement
+            if (ZMQRequester::is_reqrep_sock(sock))
+                ack(sock);
+        }
+
+        void export_db_with_tag(string dir, string tag) {
+            db_.export_db(dir + "/pando-export-" + addr_.get_addr_str(), tag);
+        }
+        ///////////////////////////////////////////////////////////
+
         void recv_import_db_distribute([[maybe_unused]] zmq_socket_t sock, const char* data, const char* end) {
             string dir {data, end};
 
