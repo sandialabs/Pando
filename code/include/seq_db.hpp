@@ -829,7 +829,8 @@ class SeqDB {
 
         void export_db_with_tag(string export_fn, string tag) {
             set<string> tags {tag};
-            auto keys = get_entry_by_tags(tags);
+            set<dbkey_t> keys_set = get_entry_by_tags(tags);
+            vector<dbkey_t> keys(keys_set.begin(), keys_set.end());
 
             size_t ssize = serialize_size(keys);
 

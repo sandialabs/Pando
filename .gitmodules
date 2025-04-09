@@ -1,6 +1,6 @@
 [submodule "thirdparty/rapidjson"]
 	path = code/thirdparty/rapidjson
-	url = ../rapidjson.git
+	url = https://github.com/Tencent/rapidjson.git
 [submodule "thirdparty/abseil-cpp"]
 	path = code/thirdparty/abseil-cpp
 	url = https://github.com/abseil/abseil-cpp

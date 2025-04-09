@@ -1054,6 +1054,33 @@ TEST(import_export) {
     TEST_PASS
 }
 
+TEST(import_export_with_tag) {
+    const string fn = "exported";
+    dbkey_t set_key {1,2,3};
+    {
+        SeqDB db { data_dir+"/simple_bitcoin.txt" };
+
+        DBEntry<> e; e.add_tag("a", "b").value() = "res "; e.set_key(set_key); db.add_entry(move(e));
+        // Ensure the number of entries is correct
+        EQ(db.size(), 3);
+
+        db.export_db_with_tag(fn, "a");
+    }
+
+    SeqDB db2;
+    db2.import_db(fn);
+
+    EQ(db2.size(), 1);
+
+    auto keys = db2.keys();
+    dbkey_t single_key = *keys.begin();
+    EQ(single_key, set_key);
+
+    remove(fn.c_str());
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1090,6 +1117,7 @@ TESTS_BEGIN
     RUN_TEST(random_key_stage_close)
     RUN_TEST(serialize_entries)
     RUN_TEST(import_export)
+    RUN_TEST(import_export_with_tag)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END

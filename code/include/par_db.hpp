@@ -520,7 +520,6 @@ class ParDB : public PandoParticipant {
             db_.export_db(dir + "/pando-export-" + addr_.get_addr_str());
         }
 
-        ///////////////////////////////////////////////////////////
         void recv_export_db_with_tag_broadcast(zmq_socket_t sock, const char* data, const char* end) {
             string data_str {data, end};
 
@@ -567,9 +566,8 @@ class ParDB : public PandoParticipant {
         }
 
         void export_db_with_tag(string dir, string tag) {
-            db_.export_db(dir + "/pando-export-" + addr_.get_addr_str(), tag);
+            db_.export_db_with_tag(dir + "/pando-export-" + addr_.get_addr_str(), tag);
         }
-        ///////////////////////////////////////////////////////////
 
         void recv_import_db_distribute([[maybe_unused]] zmq_socket_t sock, const char* data, const char* end) {
             string dir {data, end};
