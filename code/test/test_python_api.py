@@ -357,6 +357,58 @@ class Test():
         pardb_proc5.kill()
         pardb_proc6.kill()
 
+    def test_import_export_with_tag(self):
+        d = "export_with_tag"
+
+        # Make sure the directory didn't exist beforehand
+        shutil.rmtree(d, ignore_errors=True)
+
+        client1 = pando.ParDBClient(self.db1_addr)
+        client2 = pando.ParDBClient(self.db2_addr)
+        assert client1.db_size() + client2.db_size() == 0
+        client1.add_db_file(btc_path)
+        time.sleep(0.2)
+        assert client1.db_size() + client2.db_size() == 2
+        os.mkdir(d)
+        client1.export_db_with_tag(d, 'block')
+        time.sleep(0.5)
+
+        fns = glob(f"{d}/*")
+        assert len(fns) == 2
+
+        self.pardb_proc1.kill()
+        self.pardb_proc2.kill()
+
+        # Now create a new mesh and test importing there
+        db3_addr = "127.0.0.1,7"
+        db4_addr = "127.0.0.1,10"
+        pardb_proc3 = Popen([os.path.join(tests_bin_dir, "../src/pando_pardb"), db3_addr, db3_addr])
+        pardb_proc4 = Popen([os.path.join(tests_bin_dir, "../src/pando_pardb"), db4_addr, db3_addr])
+        
+        client3 = pando.ParDBClient(db3_addr)
+        client4 = pando.ParDBClient(db4_addr)
+
+        while len(client3.neighbors()) < 2:
+            time.sleep(0.05)
+        while len(client4.neighbors()) < 2:
+            time.sleep(0.05)
+
+        assert len(client3.neighbors()) == 2
+        assert len(client4.neighbors()) == 2
+        assert client3.db_size() + client4.db_size() == 0
+
+        client3.import_db(d)
+        time.sleep(0.5)
+
+        assert client3.db_size() + client4.db_size() == 2
+
+        # Kill the pardbs
+        pardb_proc3.kill()
+        pardb_proc4.kill()
+
+
+        # Clean up the exported directory
+        shutil.rmtree(d)
 
     def test_add_entry(self):
         client1 = pando.ParDBClient(self.db1_addr)
