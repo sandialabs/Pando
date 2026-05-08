@@ -10,14 +10,21 @@ using namespace pando;
 static const char* filter_name = "@filter_name@";
 static const char* cython_fail_tag = "@filter_name@" ":cython_fail";
 
+static void ensure_python_module_initialized() {
+    PyObject* sys_modules = PyImport_GetModuleDict();
+    if (sys_modules != NULL && PyDict_GetItemString(sys_modules, filter_name) != NULL) {
+        return;
+    }
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    PyInit_@filter_name@();
+    #pragma GCC diagnostic pop
+}
+
 // Fit the Pando API
 extern "C" {
     void run_(const DBAccess *access) {
-        // Import the module
-        #pragma GCC diagnostic push
-        #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-        PyInit_@filter_name@();
-        #pragma GCC diagnostic pop
+        ensure_python_module_initialized();
         
         PyObject* pmodule = PyImport_ImportModule(filter_name);
         if (!pmodule) {
@@ -42,10 +49,7 @@ extern "C" {
     }
 
     extern bool should_run(const DBAccess* access) {
-        #pragma GCC diagnostic push
-        #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-        PyInit_@filter_name@();
-        #pragma GCC diagnostic pop
+        ensure_python_module_initialized();
         PyObject* pmodule = PyImport_ImportModule(filter_name);
         
         // Here we avoid the infinite loop by checking to see if the cython code crashed in some way and return false if it has
