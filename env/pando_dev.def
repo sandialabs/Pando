@@ -1,0 +1,14 @@
+Bootstrap: docker
+From: alpine:3.18
+
+%files
+    env/requirements_build.txt /requirements_build.txt
+
+%post
+    apk add build-base boost boost-dev cmake python3-dev py3-pybind11 py3-pybind11-dev py3-pip zeromq zeromq-dev gdb ncurses-dev valgrind git git-lfs curl cargo rustfmt
+    python3 -m pip install --break-system-packages -r /requirements_build.txt
+    mkdir -p /scratch && chmod 1777 /scratch
+
+%environment
+    export SHELL=/bin/sh
+    export pybind11_DIR=/usr/lib/python3.11/site-packages/pybind11/share/cmake/pybind11
