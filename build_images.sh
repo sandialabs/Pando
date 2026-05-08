@@ -6,11 +6,17 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 pushd "${SOURCE_DIR}"
 
 function build_sif() {
+    SCRATCH_DIR="${SCRATCH_DIR:-/scratch}"
+    if [ ! -d "$SCRATCH_DIR" ] || [ ! -w "$SCRATCH_DIR" ]; then
+        echo "ERROR: SCRATCH_DIR='$SCRATCH_DIR' is not a writable directory" >&2
+        exit 1
+    fi
+
     build_im "$@"
     mkdir -p sifs
     rm -vf sifs/$1.sif
     "$P" image save -o $1.tar $1
-    singularity build sifs/$1.sif "docker-archive://$PWD/$1.tar"
+    singularity build --bind "$SCRATCH_DIR:/scratch" sifs/$1.sif "docker-archive://$PWD/$1.tar"
     rm -v $1.tar
 }
 
