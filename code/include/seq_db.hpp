@@ -246,7 +246,6 @@ class SeqDB {
         }
 
         ~SeqDB() {
-            Py_FinalizeEx();
         }
 
         /** @brief Build a SeqDB from an input file with a DB size */
