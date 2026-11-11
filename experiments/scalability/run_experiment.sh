@@ -1,20 +1,27 @@
 #!/bin/bash
 
-if [[ $# -ne 5 ]]; then
-  echo "Usage: $0 EXPERIMENT_NAME FILTER_LIST_IN_TXT_FILE DATA_DIR RESULTS_DIR NODE_COUNT"
-  echo "Ex: $0 shuffle_scalability filters/shuffle.txt /cscratch/btc-export results 8"
-  exit 1
-fi
+# if [[ $# -ne 5 ]]; then
+#   echo "Usage: $0 EXPERIMENT_NAME FILTER_LIST_IN_TXT_FILE DATA_DIR RESULTS_DIR NODE_COUNT"
+#   echo "Ex: $0 shuffle_scalability filters/shuffle.txt /cscratch/btc-export results 8"
+#   exit 1
+# fi
 
-TEST_NAME=$1
-FILTERS=$2
-DATA_DIR=$3
-RESULTS_DIR=$4
-NODE_COUNT=$5
+TEST_NAME="kmer_inv_idx"
+# FILTERS="filters/dagify.txt"
+FILTERS="filters/kmer_index_frag.txt"
+# DATA_DIR="/cscratch/eth-pre-dag-full/"
+# DATA_DIR="/cscratch/fastq/pando/pando"
+# DATA_DIR="/cscratch/pando-few"
+DATA_DIR="/cscratch/pando-one"
+RESULTS_DIR="/cscratch/results/"
+NODE_COUNT=8
 
-# Get the count of available idle processing nodes in the specified partition
-AVAILABLE_NODE_COUNT=$(sinfo -N -p compute | grep idle | awk '{print $1}' | wc -l)
-AVAILABLE_NODES=$(sinfo -N -p compute | grep idle | awk '{print $1}')
+mkdir -p "$RESULTS_DIR"
+touch "$RESULTS_DIR/$TEST_NAME.csv"
+
+AVAILABLE_NODE_COUNT=$(sinfo -N -p compute | grep idle | awk '{print $1}' | wc -l) 
+AVAILABLE_NODES=$(sinfo -N -p compute | grep idle | awk '{print $1}')              
+
 # Check if available nodes are less than requested nodes
 if [ "$AVAILABLE_NODE_COUNT" -lt "$NODE_COUNT" ]; then
     echo "Error: Requested $NODE_COUNT nodes when only $AVAILABLE_NODE_COUNT nodes are available."
@@ -35,7 +42,7 @@ fi
 
 
 # Submit batch job
-SLURM_OUTPUT=$(sbatch -N "$NODE_COUNT" --mem 490000 pardb.sbatch)
+SLURM_OUTPUT=$(sbatch -N "$NODE_COUNT" --mem 360000 pardb.sbatch)
 JOB_ID=$(echo "$SLURM_OUTPUT" | awk '{print $4}')
 echo "Batch job submitted with $NODE_COUNT nodes. Job ID: $JOB_ID"
 
@@ -50,7 +57,9 @@ MESH="${IP_ADDRESS},0"
 echo "MESH: $MESH"
 
 echo "Beginning Experiment..."
-./../../src/sifs/pando_python.sif python3 par-script.py -n $TEST_NAME -m $MESH -f $FILTERS -d $DATA_DIR -r $RESULTS_DIR
+echo "Params: $TEST_NAME $MESH $FILTERS $DATA_DIR $RESULTS_DIR"
+# singularity run -B /cscratch -B /scratch ./../../src/sifs/pando_python.sif python3 dagify-script.py -n $TEST_NAME -m $MESH -f $FILTERS -d $DATA_DIR -r $RESULTS_DIR
+singularity run -B /cscratch -B /scratch ./../../src/sifs/pando_python.sif python3 eth-tx-val.py -n $TEST_NAME -m $MESH -f $FILTERS -d $DATA_DIR -r $RESULTS_DIR
 
 echo "Experiment Complete"
 echo "Canceling Job $JOB_ID"

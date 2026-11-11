@@ -21,6 +21,7 @@ SCRIPT_PATH=$(scontrol show job $SLURM_JOBID | awk -F= '/Command=/{print $2}')
 SCRIPT_DIR=$(dirname $SCRIPT_PATH)
 PANDO_PARDB_BIN=$SCRIPT_DIR/../sifs/pando_pardb.sif
 
+echo $ip
 PANDO_BIND_IP_FILE=/ip
 
 echo START

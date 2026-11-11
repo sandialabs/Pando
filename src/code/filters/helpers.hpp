@@ -10,6 +10,8 @@
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/error/en.h"
+#include <cstdint>
+#include <utility>
 
 using namespace std;
 
@@ -105,6 +107,27 @@ int nucleotide_to_bits(char nucleotide)
     }
 }
 
+#define KMER_INDEX_NAMESPACE ((uint32_t)(KMER_INDEX << 28))
+#define KMER_INDEX_A_MASK ((uint32_t)((KMER_INDEX << 28) - 1))
+#define LOW_16_BITS_MASK ((uint32_t)((1u << 16) - 1))
+#define LOW_32_BITS_MASK ((uint64_t)((1ull << 32) - 1))
+
+dbkey_t make_kmer_index_key(uint64_t encoded_kmer)
+{
+    uint32_t high30 = static_cast<uint32_t>((encoded_kmer >> 32) & KMER_INDEX_A_MASK);
+    uint32_t low32 = static_cast<uint32_t>(encoded_kmer & LOW_32_BITS_MASK);
+
+    return {
+        static_cast<uint32_t>(KMER_INDEX_NAMESPACE | high30),
+        static_cast<uint16_t>((low32 >> 16) & LOW_16_BITS_MASK),
+        static_cast<uint16_t>(low32 & LOW_16_BITS_MASK)
+    };
+}
+
+dbkey_t make_32bit_table_key(uint32_t table_id, uint32_t key) {
+    return {table_id, static_cast<uint16_t>((key >> 16) & 0xFFFFu), static_cast<uint16_t>(key & 0xFFFFu)};
+}
+
 long long sequence_to_bits(const string & sequence)
 {
     long long bit_representation = 0;
@@ -118,4 +141,19 @@ long long sequence_to_bits(const string & sequence)
     }
 
     return bit_representation;
+}
+
+
+std::pair<uint16_t, uint16_t> roaring_key_value(uint32_t x)
+{
+    uint16_t key   = static_cast<uint16_t>(x >> 16);
+    uint16_t value = static_cast<uint16_t>(x & 0xFFFF);
+
+    return {key, value};
+}
+
+uint32_t roaring_from_key_value(uint16_t key, uint16_t value)
+{
+    return (static_cast<uint32_t>(key) << 16) |
+           static_cast<uint32_t>(value);
 }

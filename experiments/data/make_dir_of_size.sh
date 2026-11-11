@@ -1,9 +1,11 @@
 #!/bin/bash
 
-s=$1 # size in gb
+s=$3 # size in gb
+DIRECTORY=$1
+OUT_DIR=$2
 
 # Directory containing the files
-DIRECTORY="product_engagement_dataset/pando_files"
+# DIRECTORY="/cscratch/product_engagement_dataset/pando"
 # Target size in bytes (200 GB)
 TARGET_SIZE=$(($s * 1024 * 1024 * 1024))
 
@@ -31,7 +33,7 @@ done
 
 # Output the selected files and their total size
 echo "Selected files (total size: $total_size bytes):"
-out_dir="${s}G"
+out_dir="$OUT_DIR/${s}G"
 mkdir "$out_dir"
 for file in "${selected_files[@]}"; do
     echo "$file"

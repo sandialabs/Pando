@@ -69,11 +69,17 @@ def import_db_blocking(client, path):
             num_entries += num_entries_in_file
 
     initial_db_size = db_size_total(client)
+
+    print("Initial_db_size:", initial_db_size)
+    print("num_entries:", num_entries)
+
     expected_db_size = initial_db_size + num_entries
+    print("expected:", expected_db_size)
 
     client.import_db(path)
 
     time.sleep(2)
+
 
     while db_size_total(client) != expected_db_size:
         time.sleep(10)

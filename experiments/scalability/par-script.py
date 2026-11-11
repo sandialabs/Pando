@@ -4,6 +4,8 @@ import sys
 import os
 import argparse
 import time
+# import subprocess
+
 # Argument Parser
 parser = argparse.ArgumentParser(description="")
 parser.add_argument("-r", "--results_dir", type=str, required=False, help="Path to directory where to save results")
@@ -30,21 +32,6 @@ def wait_for_stable_mesh(client):
             break
         else:
             num_neighbors = n_t
-time.sleep(10)
-
-import pando
-client = pando.ParDBClient(MESH)
-print("Started Client with Mesh:", MESH)
-print("\tWaiting for mesh to be stable...")
-wait_for_stable_mesh(client)
-print("\tAdding Filter Directory")
-client.add_filter_dir('/ascldap/users/grgill/MaxReduce/src/code/build/filters')
-# client.add_filter_dir("/filters")
-print("\tBegin Data Import")
-client.import_db(DATA_DIR)
-print("\t\tWaiting for 5 seconds...")
-time.sleep(5)
-print("\t\tBeginning Import Loop")
 
 def wait_for_stable_db(client):
     while True:
@@ -55,8 +42,40 @@ def wait_for_stable_db(client):
             print("\t\tBreaking out")
             break
 
-wait_for_stable_db(client)
+time.sleep(10)
+
+import pando
+client = pando.ParDBClient(MESH)
+
+print("Started Client with Mesh:", MESH)
+print("\tWaiting for mesh to be stable...")
+wait_for_stable_mesh(client)
+
+print("\tAdding Filter Directory")
+client.add_filter_dir('/ascldap/users/grgill/bqs/src/code/build/filters')
+
+print("\tBegin Data Import")
+
+for filename in os.listdir(DATA_DIR):
+    filepath = os.path.join(DATA_DIR, filename)
+    if os.path.isfile(filepath):
+        client.add_db_file(filepath)
+
+# pando.import_db_blocking(client, "/cscratch/longread/")
+
+print("\t\tWaiting for 5 seconds...")
+time.sleep(5)
+print("\t\tBeginning Import Loop")
+
+# wait_for_stable_db(client)
+
 print("\tData Imported")
+
+# print("\tExporting data...")
+# client.export_db("/cscratch/longread/")
+
+wait_for_stable_db(client)
+
 print("\tInstalling Filters from", FILTER_FILE)
 # Install all filters
 with open(FILTER_FILE, "r") as readable:
@@ -83,7 +102,7 @@ time.sleep(1)
 while client.processing():
     time.sleep(10) 
 end = timer()
-time_taken = str(end-start)
+time_taken = str(end - start)
 print("\tEnd Data Processing: ", time_taken)
 # Save results
 filename = os.path.join(RESULTS_DIR, TEST_NAME) + ".csv" 

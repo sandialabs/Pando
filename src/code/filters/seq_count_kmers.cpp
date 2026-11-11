@@ -21,7 +21,6 @@ void fail_(const DBAccess *access, const char* filter_fail_tag, const char* filt
 }
 
 void seq_count_kmers(const DBAccess *access, const char* filter_fail_tag, const char* filter_done_tag) {
-    
     // Create new DB entries for each transaction
     string val = string(access->value);
     val.erase(std::remove_if(val.begin(), val.end(), [](unsigned char c) { return std::isspace(c); }), val.end());
@@ -29,6 +28,7 @@ void seq_count_kmers(const DBAccess *access, const char* filter_fail_tag, const 
     if (val.empty())
     {
         access->add_tag.run(&access->add_tag, filter_fail_tag);
+        return;
     }
     unordered_map<string, int> kmer_counts;
     for (size_t i = 0; i <= val.length() - K; ++i)
@@ -38,7 +38,7 @@ void seq_count_kmers(const DBAccess *access, const char* filter_fail_tag, const 
     }
     long long b_key;
     dbkey_t new_key;
-    const char * new_value;
+    string new_value;
     for (const auto& pair : kmer_counts)
     {   
         try
@@ -58,8 +58,8 @@ void seq_count_kmers(const DBAccess *access, const char* filter_fail_tag, const 
             return;
         }
         new_key = {KMER_COUNTS, b_key, 0};
-        new_value = to_string(pair.second).c_str();
-        access->make_new_entry.run(&access->make_new_entry, new_tags, new_value, new_key);
+        new_value = to_string(pair.second);
+        access->make_new_entry.run(&access->make_new_entry, new_tags, new_value.c_str(), new_key);
     }
 
     // Add a tag indicating parsing was successful

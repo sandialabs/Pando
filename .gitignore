@@ -275,3 +275,14 @@ tags
 # End of https://www.toptal.com/developers/gitignore/api/rust,c++,cmake,vim,macos
 
 __pycache__
+experiments/baseline/spark/spark-*-bin-*/
+experiments/baseline/spark/results/
+experiments/baseline/spark/spark.bak/
+experiments/baseline/hadoop/results/output/
+**/build/
+*.class
+*.jar
+*.log
+*.bak*
+tmp.txt
+.snakemake/
