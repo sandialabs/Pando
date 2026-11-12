@@ -39,45 +39,37 @@ cdef inline list get_tags(const DBAccess* access):
     return decoded_tags
 
 
-cdef inline void _fill_tags(char** c_tags, list py_tags, int limit):
-    """
-      Function:
-          _fill_tags
+cdef inline list _fill_tags(char** c_tags, list py_tags, int limit):
+    cdef int i
+    cdef list local_tags
+    cdef list new_tags_store
 
-      Description:
-          Fills a char** object for the purposes of make_new_entry using a python list.
+    for i in range(limit):
+        c_tags[i] = NULL
 
-      Parameters:
-          c_tags  (char**)    : The array of char* that is limited to the size passed in as limit
-          py_tags (list[str]) : A python list of python strings that contain the tags intended to be added to access
-          limit   (int)       : An integer limit that is the maximum length of c_tags
+    local_tags = list(py_tags)
 
-      Calls:
-          None
-
-      Modifies:
-          c_tags
-
-      Returns:
-          void
-    """
-    if py_tags[-1] != '\0' and py_tags[-1] != "":
-        py_tags.append('\0')
-    if len(py_tags) > limit:
-        print("ERROR: BUFFER OVERFLOW IN MAKE NEW ENTRY. TAG COUNT EXPECTED <", limit, "RECEIVED", len(py_tags), flush=True)
+    if len(local_tags) >= limit:
+        print("ERROR: BUFFER OVERFLOW IN MAKE NEW ENTRY. TAG COUNT EXPECTED <", limit, "RECEIVED", len(local_tags), flush=True)
         print("Only applying first", limit - 1, "tags. Use a higher-bounds function if a larger number of tags is needed.")
-        py_tags[limit] = '\0'
-    new_tags_store = [make_tag(tag) for tag in py_tags]
+        local_tags = local_tags[:limit - 1]
+
+    local_tags.append("")
+
+    new_tags_store = [make_tag(tag) for tag in local_tags]
+
     for i, tag in enumerate(new_tags_store):
-        if i >= limit:  # Check to avoid exceeding the fixed size of new_tags
+        if i >= limit:
             break
         c_tags[i] = <char*>tag
+
+    return new_tags_store
 
 
 cdef inline void make_new_entry_lt_3_tags(const DBAccess* access, list tags, object value, dbkey_t new_key):
     limit = 3
     cdef char* new_tags[3]  # Has to be manually declared, can't use 'limit'
-    _fill_tags(new_tags, tags, limit)
+    new_tags_store = _fill_tags(new_tags, tags, limit)
     new_value = make_value(value)
     access.make_new_entry.run(&access.make_new_entry, new_tags, new_value, <dbkey_t>new_key)
 
@@ -107,7 +99,7 @@ cdef inline void make_new_entry_lt_10_tags(const DBAccess* access, list tags, ob
     """
     limit = 10
     cdef char* new_tags[10]  # Has to be manually declared, can't use 'limit'
-    _fill_tags(new_tags, tags, limit)
+    new_tags_store = _fill_tags(new_tags, tags, limit)
     new_value = make_value(value)
     access.make_new_entry.run(&access.make_new_entry, new_tags, new_value, <dbkey_t>new_key)
 
@@ -138,7 +130,7 @@ cdef inline void make_new_entry_lt_25_tags(const DBAccess* access, list tags, ob
     """
     limit = 25
     cdef char* new_tags[25]  # Has to be manually declared, can't use 'limit'
-    _fill_tags(new_tags, tags, limit) 
+    new_tags_store = _fill_tags(new_tags, tags, limit) 
     new_value = make_value(value)
     access.make_new_entry.run(&access.make_new_entry, new_tags, new_value, <dbkey_t>new_key)
 
@@ -169,7 +161,7 @@ cdef inline void make_new_entry_lt_50_tags(const DBAccess* access, list tags, ob
     """
     limit = 50
     cdef char* new_tags[50]  # Has to be manually declared, can't use 'limit'
-    _fill_tags(new_tags, tags, limit)    
+    new_tags_store = _fill_tags(new_tags, tags, limit)    
     new_value = make_value(value)
     access.make_new_entry.run(&access.make_new_entry, new_tags, new_value, <dbkey_t>new_key)
 
