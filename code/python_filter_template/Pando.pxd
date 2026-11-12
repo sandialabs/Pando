@@ -47,7 +47,8 @@ cdef inline list _fill_tags(char** c_tags, list py_tags, int limit):
       Description:
           Fills a char** object for the purposes of make_new_entry using a python list.
           The input list is copied, not modified. All slots of c_tags are first set to NULL,
-          and the tags are terminated with an empty string. If limit or more tags are given,
+          and the tags are terminated with an empty string. Trailing terminators already in
+          py_tags (empty strings or a single NUL character, as str or bytes) are ignored. If limit or more tags remain,
           only the first limit - 1 are used so the terminator still fits.
 
           c_tags only holds pointers into the bytes objects in the returned list; nothing is
@@ -69,26 +70,27 @@ cdef inline list _fill_tags(char** c_tags, list py_tags, int limit):
           list[bytes] : The encoded tags that c_tags points into. Must be kept alive while c_tags is in use.
     """
     cdef int i
-    cdef list local_tags
+    cdef Py_ssize_t tag_count
     cdef list new_tags_store
 
     for i in range(limit):
         c_tags[i] = NULL
 
-    local_tags = list(py_tags)
+    # Ignore any terminator the caller already supplied; one is always appended below.
+    tag_count = len(py_tags)
+    while tag_count > 0 and py_tags[tag_count - 1] in ("", "\0", b"", b"\0"):
+        tag_count -= 1
 
-    if len(local_tags) >= limit:
-        print("ERROR: BUFFER OVERFLOW IN MAKE NEW ENTRY. TAG COUNT EXPECTED <", limit, "RECEIVED", len(local_tags), flush=True)
-        print("Only applying first", limit - 1, "tags. Use a higher-bounds function if a larger number of tags is needed.")
-        local_tags = local_tags[:limit - 1]
+    if tag_count >= limit:
+        print("ERROR: BUFFER OVERFLOW IN MAKE NEW ENTRY. TAG COUNT EXPECTED <", limit, "RECEIVED", tag_count, flush=True)
+        print("Only applying first", limit - 1, "tags. Use a higher-bounds function if a larger number of tags is needed.", flush=True)
+        tag_count = limit - 1
 
-    local_tags.append("")
-
-    new_tags_store = [make_tag(tag) for tag in local_tags]
+    # Slicing copies, so the caller's list is never modified.
+    new_tags_store = [make_tag(tag) for tag in py_tags[:tag_count]]
+    new_tags_store.append(make_tag(""))  # terminator
 
     for i, tag in enumerate(new_tags_store):
-        if i >= limit:
-            break
         c_tags[i] = <char*>tag
 
     return new_tags_store
