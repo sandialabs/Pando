@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <exception>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -44,6 +45,23 @@ typedef int (*db_query_t)(dbkey_t, const char*, const char* const*, const DBAcce
 namespace pando {
 
 static string MERGE_STRATEGY_FORCE = "MERGE_STRATEGY=FORCE_MERGE";
+
+/** @brief Start the embedded Python interpreter once per process
+ *
+ * Cython filters use single-phase init and keep their module object in a
+ * static, so they cannot be re-imported into a new interpreter after
+ * Py_FinalizeEx(). The interpreter therefore lives for the whole process
+ * (shared by every SeqDB) and is finalized once at exit.
+ */
+inline void ensure_python_initialized() {
+    if (!Py_IsInitialized()) {
+        Py_Initialize();
+        std::atexit([]() {
+            if (Py_IsInitialized())
+                Py_FinalizeEx();
+        });
+    }
+}
 
 /** @brief Contains the sequential database
  *
@@ -223,18 +241,18 @@ class SeqDB {
          * NOTE: localhost IP addresses used as default values for test cases
          * */
         SeqDB() : db_server_(ZMQAddress {"127.0.0.1", 0+MAP_LOCALNUM_OFFSET}),
-            db_(ZMQAddress {"127.0.0.1", 0+MAP_LOCALNUM_OFFSET}, ZMQAddress {"127.0.0.1", 0}) { Py_Initialize(); }
+            db_(ZMQAddress {"127.0.0.1", 0+MAP_LOCALNUM_OFFSET}, ZMQAddress {"127.0.0.1", 0}) { ensure_python_initialized(); }
 
         /** @brief Create a database with an agent id to use as seed */
         SeqDB(ZMQAddress addr) : db_server_(addr+MAP_LOCALNUM_OFFSET), db_(addr+MAP_LOCALNUM_OFFSET, addr) {
             set_agent_id(addr.serialize());
-            Py_Initialize();
+            ensure_python_initialized();
         }
 
         /** @brief Create a database with an agent id to use as seed and allocator size*/
         SeqDB(ZMQAddress addr, size_t size) : db_server_(addr+MAP_LOCALNUM_OFFSET, size), db_(addr+MAP_LOCALNUM_OFFSET, addr) {
             set_agent_id(addr.serialize());
-            Py_Initialize();
+            ensure_python_initialized();
         }
 
         /** @brief Build a SeqDB from an input file */
@@ -242,18 +260,17 @@ class SeqDB {
                 db_(ZMQAddress {"127.0.0.1", 0+MAP_LOCALNUM_OFFSET}, ZMQAddress {"127.0.0.1", 0}) {
             add_db_file(fn);
 
-            Py_Initialize();
+            ensure_python_initialized();
         }
 
-        ~SeqDB() {
-            Py_FinalizeEx();
-        }
+        // Python is intentionally not finalized here; see ensure_python_initialized().
+        ~SeqDB() = default;
 
         /** @brief Build a SeqDB from an input file with a DB size */
         SeqDB(string fn, size_t size) : db_server_(ZMQAddress {"127.0.0.1", 0+MAP_LOCALNUM_OFFSET}, size),
                                         db_(ZMQAddress {"127.0.0.1", 0+MAP_LOCALNUM_OFFSET}, ZMQAddress {"127.0.0.1", 0}) {
             add_db_file(fn);
-            Py_Initialize();
+            ensure_python_initialized();
         }
 
         /** @brief Add an input file
