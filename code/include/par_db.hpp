@@ -797,7 +797,9 @@ class ParDB : public PandoParticipant {
                     broadcast_process();
                 } else {
                     // move everyone into the alg db process
-                    if (skip_group_filters_) has_alg_processed_ = true;
+                    // Filter installs are broadcast to every agent, so the
+                    // synchronizer's installed filters match everyone's
+                    if (skip_group_filters_ || !db_.has_group_filters()) has_alg_processed_ = true;
                     if (!has_alg_processed_) {
                         has_alg_processed_ = true;
                         #ifdef VERBOSE
@@ -1297,6 +1299,10 @@ class ParDB : public PandoParticipant {
                 ret_entry_keys = db_.keys();
             }
             for (auto & k : ret_entry_keys) {
+                // Random keys are not part of any group (the sequential
+                // version and setup_graph_datastructures_have_ids skip them too)
+                if (is_random_key(k)) continue;
+
                 // Get the address of the host that owns k.b (should always be "us") and k.c
                 dbkey_t lookup_key_b {k.a, k.b, 0};
                 addr_t neigh_addr_b = lookup_agent(lookup_key_b);

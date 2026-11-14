@@ -46,6 +46,18 @@ class AlgDB : public SeqDB {
             skip_group_filters_ = true;
         }
 
+        /** @brief Whether any installed filter runs on entry groups
+         *
+         * Without one there is nothing to compute, so the group phase can be
+         * skipped entirely (no vertex setup, no copy of the DB). */
+        bool has_group_filters() const {
+            for (const auto & [filter_name, filter] : installed_filters_) {
+                if (filter->filter_type() == GROUP_ENTRIES)
+                    return true;
+            }
+            return false;
+        }
+
         //                                 SEND it, DEST vtx,  data..
         //graph key (graph_t), then msg_t = <itkey_t, <vertex_t, vector<MData>>>
         unordered_map<graph_t, msg_t> in_graph_msgs;
@@ -53,15 +65,17 @@ class AlgDB : public SeqDB {
 
         void setup_graph_datastructures() {
             // Sequential version
-            // Setup 'vertices_' for myself
-            // FIXME
-            vector<DBEntry<>> ret_entries;
+            // Setup 'vertices_' for myself. Only the keys are needed here, so
+            // read keys rather than copying every entry (the entries
+            // themselves are read once, in setup_graph_datastructures_have_ids)
+            vector<dbkey_t> ret_keys;
             if (!skip_group_filters_) {
-                ret_entries = db_.retrieve_all_entries();
+                ret_keys = db_.keys();
             }
-            for (auto & entry : ret_entries) {         // TODO : replace this with a C++ iterator that automatically "batches" behind the scene
-                if (entry.random_key()) continue;
-                dbkey_t k = entry.get_key();
+            for (auto & k : ret_keys) {
+                // Random keys (e.g. entries created with INITIAL_KEY) are not
+                // part of any group
+                if (is_random_key(k)) continue;
                 add_alg_vertex({k.a, k.b});
                 add_alg_vertex({k.a, k.c});
             }
@@ -240,6 +254,11 @@ class AlgDB : public SeqDB {
 
             // First, process all SINGLE_ENTRY filters
             seq_process();
+
+            // Nothing more to do without group filters; skip building the
+            // graph, which would otherwise read every entry in the DB
+            if (skip_group_filters_ || !has_group_filters())
+                return false;
 
             // Next, process GROUP_ENTRY filters
             setup_graph_datastructures();
