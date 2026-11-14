@@ -290,6 +290,91 @@ TEST(simple_group_test) {
     TEST_PASS
 }
 
+// Group filters must be able to read each edge's entry (value and tags) while
+// they run, not just during should_run/init. Each edge's DBAccess points into
+// the entry rather than copying it, so the entries must outlive setup and stay
+// alive through every compute iteration.
+static const size_t G_EDGES_VALUE_LEN = 80;
+static size_t g_TEST_edges_checked;
+static vector<string> g_TEST_edges_errors;
+
+static string g_TEST_edge_value(graph_t a, vtx_t b, vtx_t c) {
+    string v = "edge " + to_string(a) + "/" + to_string(b) + "/" + to_string(c) + " ";
+    v.resize(G_EDGES_VALUE_LEN, '.');
+    return v;
+}
+
+bool g_TEST_edges_sroe(const DBAccess* acc) { return acc->key.a == 4; }
+
+void g_TEST_edges_run(void* access) {
+    DBAccess* acc = (DBAccess*)access;
+
+    // Allocate strings the size of the edge values first, as a real filter
+    // doing work would. If the entries had been freed, these reuse that
+    // memory and the reads below see it.
+    vector<string> churn;
+    for (size_t i = 0; i < 4096; ++i)
+        churn.emplace_back(G_EDGES_VALUE_LEN, 'Z');
+
+    for (auto & edge : acc->group->entry.out) {
+        string where = to_string(acc->group->vtx) + "->" + to_string(edge.n);
+
+        string want = g_TEST_edge_value(acc->key.a, acc->group->vtx, edge.n);
+        if (edge.acc->value == nullptr || string(edge.acc->value) != want) {
+            // Skip the tags: if the value is wrong, the tag array may be too,
+            // and walking it could crash instead of failing the test
+            g_TEST_edges_errors.push_back("value of edge " + where);
+            continue;
+        }
+
+        set<string> tags;
+        size_t n = 0;
+        for (auto t = edge.acc->tags; t != nullptr && (*t)[0] != '\0' && n < 8; ++t, ++n)
+            tags.insert(*t);
+        set<string> want_tags {"edge", "c=" + to_string(edge.n)};
+        if (tags != want_tags)
+            g_TEST_edges_errors.push_back("tags of edge " + where);
+
+        ++g_TEST_edges_checked;
+    }
+
+    acc->group->state = INACTIVE;
+}
+
+TEST(group_edges_readable_in_run) {
+    AlgDB db;
+
+    const vtx_t NUM_VERTICES = 50, EDGES_PER_VERTEX = 20;
+    for (vtx_t b = 1; b <= NUM_VERTICES; ++b) {
+        for (vtx_t c = 1000; c < 1000 + EDGES_PER_VERTEX; ++c) {
+            DBEntry<> e;
+            e.clear().add_tag("edge").add_tag("c=" + to_string(c)).set_key({4, b, c});
+            e.value() = g_TEST_edge_value(4, b, c);
+            db.add_entry(move(e));
+        }
+    }
+
+    FilterInterface i {
+        filter_name: "TEST",
+        filter_type: GROUP_ENTRIES,
+        should_run: &g_TEST_edges_sroe,
+        init: &g_forward_init,
+        destroy: &g_forward_destroy,
+        run: &g_TEST_edges_run
+    };
+    g_TEST_edges_checked = 0;
+    g_TEST_edges_errors.clear();
+    db.install_filter(make_shared<Filter>(&i));
+    db.process();
+
+    for (size_t k = 0; k < g_TEST_edges_errors.size() && k < 5; ++k)
+        cerr << "  bad edge entry: " << g_TEST_edges_errors[k] << endl;
+    EQ(g_TEST_edges_errors.size(), 0u);
+    EQ(g_TEST_edges_checked, (size_t)(NUM_VERTICES * EDGES_PER_VERTEX));
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
     RUN_TEST(msg_data)
@@ -300,5 +385,6 @@ TESTS_BEGIN
     RUN_TEST(should_run_tags)
     RUN_TEST(create_entry)
     RUN_TEST(simple_group_test)
+    RUN_TEST(group_edges_readable_in_run)
     elga::ZMQChatterbox::Teardown();
 TESTS_END

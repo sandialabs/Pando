@@ -33,6 +33,12 @@ class AlgDB : public SeqDB {
         // Find all filters that run on entry groups
         vector<filter_p> filters_;
 
+        // The entries behind every group edge. Each edge's DBAccess points
+        // into one of these (its tags and value are not copied), so they must
+        // stay alive, and must not move, until teardown_graph() deletes those
+        // accesses. A list never relocates its elements as it grows.
+        list<DBEntry<>> group_entries_;
+
         itkey_t iter_ = 0;
 
         bool skip_group_filters_ = false;
@@ -103,7 +109,7 @@ class AlgDB : public SeqDB {
                 graphs_[graph][vtx];
             }
 
-            list<DBEntry<>> entries;
+            group_entries_.clear();
 
             vector<DBEntry<>> ret_entries;
             if (!skip_group_filters_) {
@@ -113,9 +119,9 @@ class AlgDB : public SeqDB {
                 if (entry.random_key()) continue;
                 dbkey_t k = entry.get_key();
 
-                entries.push_back(move(entry));
+                group_entries_.push_back(move(entry));
 
-                DBAccess* acc = entries.back().access();
+                DBAccess* acc = group_entries_.back().access();
                 add_db_access(acc);
 
                 // Populate the graph
@@ -223,6 +229,8 @@ class AlgDB : public SeqDB {
             }
 
             graphs_.clear();
+            // Only now that the edge accesses are deleted can their entries go
+            group_entries_.clear();
             vertices_.clear();
             filter_states_.clear();
             filters_.clear();
