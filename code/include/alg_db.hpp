@@ -168,34 +168,85 @@ class AlgDB : public SeqDB {
             }
 
         }
+        /** @brief Run one iteration (superstep) of the group filters
+         *
+         * Vertex-centric (Pregel) semantics:
+         *  - a vertex runs if it is ACTIVE or has messages for this iteration;
+         *    a message wakes up a vertex that voted to halt (INACTIVE);
+         *  - every vertex sees the global iteration in group->iter, whether or
+         *    not it ran in earlier iterations;
+         *  - the computation continues while any vertex is still ACTIVE or any
+         *    message was sent for the next iteration, so a message sent in the
+         *    same iteration a vertex halts is still delivered.
+         *
+         * Messages a filter sends go to out_msgs[iter+1]. Messages from earlier
+         * iterations are dropped here once they have been consumed or
+         * delivered.
+         *
+         * @return whether another iteration is needed
+         */
         bool compute_internal() {
-            int cont = 0;
-            // Note: this will terminate when cont is never set to true,
-            // which happens if all group state values are != ACTIVE after
-            // running
-            // If just 1 is ACTIVE, the loop will continue and execute
-            // every filter for every vertex again
+            // Drop consumed incoming messages and already-delivered outgoing ones
+            for (auto & [graph_key, msgs] : in_graph_msgs)
+                for (auto it = msgs.begin(); it != msgs.end();)
+                    it = (it->first < iter_) ? msgs.erase(it) : next(it);
+            for (auto & [graph_key, msgs] : out_graph_msgs)
+                for (auto it = msgs.begin(); it != msgs.end();)
+                    it = (it->first <= iter_) ? msgs.erase(it) : next(it);
 
-            // Begin the processing loop
+            size_t active = 0;
+
             for (auto & [graph_key, graph] : filter_states_) {
+                // Messages delivered to this graph for the current iteration
+                const itmsg_t* msgs_now = nullptr;
+                auto in_graph = in_graph_msgs.find(graph_key);
+                if (in_graph != in_graph_msgs.end()) {
+                    auto at_iter = in_graph->second.find(iter_);
+                    if (at_iter != in_graph->second.end())
+                        msgs_now = &(at_iter->second);
+                }
+
                 for (auto & [v, fs_pair] : graph) {
                     auto & [acc, filter_state] = fs_pair;
+                    acc->group->iter = iter_;
 
-                    // Always run, and keep track of whether there is some
-                    // ACTIVE output
+                    bool has_msgs = false;
+                    if (msgs_now != nullptr) {
+                        auto vtx_msgs = msgs_now->find(v);
+                        has_msgs = vtx_msgs != msgs_now->end() && !vtx_msgs->second.empty();
+                    }
+
+                    // Halted vertices are skipped unless a message wakes them
+                    if (acc->group->state != ACTIVE && !has_msgs)
+                        continue;
+                    acc->group->state = ACTIVE;
+
+                    bool ran = false;
                     for (size_t idx = 0; idx < filters_.size(); ++idx) {
                         if (filter_state[idx] != nullptr) {
                             filters_[idx]->run_with_state(filter_state[idx]);
-                            if (acc->group->state == ACTIVE)
-                                ++cont;
+                            ran = true;
                         }
                     }
 
-                    ++acc->group->iter;
+                    if (ran && acc->group->state == ACTIVE)
+                        ++active;
                 }
             }
+
+            // Any message sent for the next iteration keeps the computation going
+            bool pending = false;
+            for (auto & [graph_key, msgs] : out_graph_msgs) {
+                auto next_iter = msgs.find(iter_ + 1);
+                if (next_iter == msgs.end()) continue;
+                for (auto & [vtx, vtx_msgs] : next_iter->second) {
+                    if (!vtx_msgs.empty()) { pending = true; break; }
+                }
+                if (pending) break;
+            }
+
             ++iter_;
-            return cont > 0;
+            return active > 0 || pending;
         }
         void teardown_graph() {
             // Clear messages
@@ -277,9 +328,12 @@ class AlgDB : public SeqDB {
             // specific
 
             while (compute_internal()) {
-                // Move out to in msgs
-                for (auto & [graph, msg] : out_graph_msgs) {
-                    in_graph_msgs[graph] = msg;
+                // Deliver the messages sent for the next iteration (iter_ now
+                // names it); older ones are dropped by compute_internal()
+                for (auto & [graph, msgs] : out_graph_msgs) {
+                    auto next_iter = msgs.find(iter_);
+                    if (next_iter != msgs.end())
+                        in_graph_msgs[graph][iter_] = move(next_iter->second);
                 }
             }
 
