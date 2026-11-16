@@ -108,6 +108,8 @@ using it_t = int32_t;
 #define GET_STATE                     0xd1
 #define EXPORT_DB_WITH_TAG            0xd2
 #define EXPORT_DB_WITH_TAG_BROADCAST  0xd3
+#define GET_ENTRIES_BY_KEYS           0xd4
+#define MAP_RETRIEVE_VALUES           0xd5
 #define WANT_HEARTBEAT                0xfe
 #define HEARTBEAT                     0xff
 

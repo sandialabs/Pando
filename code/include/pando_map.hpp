@@ -189,6 +189,49 @@ class PandoMap : public PandoParticipant {
             ZMQChatterbox::send(sock, msg, msg_size);
         }
 
+        /** @brief Look up the values for a batch of keys
+         *
+         * Request: <size_t n> <n x dbkey_t>
+         * Reply:   <size_t n> then for each key, in order:
+         *          <bool exists> <size_t len> <len bytes of value>
+         *          (len is 0 and no bytes follow if the key does not exist)
+         * Only values are returned, not tags.
+         */
+        void recv_map_retrieve_values(zmq_socket_t sock, const char* data, [[maybe_unused]] const char* end) {
+            size_t n;
+            unpack_single(data, n);
+            const char* keys_data = data;
+
+            // Find each entry once and size the reply
+            vector<DBEntry<Alloc>*> found(n, nullptr);
+            size_t msg_size = sizeof(size_t);
+            for (size_t i = 0; i < n; ++i) {
+                dbkey_t key;
+                unpack_single(keys_data, key);
+                auto it = map_.find(key);
+                if (it != map_.end()) found[i] = &(it->second);
+                msg_size += sizeof(bool) + sizeof(size_t) + (found[i] ? found[i]->value().size() : 0);
+            }
+
+            char* msg = new char[msg_size];
+            char* msg_ptr = msg;
+            pack_single(msg_ptr, n);
+            for (size_t i = 0; i < n; ++i) {
+                bool exists = found[i] != nullptr;
+                size_t len = exists ? found[i]->value().size() : 0;
+                pack_single(msg_ptr, exists);
+                pack_single(msg_ptr, len);
+                if (len) {
+                    memcpy(msg_ptr, found[i]->value().data(), len);
+                    msg_ptr += len;
+                }
+            }
+
+            ZMQChatterbox::send(sock, msg, msg_size);
+
+            delete [] msg;
+        }
+
         void process_msg(msg_type_t type, zmq_socket_t sock, const char *data, const char* end) {
             if (type == MAP_INSERT) 
                 recv_map_insert(sock, data, end);
@@ -206,6 +249,8 @@ class PandoMap : public PandoParticipant {
                 recv_map_get_entries(sock, data, end);
             else if (type == MAP_DOES_KEY_EXIST)
                 recv_map_does_key_exist(sock, data, end);
+            else if (type == MAP_RETRIEVE_VALUES)
+                recv_map_retrieve_values(sock, data, end);
             else
                 throw runtime_error("Unknown message type");
         }

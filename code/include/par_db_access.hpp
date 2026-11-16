@@ -11,6 +11,7 @@ typedef void (*fn_remove_tag_from_entry)(void*, dbkey_t, string);
 typedef void (*fn_update_entry_val)(void*, dbkey_t, string);
 typedef void (*fn_subscribe_to_entry)(void*, dbkey_t, dbkey_t, string);
 typedef void (*fn_get_entry_by_key)(void*, dbkey_t, char**);
+typedef void (*fn_get_entries_by_keys)(void*, size_t, const dbkey_t*, char**);
 
 typedef struct fn_refs {
     fn_ref ref;
@@ -20,6 +21,7 @@ typedef struct fn_refs {
     fn_update_entry_val update_entry_val;
     fn_subscribe_to_entry subscribe_to_entry;
     fn_get_entry_by_key get_entry_by_key;
+    fn_get_entries_by_keys get_entries_by_keys;
 
     fn_refs(
         fn_ref ref,
@@ -28,7 +30,8 @@ typedef struct fn_refs {
         fn_remove_tag_from_entry remove_tag_from_entry,
         fn_update_entry_val update_entry_val,
         fn_subscribe_to_entry subscribe_to_entry,
-        fn_get_entry_by_key get_entry_by_key
+        fn_get_entry_by_key get_entry_by_key,
+        fn_get_entries_by_keys get_entries_by_keys
     ) :
         ref(ref),
         add_entry(add_entry),
@@ -36,7 +39,8 @@ typedef struct fn_refs {
         remove_tag_from_entry(remove_tag_from_entry),
         update_entry_val(update_entry_val),
         subscribe_to_entry(subscribe_to_entry),
-        get_entry_by_key(get_entry_by_key)
+        get_entry_by_key(get_entry_by_key),
+        get_entries_by_keys(get_entries_by_keys)
         { }
 } fn_refs;
 
@@ -98,6 +102,11 @@ class SeqDBParAccess : public AlgDB {
         /** @brief Get the value of the entry that has key search_key */
         virtual void get_entry_value_by_key(dbkey_t search_key, char **res) {
             b_refs_.get_entry_by_key(b_refs_.ref, search_key, res);
+        }
+
+        /** @brief Get the values for many keys, from whichever agents own them */
+        virtual void get_entry_values_by_keys(size_t n, const dbkey_t* keys, char** values) {
+            b_refs_.get_entries_by_keys(b_refs_.ref, n, keys, values);
         }
 
         virtual void subscribe_to_entry_wrapper(dbkey_t my_key, dbkey_t wait_key, string tag) {

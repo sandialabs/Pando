@@ -35,6 +35,7 @@ void s_ref_remove_tag(fn_ref, dbkey_t, string);
 void s_ref_update_entry_val(fn_ref, dbkey_t, string);
 void s_ref_subscribe_to_entry(fn_ref, dbkey_t, dbkey_t, string);
 void s_ref_get_entry_by_key(fn_ref, dbkey_t, char**);
+void s_ref_get_entries_by_keys(fn_ref, size_t, const dbkey_t*, char**);
 
 /** @brief Contains the parallel (distributed) database
  *
@@ -81,7 +82,8 @@ class ParDB : public PandoParticipant {
                     s_ref_remove_tag,
                     s_ref_update_entry_val,
                     s_ref_subscribe_to_entry,
-                    s_ref_get_entry_by_key
+                    s_ref_get_entry_by_key,
+                    s_ref_get_entries_by_keys
                 ),
                 db_(db_refs_, addr_ser_, sz),
                 state_(PRELOAD),
@@ -339,6 +341,67 @@ class ParDB : public PandoParticipant {
             *res = (char*)malloc(sizeof(char)*value.size()+1); // add one for the null terminator
             if (*res == nullptr) throw runtime_error("Unable to allocate memory");
             strcpy(*res, value.c_str());
+        }
+
+        /** @brief Look up many keys with one blocking call
+         *
+         * Keys are grouped by the agent that owns them. One request is sent
+         * to every owner's responder before any reply is awaited, so the
+         * owners look their keys up in parallel; each answers its whole group
+         * with a single PandoMap lookup.
+         *
+         * values[i] receives a malloc'd, NUL-terminated copy of the value
+         * for keys[i] (the caller frees it), or nullptr if the key does not
+         * exist. An empty value gives an empty string, not nullptr. Keys may
+         * repeat. On error every value is freed and set to nullptr before the
+         * exception is thrown.
+         */
+        void get_entries_by_keys(size_t n, const dbkey_t* keys, char** values) {
+            for (size_t i = 0; i < n; ++i) values[i] = nullptr;
+            if (n == 0) return;
+
+            // Group the positions of the keys by owning agent
+            unordered_map<addr_t, vector<size_t>> by_owner;
+            for (size_t i = 0; i < n; ++i)
+                by_owner[lookup_agent(keys[i])].push_back(i);
+
+            // Send one request to every owner before waiting for any reply
+            using req_it = decltype(find_req(keys[0], true));
+            vector<pair<req_it, const vector<size_t>*>> pending;
+            pending.reserve(by_owner.size());
+            for (auto & [owner, idx] : by_owner) {
+                auto req = find_req(keys[idx[0]], true); // the owner's responder
+
+                size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + idx.size()*sizeof(dbkey_t);
+                char* msg = new char[msg_size];
+                char* msg_ptr = msg;
+                pack_msg(msg_ptr, GET_ENTRIES_BY_KEYS);
+                pack_single(msg_ptr, idx.size());
+                for (size_t i : idx) pack_single(msg_ptr, keys[i]);
+
+                req->send(msg, msg_size);
+                delete [] msg;
+
+                pending.push_back({req, &idx});
+            }
+
+            // Read every reply before parsing any, so that a bad reply cannot
+            // leave another responder's request unread
+            vector<ZMQMessage> replies;
+            replies.reserve(pending.size());
+            for (auto & [req, idx] : pending)
+                replies.push_back(req->read());
+
+            try {
+                for (size_t r = 0; r < pending.size(); ++r) {
+                    const vector<size_t>& idx = *pending[r].second;
+                    const char* data = replies[r].data();
+                    unpack_values_reply(data, data + replies[r].size(), idx.size(), idx.data(), values);
+                }
+            } catch (...) {
+                for (size_t i = 0; i < n; ++i) { free(values[i]); values[i] = nullptr; }
+                throw;
+            }
         }
 
         /** @brief Broadcast the message to add a filter directory to the internal DB */
@@ -1390,5 +1453,9 @@ void s_ref_subscribe_to_entry(fn_ref r, dbkey_t my_key, dbkey_t wait_key, string
 void s_ref_get_entry_by_key(fn_ref r, dbkey_t search_key, char** res) {
     ParDB* db = (ParDB*)r;
     db->get_entry_by_key(search_key, res);
+}
+void s_ref_get_entries_by_keys(fn_ref r, size_t n, const dbkey_t* keys, char** values) {
+    ParDB* db = (ParDB*)r;
+    db->get_entries_by_keys(n, keys, values);
 }
 }

@@ -1081,6 +1081,45 @@ TEST(import_export_with_tag) {
     TEST_PASS
 }
 
+// Batched lookups on a single SeqDB, directly and through a filter's DBAccess
+TEST(get_entries_by_keys_local) {
+    SeqDB d;
+    dbkey_t k1 {40, 1, 0}, k2 {40, 2, 0}, k3 {40, 3, 0}, missing {40, 9, 0};
+    { DBEntry<> e; e.clear().add_tag("a").value() = "v1"; e.set_key(k1); d.add_entry(move(e)); }
+    { DBEntry<> e; e.clear().add_tag("a").value() = "";   e.set_key(k2); d.add_entry(move(e)); }
+    { DBEntry<> e; e.clear().add_tag("a").value() = "x\ny"; e.set_key(k3); d.add_entry(move(e)); }
+
+    dbkey_t keys[] = {k1, missing, k2, k1, k3};
+    const size_t n = sizeof(keys)/sizeof(keys[0]);
+
+    // Directly
+    char* values[n];
+    d.get_entry_values_by_keys(n, keys, values);
+    NOPRINT_NOTEQ(values[0], nullptr); EQ(string{values[0]}, "v1");
+    NOPRINT_EQ(values[1], nullptr);                           // missing
+    NOPRINT_NOTEQ(values[2], nullptr); EQ(string{values[2]}, "");    // empty, not missing
+    NOPRINT_NOTEQ(values[3], nullptr); EQ(string{values[3]}, "v1");  // repeated key
+    NOPRINT_NOTEQ(values[4], nullptr); EQ(string{values[4]}, "x\ny");
+    for (char* v : values) free(v);
+
+    // Through a filter's DBAccess (the C entry point filters use)
+    DBEntry<> any; any.clear().add_tag("a");
+    DBAccess* access = any.access();
+    d.add_db_access(access);
+    char* values2[n];
+    access->get_entries_by_keys.run(&access->get_entries_by_keys, n, (const dbkey_t*)keys, (char**)values2);
+    NOPRINT_NOTEQ(values2[0], nullptr); EQ(string{values2[0]}, "v1");
+    NOPRINT_EQ(values2[1], nullptr);
+    NOPRINT_NOTEQ(values2[2], nullptr); EQ(string{values2[2]}, "");
+    for (char* v : values2) free(v);
+    delete access;
+
+    // An empty batch is fine
+    d.get_entry_values_by_keys(0, keys, values);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1118,6 +1157,7 @@ TESTS_BEGIN
     RUN_TEST(serialize_entries)
     RUN_TEST(import_export)
     RUN_TEST(import_export_with_tag)
+    RUN_TEST(get_entries_by_keys_local)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END

@@ -8,6 +8,42 @@ using namespace elga;
 
 namespace pando {
 
+/** @brief Unpack a MAP_RETRIEVE_VALUES reply (see
+ * PandoMap::recv_map_retrieve_values) holding n values
+ *
+ * The i-th value goes to values[positions[i]] (or values[i] if positions is
+ * nullptr) as a malloc'd, NUL-terminated copy, or nullptr if the key does not
+ * exist. Throws runtime_error on a malformed reply; slots already filled are
+ * left for the caller to free.
+ */
+inline void unpack_values_reply(const char* data, const char* end, size_t n,
+                                const size_t* positions, char** values) {
+    if ((size_t)(end - data) < sizeof(size_t)) throw runtime_error("values reply: too short");
+    size_t count;
+    unpack_single(data, count);
+    if (count != n) throw runtime_error("values reply: wrong number of values");
+
+    for (size_t i = 0; i < n; ++i) {
+        if ((size_t)(end - data) < sizeof(bool) + sizeof(size_t)) throw runtime_error("values reply: truncated");
+        bool exists;
+        size_t len;
+        unpack_single(data, exists);
+        unpack_single(data, len);
+        if ((size_t)(end - data) < len) throw runtime_error("values reply: truncated value");
+
+        char*& slot = values[positions ? positions[i] : i];
+        slot = nullptr;
+        if (exists) {
+            char* v = (char*)malloc(len + 1);
+            if (v == nullptr) throw runtime_error("values reply: unable to allocate memory");
+            memcpy(v, data, len);
+            v[len] = '\0';
+            slot = v;
+        }
+        data += len;
+    }
+}
+
 class PandoMapClient : public ZMQRequester {
     private:
     public:
@@ -140,6 +176,24 @@ class PandoMapClient : public ZMQRequester {
             }
 
             return entries;
+        }
+
+        /** @brief Send a MAP_RETRIEVE_VALUES request for n keys and return
+         * the raw reply (see PandoMap::recv_map_retrieve_values)
+         */
+        ZMQMessage retrieve_values_raw(size_t n, const dbkey_t* keys) {
+            size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + n*sizeof(dbkey_t);
+            char* msg = new char[msg_size];
+            char* msg_ptr = msg;
+
+            pack_msg(msg_ptr, MAP_RETRIEVE_VALUES);
+            pack_single(msg_ptr, n);
+            if (n) memcpy(msg_ptr, keys, n*sizeof(dbkey_t));
+
+            send(msg, msg_size);
+            delete [] msg;
+
+            return read();
         }
 
         bool key_exist(dbkey_t key) {

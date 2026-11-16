@@ -43,6 +43,13 @@ typedef struct DBAccess {
     const char* value;
     /** Members specific for GROUP_ENTRIES filters */
     GroupAccess* group;
+    /** Look up many keys with one blocking request:
+     *    run(fn*, size_t n, const dbkey_t* keys, char** values)
+     *  values[i] is set to a malloc'd, NUL-terminated copy of the value for
+     *  keys[i] (free it), or NULL if the key does not exist. The keys are
+     *  sent to all of their owning agents at once.
+     *  (Kept last so filters built before it was added still work.) */
+    fn get_entries_by_keys;
 } DBAccess;
 
 enum filter_type {

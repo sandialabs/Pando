@@ -903,11 +903,71 @@ TEST(subscribing_consensus) {
     TEST_PASS
 }
 
+// A filter on one agent looks up keys owned by all three agents (and a
+// missing one) with one batched call
+TEST(filter_get_entries_by_keys) {
+    g_idx = 0;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr };
+    elga::ZMQAddress db3_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db3 { db3_addr };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    ParDBClient c3 { db3_addr };
+
+    vector<ZMQAddress> addrs { db1_addr, db2_addr, db3_addr };
+
+    c2.add_neighbor(db1_addr);
+    c3.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 3 || c2.num_neighbors() != 3 || c3.num_neighbors() != 3); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 3);
+    EQ(c2.num_neighbors(), 3);
+    EQ(c3.num_neighbors(), 3);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_get_entries");
+
+    // Values at {30, i, 0} = i, spread over the agents (placement hashes (a, b))
+    size_t n = 2000;
+    for (size_t i = 0; i < n; ++i) {
+        DBEntry<> e; e.set_key({30, (vtx_t)i, 0});
+        e.add_tag("value"); e.value() = to_string(i);
+        c1.add_entry(e);
+    }
+    { DBEntry<> e; e.set_key({30, 5000, 0}); e.add_tag("value"); c1.add_entry(e); }   // empty value
+    { DBEntry<> e; e.set_key({32, 0, 0}); e.add_tag("Q"); e.value() = to_string(n); c1.add_entry(e); }
+
+    // Wait for forwarded entries to reach their owners
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() + c3.db_size() != n + 2; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size() + c3.db_size(), n + 2);
+    // The keys really are spread over all three agents
+    EQ(c1.db_size() > 0 && c2.db_size() > 0 && c3.db_size() > 0, true);
+
+    c1.process();
+    wait(addrs);
+
+    string summary;
+    for (auto* c : {&c1, &c2, &c3})
+        for (auto & entry : c->get_entries())
+            if (entry.get_key() == dbkey_t{33, 0, 0}) summary = entry.value();
+    EQ(summary, "ok=" + to_string(n) + "/" + to_string(n) + " missing=1 dup=1 empty=1");
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
     RUN_TEST(filter_new_entry)
     RUN_TEST(filter_new_entry_with_key)
+    RUN_TEST(filter_get_entries_by_keys)
     RUN_TEST(filter_fail)
     RUN_TEST(dup_filters_fail)
     RUN_TEST(two_filters)
