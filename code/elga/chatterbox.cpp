@@ -284,6 +284,8 @@ ZMQMessage::ZMQMessage(zmq_socket_t sock, bool block) : msg_part_(), sock_(sock)
         // We are not blocking, and there are no messages
         zmq_msg_close(&msg_part_);
         closed_ = true;
+        size_ = 0;
+        data_ = nullptr;
         return;
     }
 
@@ -310,21 +312,35 @@ ZMQMessage::~ZMQMessage() {
     zmq_msg_close(&msg_part_);
 }
 
-ZMQMessage::ZMQMessage(ZMQMessage&& that) {
-    std::swap(msg_part_, that.msg_part_);
-    std::swap(sock_, that.sock_);
-    std::swap(size_, that.size_);
-    std::swap(data_, that.data_);
+/* Moving a message: the zmq_msg_t is moved with zmq_msg_move, and data_ is
+ * looked up again afterwards. Small messages (up to ~33 bytes) are stored
+ * inside the zmq_msg_t itself, so a data_ pointer taken from the old object
+ * would point into the moved-from message. */
+void ZMQMessage::take_(ZMQMessage& that) {
+    sock_ = that.sock_;
+    size_ = that.size_;
+    closed_ = that.closed_;
+    data_ = nullptr;
+    if (!closed_) {
+        if (zmq_msg_init(&msg_part_) != 0) throw std::runtime_error("Unable to init msg");
+        if (zmq_msg_move(&msg_part_, &that.msg_part_) != 0) throw std::runtime_error("Unable to move msg");
+        data_ = (char*)zmq_msg_data(&msg_part_);
+    }
+    // The moved-from message no longer owns anything
     that.closed_ = true;
+    that.data_ = nullptr;
+    that.size_ = 0;
+}
+
+ZMQMessage::ZMQMessage(ZMQMessage&& that) : msg_part_(), sock_(nullptr), size_(0), data_(nullptr), closed_(true) {
+    take_(that);
 }
 
 ZMQMessage& ZMQMessage::operator=(ZMQMessage&& that) {
     if (this != &that) {
-        std::swap(msg_part_, that.msg_part_);
-        std::swap(sock_, that.sock_);
-        std::swap(size_, that.size_);
-        std::swap(data_, that.data_);
-        that.closed_ = true;
+        // Release the message this one held before taking over the other
+        if (!closed_) zmq_msg_close(&msg_part_);
+        take_(that);
     }
     return *this;
 }

@@ -42,6 +42,9 @@ namespace elga {
             char *data_;
             bool closed_;
 
+            /** Take over that's message, leaving that empty (used by moves) */
+            void take_(ZMQMessage& that);
+
         public:
             /** Read a message from a socket */
             ZMQMessage(zmq_socket_t sock, bool block=true);
