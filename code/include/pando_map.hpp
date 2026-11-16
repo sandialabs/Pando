@@ -213,8 +213,11 @@ class PandoMap : public PandoParticipant {
                 msg_size += sizeof(bool) + sizeof(size_t) + (found[i] ? found[i]->value().size() : 0);
             }
 
-            char* msg = new char[msg_size];
-            char* msg_ptr = msg;
+            // Build the reply directly in a ZeroMQ message, so the values are
+            // copied once (from the map into the message) rather than into a
+            // buffer and then again into a message by zmq_send
+            ZMQMessage out {sock, msg_size};
+            char* msg_ptr = out.edit_data();
             pack_single(msg_ptr, n);
             for (size_t i = 0; i < n; ++i) {
                 bool exists = found[i] != nullptr;
@@ -227,9 +230,7 @@ class PandoMap : public PandoParticipant {
                 }
             }
 
-            ZMQChatterbox::send(sock, msg, msg_size);
-
-            delete [] msg;
+            out.send();
         }
 
         void process_msg(msg_type_t type, zmq_socket_t sock, const char *data, const char* end) {
