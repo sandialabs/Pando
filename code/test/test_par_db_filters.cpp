@@ -963,12 +963,73 @@ TEST(filter_max_filters_per_stage) {
     TEST_PASS
 }
 
+// A filter on one agent makes another filter runnable on entries owned by
+// another agent, possibly behind that agent's scan cursor. With
+// max_filters_per_stage = 1, every such entry must still be filtered.
+TEST(filter_cursor_cross_agent) {
+    g_idx = 0;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr, 2ull*(1ull<<29), false, 1 };
+
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr, 2ull*(1ull<<29), false, 1 };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+
+    vector<ZMQAddress> addrs; addrs.push_back(db1_addr); addrs.push_back(db2_addr);
+
+    c1.add_neighbor(db2_addr);
+
+    this_thread::sleep_for(chrono::milliseconds(50));
+
+    EQ(c1.num_neighbors(), 2);
+    EQ(c2.num_neighbors(), 2);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_tag_other");
+    c1.install_filter("test_pardb_filters_on_tag_b");
+
+    // Y_i at {20, i, 0} tags X_i at {21, i, 0}; placement hashes (a, b), so
+    // pairs are spread over the agents and often split between them
+    size_t pairs = 10;
+    for (size_t k = 0; k < pairs; ++k) {
+        DBEntry<> x; x.set_key({21, (vtx_t)k, 0}); x.add_tag("X").add_to_value("x");
+        c1.add_entry(x);
+        DBEntry<> y; y.set_key({20, (vtx_t)k, 0}); y.add_tag("Y").add_to_value("y");
+        c1.add_entry(y);
+    }
+
+    this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size(), 2*pairs);
+
+    c1.process();
+    wait(addrs);
+
+    size_t x_done = 0, y_done = 0;
+    vector<DBEntry<>> entries = c1.get_entries();
+    auto c2_entries = c2.get_entries();
+    move(c2_entries.begin(), c2_entries.end(), std::back_inserter(entries));
+    for (auto & entry : entries) {
+        if (entry.has_tag("X") && entry.has_tag("test_pardb_filters_on_tag_b:done")) ++x_done;
+        if (entry.has_tag("Y") && entry.has_tag("test_pardb_filters_tag_other:done")) ++y_done;
+    }
+    EQ(y_done, pairs);
+    EQ(x_done, pairs);
+    EQ(c1.db_size() + c2.db_size(), 2*pairs);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
     RUN_TEST(filter_new_entry)
     RUN_TEST(filter_new_entry_with_key)
     RUN_TEST(filter_max_filters_per_stage)
+    RUN_TEST(filter_cursor_cross_agent)
     RUN_TEST(filter_fail)
     RUN_TEST(dup_filters_fail)
     RUN_TEST(two_filters)
