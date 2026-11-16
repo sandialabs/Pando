@@ -142,6 +142,49 @@ class PandoMapClient : public ZMQRequester {
             return entries;
         }
 
+        /** @brief Retrieve the keys and tags of the given entries, without values
+         *
+         * Returned entries have an empty value. Keys that do not exist are
+         * skipped, so the result may be shorter than the request.
+         *
+         * @param keys the keys to look up
+         * @param begin index of the first key to look up
+         * @param count number of keys (starting at begin) to look up
+         */
+        vector<DBEntry<>> retrieve_tags_by_keys(const vector<dbkey_t>& keys, size_t begin, size_t count) {
+            if (begin > keys.size()) begin = keys.size();
+            if (count > keys.size() - begin) count = keys.size() - begin;
+
+            size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + count*sizeof(dbkey_t);
+            char* msg = new char[msg_size];
+            char* msg_ptr = msg;
+
+            pack_msg(msg_ptr, MAP_GET_TAGS_BY_KEYS);
+            pack_single(msg_ptr, count);
+            for (size_t i = begin; i < begin + count; ++i)
+                pack_single(msg_ptr, keys[i]);
+
+            send(msg, msg_size);
+            delete [] msg;
+
+            ZMQMessage resp = read();
+            const char* resp_data = resp.data();
+
+            size_t recvd_msg_size;
+            unpack_single(resp_data, recvd_msg_size);
+
+            const char *resp_end = resp_data + recvd_msg_size - sizeof(size_t);
+
+            vector<DBEntry<>> entries;
+            entries.reserve(count);
+            while (resp_data < resp_end) {
+                DBEntry e {resp_data};
+                entries.push_back(move(e));
+            }
+
+            return entries;
+        }
+
         bool key_exist(dbkey_t key) {
             // Serialize the key and tag
             size_t msg_size = sizeof(msg_type_t)+sizeof(dbkey_t);
