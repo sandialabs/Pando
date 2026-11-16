@@ -1081,6 +1081,76 @@ TEST(import_export_with_tag) {
     TEST_PASS
 }
 
+// Filter for the max_filters_per_stage tests: runs on entries tagged "A" that
+// it hasn't tagged "A:done" yet, so each entry is filtered exactly once
+static size_t g_TEST_max_filters_runs;
+bool g_TEST_max_filters_should_run(const DBAccess* acc) {
+    bool found_a = false;
+    for (auto tags = acc->tags; *tags[0] != '\0'; ++tags) {
+        if (string(*tags) == "A:done") return false;
+        if (string(*tags) == "A") found_a = true;
+    }
+    return found_a;
+}
+void g_TEST_max_filters_run(void* access) {
+    const DBAccess* acc = (const DBAccess*)access;
+    ++g_TEST_max_filters_runs;
+    acc->add_tag.run(&acc->add_tag, "A:done");
+}
+
+TEST(max_filters_per_stage) {
+    g_TEST_max_filters_runs = 0;
+    FilterInterface i {
+        filter_name: "TEST_max_filters",
+        filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_max_filters_should_run,
+        init: nullptr,
+        destroy: nullptr,
+        run: &g_TEST_max_filters_run
+    };
+
+    SeqDB d;
+    EQ(d.max_filters_per_stage(), 100000);
+    for (int k = 0; k < 5; ++k) { DBEntry<> e; e.clear().add_tag("A"); d.add_entry(e); }
+    { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
+
+    d.set_max_filters_per_stage(2);
+    EQ(d.max_filters_per_stage(), 2);
+    d.install_filter(make_shared<Filter>(&i));
+
+    // Each pass runs at most 2 filters; the "A:done" tags are applied when
+    // the stage closes, so the next pass picks up the remaining entries
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, 2);
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, 4);
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, 5);
+    EQ(d.process_once(), false);
+    EQ(g_TEST_max_filters_runs, 5);
+
+    size_t done = 0;
+    for (auto & [key, entry] : d.entries())
+        if (entry.has_tag("A:done")) ++done;
+    EQ(done, 5);
+
+    TEST_PASS
+}
+
+TEST(max_filters_per_stage_rejects_zero) {
+    SeqDB d;
+    bool threw = false;
+    try {
+        d.set_max_filters_per_stage(0);
+    } catch (const invalid_argument&) {
+        threw = true;
+    }
+    EQ(threw, true);
+    EQ(d.max_filters_per_stage(), 100000);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1118,6 +1188,8 @@ TESTS_BEGIN
     RUN_TEST(serialize_entries)
     RUN_TEST(import_export)
     RUN_TEST(import_export_with_tag)
+    RUN_TEST(max_filters_per_stage)
+    RUN_TEST(max_filters_per_stage_rejects_zero)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END

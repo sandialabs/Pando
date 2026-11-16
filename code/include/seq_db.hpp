@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <exception>
+#include <stdexcept>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -174,14 +175,24 @@ class SeqDB {
         /** @brief Hold entries that need their values updates */
         absl::flat_hash_map<dbkey_t, string> val_updates_;
 
+        /** @brief How many filter runs one pass of run_filters_() may do
+         * before it stops, so the stage can close. Entries created by those
+         * runs (and messages for them) are held in memory until the stage
+         * closes, so a smaller value bounds that memory at the cost of more
+         * passes.
+         */
+        size_t max_filters_per_stage_ = 100000;
+
         bool run_filters_() {
             bool filter_ran = false;
             auto keys = db_.keys();
             size_t i = 0;
             size_t num_keys [[maybe_unused]]  = keys.size(); // unused w/o verbosity
 
-            // limit how many filters we run before a stage close to help with memory usage
-            size_t MAX_FILTERS_TO_RUN = 100000;
+            // Limit how many filters we run before a stage close to help with
+            // memory usage (see max_filters_per_stage_). The limit is checked
+            // after all filters have been offered an entry, so a pass can go
+            // over it by up to (installed filters - 1).
             size_t num_filters_run = 0;
 
 
@@ -219,7 +230,7 @@ class SeqDB {
                     delete access;
                 }
 
-                if (num_filters_run > MAX_FILTERS_TO_RUN) {
+                if (num_filters_run >= max_filters_per_stage_) {
                     #ifdef VERBOSE
                     cerr << "breaking early due to max filter run limit" << endl;
                     #endif
@@ -554,6 +565,17 @@ class SeqDB {
             // Add it to the installed list
             installed_filters_[filter_name] = filter;
         }
+
+        /** @brief Set how many filter runs one processing pass may do
+         * before stopping so the stage can close (default 100000)
+         */
+        void set_max_filters_per_stage(size_t n) {
+            if (n == 0) throw invalid_argument("max_filters_per_stage must be at least 1");
+            max_filters_per_stage_ = n;
+        }
+
+        /** @brief Return how many filter runs one processing pass may do */
+        size_t max_filters_per_stage() const { return max_filters_per_stage_; }
 
         /** @brief Return the number of installed filters*/
         size_t num_filters() {return installed_filters_.size();}

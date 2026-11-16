@@ -903,11 +903,72 @@ TEST(subscribing_consensus) {
     TEST_PASS
 }
 
+// With max_filters_per_stage = 1, every agent closes its stage after each
+// filter run. Processing must still loop (across agents) until every entry
+// has been filtered.
+TEST(filter_max_filters_per_stage) {
+    g_idx = 0;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr, 2ull*(1ull<<29), false, 1 };
+
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr, 2ull*(1ull<<29), false, 1 };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+
+    vector<ZMQAddress> addrs; addrs.push_back(db1_addr); addrs.push_back(db2_addr);
+
+    c1.add_neighbor(db2_addr);
+
+    this_thread::sleep_for(chrono::milliseconds(50));
+
+    EQ(c1.num_neighbors(), 2);
+    EQ(c2.num_neighbors(), 2);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_new_entry");
+
+    // Entries the filter runs on (tag "A"), spread over both agents by key
+    size_t num_a = 10;
+    for (size_t k = 0; k < num_a; ++k) {
+        DBEntry<> e; e.set_key({1, (vtx_t)(10+k), 0});  // placement hashes (a, b)
+        e.add_tag("A").add_to_value("v"+to_string(k));
+        c1.add_entry(e);
+    }
+
+    this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size(), num_a);
+
+    c1.process();
+    wait(addrs);
+
+    // Every "A" entry was filtered, and the filter's output entry {2,2,2}
+    // (identical every time, so stored once) exists
+    size_t done = 0;
+    bool new_entry_found = false;
+    vector<DBEntry<>> entries = c1.get_entries();
+    auto c2_entries = c2.get_entries();
+    move(c2_entries.begin(), c2_entries.end(), std::back_inserter(entries));
+    for (auto & entry : entries) {
+        if (entry.has_tag("A") && entry.has_tag("test_pardb_filters_new_entry:done")) ++done;
+        if (entry.get_key() == dbkey_t{2,2,2}) new_entry_found = true;
+    }
+    EQ(done, num_a);
+    EQ(new_entry_found, true);
+    EQ(c1.db_size() + c2.db_size(), num_a+1);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
     RUN_TEST(filter_new_entry)
     RUN_TEST(filter_new_entry_with_key)
+    RUN_TEST(filter_max_filters_per_stage)
     RUN_TEST(filter_fail)
     RUN_TEST(dup_filters_fail)
     RUN_TEST(two_filters)
