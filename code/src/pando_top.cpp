@@ -68,13 +68,20 @@ struct AgentData {
     AgentData() : w(nullptr), db_size(0), last_seen(0) { }
 };
 
+// Smallest terminal the layout fits in: the stats box needs 31 columns
+// ("Total DB size : " plus an 11-digit size) after the 14-column header and
+// the 7-column spinner. Agent boxes start at row 7 and are 3 rows tall, and
+// the last row is kept for the "not shown" note, so one row of agents needs 11.
+static const int MIN_ROWS = 11;
+static const int MIN_COLS = 52;
+
 class PandoData {
     private:
         PandoTop& pp_;
-        vector<WINDOW*>& wins_;
         WinPos mesh_, db_, up_;
         int status_;
         unordered_map<addr_t, AgentData> agents_;
+        size_t hidden_agents_;
 
         inline static WinPos get_pos_(WINDOW *w) {
             int y, x;
@@ -90,15 +97,24 @@ class PandoData {
         int rows_, cols_;
 
     public:
-        PandoData(PandoTop& pp, vector<WINDOW*>& wins, int rows, int cols) :
-                pp_(pp), wins_(wins), status_(0), x_(2), y_(7),
+        PandoData(PandoTop& pp, int rows, int cols) :
+                pp_(pp), status_(0), hidden_agents_(0), x_(2), y_(7),
                 rows_(rows), cols_(cols) {
         }
+
+        ~PandoData() {
+            for (auto& [addr, ad] : agents_)
+                if (ad.w != nullptr) delwin(ad.w);
+        }
+
+        PandoData(const PandoData&) = delete;
+        PandoData& operator=(const PandoData&) = delete;
 
         void set_mesh_pos(WINDOW* w) {
             mesh_ = get_pos_(w);
         }
         void write_mesh() {
+            if (mesh_.w == nullptr) return;
             size_t known = agents_.size();
             size_t full = pp_.agents().size();
             if (known != full)
@@ -111,6 +127,7 @@ class PandoData {
             db_ = get_pos_(w);
         }
         void write_db() {
+            if (db_.w == nullptr) return;
             size_t db_size = 0;
             for (auto& [addr, ad] : agents_) {
                 db_size += ad.db_size;
@@ -123,6 +140,7 @@ class PandoData {
             up_ = get_pos_(w);
         }
         void write_up() {
+            if (up_.w == nullptr) return;
             wmove(up_.w, up_.y, up_.x);
             wattron(up_.w, COLOR_PAIR(2));
             char status_char = 'X';
@@ -145,16 +163,23 @@ class PandoData {
         void write_stats() {
             write_mesh();
             write_db();
-            wrefresh(db_.w);
+            if (db_.w != nullptr) wrefresh(db_.w);
+        }
+
+        // Agents that do not fit on screen get no window; report how many
+        void write_hidden() {
+            move(rows_-1, 0);
+            clrtoeol();
+            if (hidden_agents_ > 0)
+                mvprintw(rows_-1, 2, "+%zu agents not shown (enlarge the window to see them)", hidden_agents_);
+            wnoutrefresh(stdscr);
         }
 
         void update() {
             // Process any messages, and register / create windows for all new
             // agents
-            printw("START");
             size_t max_recvs = pp_.agents().size()*2;
             for (size_t ctr = 0; ctr < max_recvs && pp_.recv_msg(); ++ctr) {}
-            printw("STOP");
 
             // Now, find any new agents and provide them windows as appropriate
             for (addr_t addr : pp_.agents()) {
@@ -165,92 +190,110 @@ class PandoData {
                     elga::ZMQAddress elga_addr {addr};
                     ad.str = elga_addr.get_addr_str();
 
-                    // Create a new window for it
+                    // Create a new window for it, if one fits (the last row is
+                    // kept free for the "not shown" note)
                     if (x_ + blk_w_ + blk_pad_ >= cols_) {
                         // Move to the next line
                         y_ += blk_h_;
                         x_ = 2;
                     }
-                    ad.w = newwin(blk_h_, blk_w_, y_, x_);
-                    x_ += blk_w_ + blk_pad_;
-                    wattron(ad.w, COLOR_PAIR(3));
-                    box(ad.w, 0, 0);
-                    wattroff(ad.w, COLOR_PAIR(3));
-                    wrefresh(ad.w);
+                    if (y_ + blk_h_ <= rows_ - 1 && x_ + blk_w_ <= cols_)
+                        ad.w = newwin(blk_h_, blk_w_, y_, x_);
+                    if (ad.w != nullptr) {
+                        x_ += blk_w_ + blk_pad_;
+                        wattron(ad.w, COLOR_PAIR(3));
+                        box(ad.w, 0, 0);
+                        wattroff(ad.w, COLOR_PAIR(3));
+                        wrefresh(ad.w);
+                    } else {
+                        ++hidden_agents_;
+                    }
 
                     agents_[addr] = move(ad);
                 }
 
                 // Update the state
                 auto [ls, size] = pp_.get_state(addr);
-                if (ls != 0 || true) {
-                    auto w = agents_[addr].w;
-                    agents_[addr].db_size = size;
-                    agents_[addr].last_seen = ls;
-                    auto age = time(nullptr) - agents_[addr].last_seen;
-                    if (age > 999) age = 999;
+                agents_[addr].db_size = size;
+                agents_[addr].last_seen = ls;
 
-                    if (age > 60) {
-                        wattron(w, COLOR_PAIR(1));
-                        box(w, 0, 0);
-                        wattroff(w, COLOR_PAIR(1));
-                    } else if (age < 10) {
-                        wattron(w, COLOR_PAIR(2));
-                        box(w, 0, 0);
-                        wattroff(w, COLOR_PAIR(2));
-                    } else {
-                        wattron(w, COLOR_PAIR(3));
-                        box(w, 0, 0);
-                        wattroff(w, COLOR_PAIR(3));
-                    }
+                auto w = agents_[addr].w;
+                if (w == nullptr) continue;
 
-                    if (age > 4) {
-                        string age_s = to_string(age);
-                        size_t age_s_len = age_s.size();
+                auto age = time(nullptr) - agents_[addr].last_seen;
+                if (age > 999) age = 999;
 
-                        mvwprintw(w, 0, blk_w_-age_s_len-1, "%s", age_s.c_str());
-                        if (age == 999)
-                            wprintw(w, "+");
-                    }
-                    string addr_str = agents_[addr].str;
-                    mvwprintw(w, 0, 1, "%s", addr_str.c_str());
-                    mvwprintw(w, 1, 2, "DB size : %-8ld", agents_[addr].db_size);
-                    wrefresh(w);
+                if (age > 60) {
+                    wattron(w, COLOR_PAIR(1));
+                    box(w, 0, 0);
+                    wattroff(w, COLOR_PAIR(1));
+                } else if (age < 10) {
+                    wattron(w, COLOR_PAIR(2));
+                    box(w, 0, 0);
+                    wattroff(w, COLOR_PAIR(2));
+                } else {
+                    wattron(w, COLOR_PAIR(3));
+                    box(w, 0, 0);
+                    wattroff(w, COLOR_PAIR(3));
                 }
+
+                if (age > 4) {
+                    string age_s = to_string(age);
+                    size_t age_s_len = age_s.size();
+
+                    mvwprintw(w, 0, blk_w_-age_s_len-1, "%s", age_s.c_str());
+                    if (age == 999)
+                        wprintw(w, "+");
+                }
+                string addr_str = agents_[addr].str;
+                mvwprintw(w, 0, 1, "%s", addr_str.c_str());
+                mvwprintw(w, 1, 2, "DB size : %-8ld", agents_[addr].db_size);
+                wrefresh(w);
             }
 
             // Write updates
             write_stats();
             write_up();
+            write_hidden();
+            doupdate();
         }
 };
 
+// Wait for the next input event or timeout. Returns true if the terminal was
+// resized. ncurses reports resizes as KEY_RESIZE from getch(), and only then
+// updates LINES/COLS, so reading input is what keeps the size current.
+static bool wait_for_resize(int rows, int cols) {
+    int ch = getch();
+    if (ch == KEY_RESIZE) return true;
+    int cur_rows, cur_cols;
+    getmaxyx(stdscr, cur_rows, cur_cols);
+    return cur_rows != rows || cur_cols != cols;
+}
+
+// Draw one layout for the current terminal size and run until the terminal is
+// resized or Ctrl+C is pressed. All windows are created here and deleted on
+// return, so the caller can simply call it again after a resize.
 void top(PandoTop& pp) {
     vector<WINDOW*> wins;
 
-    setlocale(LC_ALL, "");
-
-    initscr();
-    cbreak();
-    keypad(stdscr, true);
-    noecho();
-    start_color();
-    curs_set(0);
-    erase();
-
+    // clear() rather than erase(): forces a full repaint, wiping the old layout
+    clear();
     refresh();
 
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    if (rows < 10 || cols < 10) throw runtime_error("Window too small");
+
+    // Too small for the layout: say so and wait for a resize instead of
+    // creating windows that would not fit
+    if (rows < MIN_ROWS || cols < MIN_COLS) {
+        mvprintw(0, 0, "Window too small (%dx%d, need %dx%d)", cols, rows, MIN_COLS, MIN_ROWS);
+        refresh();
+        while (!*g_shutdown && !wait_for_resize(rows, cols)) {}
+        return;
+    }
 
     // Keep track of the data to present
-    PandoData pd {pp, wins, rows, cols};
-
-    // Setup the colors
-    init_pair(1, COLOR_RED, COLOR_BLACK);
-    init_pair(2, COLOR_BLUE, COLOR_BLACK);
-    init_pair(3, COLOR_MAGENTA, COLOR_BLACK);
+    PandoData pd {pp, rows, cols};
 
     // Build the windows
     WINDOW *w_header;
@@ -289,21 +332,11 @@ void top(PandoTop& pp) {
         wprintw(w_hl, "▄");
     wrefresh(w_hl);
 
-    for (; !*g_shutdown; this_thread::sleep_for(chrono::milliseconds(10))) {
-        int cur_rows, cur_cols;
-        getmaxyx(stdscr, cur_rows, cur_cols);
-
-        if (cur_rows != rows || cur_cols != cols) {
-            // just reset the full top
-            break;
-        }
-
+    while (!*g_shutdown && !wait_for_resize(rows, cols))
         pd.update();
-    }
 
     for (auto revit = wins.rbegin(); revit != wins.rend(); ++revit)
-        delwin(*revit);
-    endwin();
+        if (*revit != nullptr) delwin(*revit);
 }
 
 int main_(int argc, char **argv) {
@@ -330,9 +363,24 @@ int main_(int argc, char **argv) {
     g_shutdown = &shutdown;
     set_handler();
 
+    // Set up the terminal once; top() rebuilds its windows after each resize
+    setlocale(LC_ALL, "");
+    initscr();
+    cbreak();
+    keypad(stdscr, true);
+    noecho();
+    start_color();
+    curs_set(0);
+    timeout(10);    // getch() waits at most 10 ms, pacing the update loop
+
+    init_pair(1, COLOR_RED, COLOR_BLACK);
+    init_pair(2, COLOR_BLUE, COLOR_BLACK);
+    init_pair(3, COLOR_MAGENTA, COLOR_BLACK);
+
     while (!shutdown)
         top(pp);
 
+    endwin();
     return 0;
 }
 
