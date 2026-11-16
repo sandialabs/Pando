@@ -57,6 +57,38 @@ TEST(zmq_message_moves) {
     TEST_PASS
 }
 
+// A received message can be forwarded on another socket without copying,
+// and is empty afterwards
+TEST(zmq_message_forward) {
+    void* ctx = zmq_ctx_new();
+    void* a = zmq_socket(ctx, ZMQ_PAIR);
+    void* b = zmq_socket(ctx, ZMQ_PAIR);
+    void* c = zmq_socket(ctx, ZMQ_PAIR);
+    void* d = zmq_socket(ctx, ZMQ_PAIR);
+    EQ(zmq_bind(b, "inproc://test_zmq_message_forward_1"), 0);
+    EQ(zmq_connect(a, "inproc://test_zmq_message_forward_1"), 0);
+    EQ(zmq_bind(d, "inproc://test_zmq_message_forward_2"), 0);
+    EQ(zmq_connect(c, "inproc://test_zmq_message_forward_2"), 0);
+
+    for (const string& s : {string("tiny"), string(5000, 'y')}) {
+        EQ(zmq_send(a, s.data(), s.size(), 0), (int)s.size());
+        {
+            ZMQMessage m(b);          // received on b ...
+            EQ(as_string(m), s);
+            m.send(c);                // ... forwarded on c
+            EQ(m.size(), 0);
+        }
+        ZMQMessage out(d);
+        EQ(as_string(out), s);
+    }
+
+    for (void* s : {a, b, c, d}) zmq_close(s);
+    zmq_ctx_term(ctx);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     RUN_TEST(zmq_message_moves)
+    RUN_TEST(zmq_message_forward)
 TESTS_END

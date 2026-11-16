@@ -40,7 +40,8 @@ class PandoResponder : public PandoParticipant {
         /** @brief Look up a batch of keys owned by this agent
          *
          * Request: <size_t n> <n x dbkey_t>. The reply is the PandoMap's
-         * MAP_RETRIEVE_VALUES reply, passed through unchanged.
+         * MAP_RETRIEVE_VALUES reply, forwarded as is: the received ZeroMQ
+         * message is sent on the requester's socket without being copied.
          */
         void recv_get_entries_by_keys(zmq_socket_t sock, const char* data, const char* end) {
             size_t n;
@@ -49,7 +50,7 @@ class PandoResponder : public PandoParticipant {
                 throw runtime_error("GET_ENTRIES_BY_KEYS: request size does not match key count");
 
             ZMQMessage resp = db_.retrieve_values_raw(n, (const dbkey_t*)data);
-            send(sock, resp.data(), resp.size());
+            resp.send(sock);
         }
 
         void recv_get_entry_by_key(zmq_socket_t sock, [[maybe_unused]] const char* data, [[maybe_unused]] const char* end) {
