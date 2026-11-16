@@ -251,10 +251,11 @@ class PandoParticipant : public ZMQChatterbox {
          * as they occur.
          *
          * This returns false if no messages were processed
+         *
+         * @param timeout_ms how long to wait for a message (0 to not wait)
          */
-        bool recv_msg() {
-            // Note: this is a non-blocking poll, wait for 500ms
-            auto socks = poll(500);
+        bool recv_msg(long timeout_ms = 500) {
+            auto socks = poll(timeout_ms);
             for (auto sock : socks) {
                 // Get the message
                 ZMQMessage msg(sock);
