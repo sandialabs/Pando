@@ -59,6 +59,12 @@ class ParDBThread {
         volatile sig_atomic_t* get_shutdown_flag() {
             return &shutdown_;
         }
+
+        /** @brief Access the internal DB, e.g. to adjust settings before
+         * processing starts. Its server thread is running, so only change
+         * things it does not use until later (such as settings read when
+         * filters run). */
+        T& db() { return db_; }
 };
 
 }

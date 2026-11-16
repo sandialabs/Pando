@@ -907,8 +907,9 @@ TEST(subscribing_consensus) {
 // missing one) with one batched call. The agent running the filter owns
 // some of the keys itself, which it reads from its own PandoMap. With a
 // small n, each owner's reply is only a few bytes (small enough for ZeroMQ
-// to keep inside the message object).
-TEST(filter_get_entries_by_keys, size_t n) {
+// to keep inside the message object). With a small max_keys_per_request,
+// each owner's keys are split over several requests.
+TEST(filter_get_entries_by_keys, size_t n, size_t max_keys_per_request) {
     g_idx = 0;
 
     elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
@@ -917,6 +918,13 @@ TEST(filter_get_entries_by_keys, size_t n) {
     ParDBThread db2 { db2_addr };
     elga::ZMQAddress db3_addr { "127.0.0.1", g_idx+=inc_amount };
     ParDBThread db3 { db3_addr };
+
+    if (max_keys_per_request != 0) {
+        // Set on every agent: whichever owns the "Q" entry runs the filter
+        db1.db().set_max_keys_per_request(max_keys_per_request);
+        db2.db().set_max_keys_per_request(max_keys_per_request);
+        db3.db().set_max_keys_per_request(max_keys_per_request);
+    }
 
     ParDBClient c1 { db1_addr };
     ParDBClient c2 { db2_addr };
@@ -1021,8 +1029,9 @@ TESTS_BEGIN
 
     RUN_TEST(filter_new_entry)
     RUN_TEST(filter_new_entry_with_key)
-    RUN_TEST(filter_get_entries_by_keys, 2000)
-    RUN_TEST(filter_get_entries_by_keys, 2)
+    RUN_TEST(filter_get_entries_by_keys, 2000, 0)
+    RUN_TEST(filter_get_entries_by_keys, 2, 0)
+    RUN_TEST(filter_get_entries_by_keys, 2000, 7)
     RUN_TEST(filter_get_entry_by_key_local_and_remote)
     RUN_TEST(filter_fail)
     RUN_TEST(dup_filters_fail)
