@@ -13,8 +13,11 @@
 #include <iterator>
 #include <algorithm>
 #include <chrono>
+#include <boost/lexical_cast.hpp>
+#include <boost/lexical_cast/bad_lexical_cast.hpp>
 #include "absl/container/flat_hash_map.h"
 #include "Python.h"
+
 
 #include "pigo.hpp"
 
@@ -45,6 +48,7 @@ typedef int (*db_query_t)(dbkey_t, const char*, const char* const*, const DBAcce
 namespace pando {
 
 static string MERGE_STRATEGY_FORCE = "MERGE_STRATEGY=FORCE_MERGE";
+static string MERGE_STRATEGY_SUM = "MERGE_STRATEGY=SUM";
 
 /** @brief Start the embedded Python interpreter once per process
  *
@@ -376,6 +380,11 @@ class SeqDB {
                 force_merge |= entry->has_tag(MERGE_STRATEGY_FORCE);
                 should_concat |= force_merge;
 
+                if (e.has_tag(MERGE_STRATEGY_SUM) || entry->has_tag(MERGE_STRATEGY_SUM)) {
+                    should_concat = false;
+                    *entry = sum_entries(&e, entry);
+                }
+
                 if (should_concat)
                     *entry = concat_entries(&e, entry, force_merge);
             }
@@ -392,6 +401,32 @@ class SeqDB {
                 prepare_to_add_entry(&entry);
             }
             db_.insert_multiple(entries);
+        }
+
+        DBEntry<> sum_entries(DBEntry<>* e1, DBEntry<>* e2) {
+            DBEntry<> new_entry;
+            new_entry.set_key(e1->get_key());
+            vector<string> tag_union;
+            auto e1_tags = e1->tags();
+            auto e2_tags = e2->tags();
+            set_union(e1_tags.begin(), e1_tags.end(), e2_tags.begin(), e2_tags.end(), inserter(tag_union, tag_union.begin()));
+
+            for (auto &tag : tag_union) {
+                new_entry.add_tag(tag);
+            }
+
+            try {
+                double num1 = boost::lexical_cast<double>(e1->value());
+                double num2 = boost::lexical_cast<double>(e2->value());
+                double sum = num1 + num2;
+                new_entry.value() = to_string(sum);
+                new_entry.add_tag("MERGED_SUM");
+            } catch (const boost::bad_lexical_cast& exc) {
+                DBEntry<> new_concat_entry = concat_entries(e1, e2).add_tag("MERGED_SUM_FAILED");
+                new_concat_entry.set_key(e1->get_key());
+                return new_concat_entry;
+            }
+            return new_entry;
         }
 
         DBEntry<> concat_entries(DBEntry<>* e1, DBEntry<>* e2, bool force_merge=false) {
@@ -444,7 +479,13 @@ class SeqDB {
                 force_merge |= new_entries_it->second.has_tag(MERGE_STRATEGY_FORCE);
                 should_concat |= force_merge;
 
-                if (should_concat) {
+                // Sum numeric values, as add_entry does. Without this, two
+                // identical staged entries (e.g. two counts of "1") compare
+                // equal and the second is dropped, and differing ones are
+                // concatenated instead of added.
+                if (new_entries_it->second.has_tag(MERGE_STRATEGY_SUM) || entry.has_tag(MERGE_STRATEGY_SUM)) {
+                    new_entries_it->second = sum_entries(&(new_entries_it->second), &entry);
+                } else if (should_concat) {
                     entry = concat_entries(&(new_entries_it->second), &entry, force_merge);
                     new_entries_it->second = move(entry);
                 }
