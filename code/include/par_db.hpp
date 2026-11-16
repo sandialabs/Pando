@@ -594,13 +594,15 @@ class ParDB : public PandoParticipant {
                 const vector<size_t>* idx;    // positions of its keys
                 size_t next = 0;              // first position of the next request
                 size_t cur = 0;               // first position of the request in flight
-                bool done = false;
+                bool in_flight = false;       // a request was sent and its reply not read
             };
-            struct reply_t {
-                const size_t* positions;
-                size_t count;
-                ZMQMessage msg;
-            };
+
+            // The first error (a failed send, a bad reply, or the local
+            // lookup). After an error no new request is sent, but every
+            // request already sent is still read, so no responder socket is
+            // left with an unread reply; then all values are freed and the
+            // error is rethrown.
+            exception_ptr error;
 
             auto send_next = [&](owner_t& o) {
                 size_t b = o.next;
@@ -629,7 +631,15 @@ class ParDB : public PandoParticipant {
                 o.idx = &idx;
                 owners.push_back(o);
             }
-            for (auto & o : owners) send_next(o);
+            for (auto & o : owners) {
+                if (error) break;
+                try {
+                    send_next(o);
+                    o.in_flight = true;
+                } catch (...) {
+                    error = current_exception();
+                }
+            }
 
             // While the other owners work, read this agent's own keys from its
             // PandoMap. This uses the ParDB thread's own map client, which is
@@ -637,8 +647,7 @@ class ParDB : public PandoParticipant {
             // virtual get_entry_values_by_keys on db_ comes back here.
             // An error is held until every remote reply has been read.
             // Local keys are read in the same size of request as remote ones.
-            exception_ptr local_error;
-            try {
+            if (!error) try {
                 vector<dbkey_t> local_keys;
                 vector<char*> local_values;
                 for (size_t b = 0; b < local_idx.size(); b += max_keys_per_request_) {
@@ -650,37 +659,46 @@ class ParDB : public PandoParticipant {
                     for (size_t j = b; j < e; ++j) values[local_idx[j]] = local_values[j - b];
                 }
             } catch (...) {
-                local_error = current_exception();
+                error = current_exception();
             }
 
-            // Collect every reply, sending each owner its next request as soon
-            // as its previous reply is in. Every reply is read before any is
-            // parsed, so that a bad reply cannot leave a request unread.
-            vector<reply_t> replies;
-            size_t remaining = owners.size();
-            while (remaining > 0) {
+            // Collect the replies owner by owner in turns. Each reply is
+            // parsed into values and freed as soon as it is read, so at most
+            // one reply is held at a time; then that owner is sent its next
+            // request.
+            bool any_in_flight = true;
+            while (any_in_flight) {
+                any_in_flight = false;
                 for (auto & o : owners) {
-                    if (o.done) continue;
-                    ZMQMessage msg = o.req->read();
-                    replies.push_back({o.idx->data() + o.cur, o.next - o.cur, move(msg)});
-                    if (o.next < o.idx->size()) {
-                        send_next(o);
-                    } else {
-                        o.done = true;
-                        --remaining;
+                    if (!o.in_flight) continue;
+                    {
+                        ZMQMessage msg = o.req->read();
+                        o.in_flight = false;
+                        if (!error) {
+                            try {
+                                const char* data = msg.data();
+                                unpack_values_reply(data, data + msg.size(), o.next - o.cur,
+                                                    o.idx->data() + o.cur, values);
+                            } catch (...) {
+                                error = current_exception();
+                            }
+                        }
+                    } // the reply is freed here
+                    if (!error && o.next < o.idx->size()) {
+                        try {
+                            send_next(o);
+                            o.in_flight = true;
+                        } catch (...) {
+                            error = current_exception();
+                        }
                     }
+                    any_in_flight |= o.in_flight;
                 }
             }
 
-            try {
-                if (local_error) rethrow_exception(local_error);
-                for (auto & r : replies) {
-                    const char* data = r.msg.data();
-                    unpack_values_reply(data, data + r.msg.size(), r.count, r.positions, values);
-                }
-            } catch (...) {
+            if (error) {
                 for (size_t i = 0; i < n; ++i) { free(values[i]); values[i] = nullptr; }
-                throw;
+                rethrow_exception(error);
             }
         }
 
