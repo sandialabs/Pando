@@ -349,7 +349,15 @@ ZMQMessage& ZMQMessage::operator=(ZMQMessage&& that) {
 }
 
 void ZMQMessage::send() {
+    send(sock_);
+}
+
+void ZMQMessage::send(zmq_socket_t sock) {
+    if (closed_) throw std::runtime_error("Cannot send a closed message");
     // zmq_msg_send returns the size clamped to INT_MAX, or -1 on error
-    int ret = zmq_msg_send(&msg_part_, sock_, 0);
+    int ret = zmq_msg_send(&msg_part_, sock, 0);
     if (ret < 0) throw std::runtime_error("Error while sending");
+    // On success ZeroMQ owns the buffer and msg_part_ is now empty
+    data_ = nullptr;
+    size_ = 0;
 }

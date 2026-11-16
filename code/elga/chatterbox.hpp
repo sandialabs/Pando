@@ -76,8 +76,12 @@ namespace elga {
             /** Access and change message data */
             char *edit_data() { return data_; }
 
-            /** Send the message */
+            /** Send the message on the socket it was created for */
             void send();
+            /** Send the message on another socket, e.g. to forward a message
+             *  received on one socket without copying it. ZeroMQ takes over
+             *  the buffer, so this message is empty afterwards. */
+            void send(zmq_socket_t sock);
     };
 
     /** Handles requests to servers */
