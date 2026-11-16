@@ -313,8 +313,27 @@ class ParDB : public PandoParticipant {
         }
 
 
-        /** @brief Lookup an entry by key */
+        /** @brief Lookup an entry by key
+         *
+         * A key this agent owns is read from its own PandoMap (through the
+         * ParDB thread's map client, idle whenever a filter runs) instead of
+         * through its own responder. The result is the same either way:
+         * - a missing key or an empty value leaves *res unchanged (callers
+         *   set it to nullptr first), as the remote path's "\0" comparison
+         *   does;
+         * - otherwise *res is a malloc'd copy, cut at the first NUL byte
+         *   (strcpy), as the remote path does.
+         */
         void get_entry_by_key(dbkey_t key, char** res) {
+            if (has_ownership(key)) {
+                string value;
+                if (!db_.get_value_if_exists(key, value) || value.empty()) return;
+                *res = (char*)malloc(sizeof(char)*value.size()+1);
+                if (*res == nullptr) throw runtime_error("Unable to allocate memory");
+                strcpy(*res, value.c_str());
+                return;
+            }
+
             // Serialize the key and tag
             size_t msg_size = sizeof(msg_type_t)+sizeof(dbkey_t);
             char msg[msg_size];
