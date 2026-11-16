@@ -111,34 +111,47 @@ class AlgDB : public SeqDB {
 
             group_entries_.clear();
 
-            vector<DBEntry<>> ret_entries;
+            // Only the keys and tags of each edge entry are loaded, never the
+            // values, so the whole DB is not copied into memory. Edge accesses
+            // therefore have value == nullptr; a group filter that needs an
+            // edge's value must look it up with get_entry_by_key. Entries are
+            // fetched in batches to keep each request/response small.
+            vector<dbkey_t> edge_keys;
             if (!skip_group_filters_) {
-                ret_entries = db_.retrieve_all_entries();
+                for (auto & k : db_.keys()) {
+                    // Random keys are not part of any group
+                    if (!is_random_key(k))
+                        edge_keys.push_back(k);
+                }
             }
-            for (auto & entry : ret_entries) {         // TODO : replace this with a C++ iterator that automatically "batches" behind the scene
-                if (entry.random_key()) continue;
-                dbkey_t k = entry.get_key();
 
-                group_entries_.push_back(move(entry));
+            const size_t BATCH_SIZE = 1ull<<16;
+            for (size_t begin = 0; begin < edge_keys.size(); begin += BATCH_SIZE) {
+                for (auto & entry : db_.retrieve_tags_by_keys(edge_keys, begin, BATCH_SIZE)) {
+                    dbkey_t k = entry.get_key();
 
-                DBAccess* acc = group_entries_.back().access();
-                add_db_access(acc);
+                    group_entries_.push_back(move(entry));
 
-                // Populate the graph
-                // We know we have [k.b] - by hash constraint on what is in our DB
-                // assume k.a is something fixed
-                // we have all db entries:
-                //  OUT [k.b][a1]
-                //  OUT [k.b][a2]
-                //  OUT [k.b][..]
-                //  OUT [k.b][aN]
-                //
-                //  \        /
-                //   --------- ---> due to hashing with k.c = 0
-                //
-                // we are the correct processor for k.b ✓
+                    DBAccess* acc = group_entries_.back().access();
+                    acc->value = nullptr;
+                    add_db_access(acc);
 
-                graphs_[k.a][k.b].out.emplace_back(k.c, acc);
+                    // Populate the graph
+                    // We know we have [k.b] - by hash constraint on what is in our DB
+                    // assume k.a is something fixed
+                    // we have all db entries:
+                    //  OUT [k.b][a1]
+                    //  OUT [k.b][a2]
+                    //  OUT [k.b][..]
+                    //  OUT [k.b][aN]
+                    //
+                    //  \        /
+                    //   --------- ---> due to hashing with k.c = 0
+                    //
+                    // we are the correct processor for k.b ✓
+
+                    graphs_[k.a][k.b].out.emplace_back(k.c, acc);
+                }
             }
 
             // Now, iterate through the graph and run on each entry group

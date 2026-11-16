@@ -296,10 +296,14 @@ TEST(simple_group_test) {
     TEST_PASS
 }
 
-// Group filters must be able to read each edge's entry (value and tags) while
-// they run, not just during should_run/init. Each edge's DBAccess points into
-// the entry rather than copying it, so the entries must outlive setup and stay
-// alive through every compute iteration.
+// Group filters must be able to read each edge's tags while they run, not just
+// during should_run/init. Each edge's DBAccess points into the entry rather
+// than copying it, so the entries must outlive setup and stay alive through
+// every compute iteration.
+//
+// Edge values are intentionally not loaded (so the AlgDB does not copy the
+// whole DB into memory): the edge access value is nullptr, and the value is
+// still available through get_entry_by_key.
 static const size_t G_EDGES_VALUE_LEN = 80;
 static size_t g_TEST_edges_checked;
 static vector<string> g_TEST_edges_errors;
@@ -325,13 +329,24 @@ void g_TEST_edges_run(void* access) {
     for (auto & edge : acc->group->entry.out) {
         string where = to_string(acc->group->vtx) + "->" + to_string(edge.n);
 
-        string want = g_TEST_edge_value(acc->key.a, acc->group->vtx, edge.n);
-        if (edge.acc->value == nullptr || string(edge.acc->value) != want) {
-            // Skip the tags: if the value is wrong, the tag array may be too,
-            // and walking it could crash instead of failing the test
-            g_TEST_edges_errors.push_back("value of edge " + where);
+        // The key identifies the edge; if it is wrong the access is likely
+        // garbage, so do not walk the tags
+        dbkey_t want_key {(chain_info_t)acc->key.a, acc->group->vtx, edge.n};
+        if (edge.acc->key != want_key) {
+            g_TEST_edges_errors.push_back("key of edge " + where);
             continue;
         }
+
+        if (edge.acc->value != nullptr)
+            g_TEST_edges_errors.push_back("value of edge " + where + " was loaded");
+
+        // The value is still available on demand
+        string want = g_TEST_edge_value(acc->key.a, acc->group->vtx, edge.n);
+        char* val = nullptr;
+        edge.acc->get_entry_by_key.run(&edge.acc->get_entry_by_key, edge.acc->key, &val);
+        if (val == nullptr || string(val) != want)
+            g_TEST_edges_errors.push_back("value lookup of edge " + where);
+        free(val);
 
         set<string> tags;
         size_t n = 0;
