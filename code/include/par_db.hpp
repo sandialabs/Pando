@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <exception>
+#include <stdexcept>
 #include <list>
 #include <vector>
 #include <thread>
@@ -113,6 +115,10 @@ class ParDB : public PandoParticipant {
             opts.mem_policy = mem_policy;
             return opts;
         }
+
+        /** @brief Most keys get_entries_by_keys puts in one request to one
+         * agent (see set_max_keys_per_request) */
+        size_t max_keys_per_request_ = 65536;
 
     public:
         /** @brief Initialize the parallel DB
@@ -578,64 +584,118 @@ class ParDB : public PandoParticipant {
                 else by_owner[owner].push_back(i);
             }
 
-            // Send one request to every owner before waiting for any reply
+            // Each owner's keys are sent in requests of at most
+            // max_keys_per_request_ keys. Every owner's first request goes
+            // out before any reply is awaited; after each reply, that owner
+            // is sent its next request.
             using req_it = decltype(find_req(keys[0], true));
-            vector<pair<req_it, const vector<size_t>*>> pending;
-            pending.reserve(by_owner.size());
-            for (auto & [owner, idx] : by_owner) {
-                auto req = find_req(keys[idx[0]], true); // the owner's responder
+            struct owner_t {
+                req_it req;                   // the owner's responder
+                const vector<size_t>* idx;    // positions of its keys
+                size_t next = 0;              // first position of the next request
+                size_t cur = 0;               // first position of the request in flight
+                bool done = false;
+            };
+            struct reply_t {
+                const size_t* positions;
+                size_t count;
+                ZMQMessage msg;
+            };
 
-                size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + idx.size()*sizeof(dbkey_t);
+            auto send_next = [&](owner_t& o) {
+                size_t b = o.next;
+                size_t e = min(b + max_keys_per_request_, o.idx->size());
+                size_t count = e - b;
+
+                size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + count*sizeof(dbkey_t);
                 char* msg = new char[msg_size];
                 char* msg_ptr = msg;
                 pack_msg(msg_ptr, GET_ENTRIES_BY_KEYS);
-                pack_single(msg_ptr, idx.size());
-                for (size_t i : idx) pack_single(msg_ptr, keys[i]);
+                pack_single(msg_ptr, count);
+                for (size_t j = b; j < e; ++j) pack_single(msg_ptr, keys[(*o.idx)[j]]);
 
-                req->send(msg, msg_size);
+                o.req->send(msg, msg_size);
                 delete [] msg;
 
-                pending.push_back({req, &idx});
+                o.cur = b;
+                o.next = e;
+            };
+
+            vector<owner_t> owners;
+            owners.reserve(by_owner.size());
+            for (auto & [owner, idx] : by_owner) {
+                owner_t o;
+                o.req = find_req(keys[idx[0]], true);
+                o.idx = &idx;
+                owners.push_back(o);
             }
+            for (auto & o : owners) send_next(o);
 
             // While the other owners work, read this agent's own keys from its
             // PandoMap. This uses the ParDB thread's own map client, which is
             // idle whenever a filter runs. Call the SeqDB worker directly: the
             // virtual get_entry_values_by_keys on db_ comes back here.
             // An error is held until every remote reply has been read.
+            // Local keys are read in the same size of request as remote ones.
             exception_ptr local_error;
-            if (!local_idx.empty()) {
+            try {
                 vector<dbkey_t> local_keys;
-                local_keys.reserve(local_idx.size());
-                for (size_t i : local_idx) local_keys.push_back(keys[i]);
-                vector<char*> local_values(local_idx.size(), nullptr);
-                try {
+                vector<char*> local_values;
+                for (size_t b = 0; b < local_idx.size(); b += max_keys_per_request_) {
+                    size_t e = min(b + max_keys_per_request_, local_idx.size());
+                    local_keys.clear();
+                    for (size_t j = b; j < e; ++j) local_keys.push_back(keys[local_idx[j]]);
+                    local_values.assign(e - b, nullptr);
                     db_.get_entry_values_by_keys_worker(local_keys.size(), local_keys.data(), local_values.data());
-                    for (size_t j = 0; j < local_idx.size(); ++j) values[local_idx[j]] = local_values[j];
-                } catch (...) {
-                    local_error = current_exception();
+                    for (size_t j = b; j < e; ++j) values[local_idx[j]] = local_values[j - b];
+                }
+            } catch (...) {
+                local_error = current_exception();
+            }
+
+            // Collect every reply, sending each owner its next request as soon
+            // as its previous reply is in. Every reply is read before any is
+            // parsed, so that a bad reply cannot leave a request unread.
+            vector<reply_t> replies;
+            size_t remaining = owners.size();
+            while (remaining > 0) {
+                for (auto & o : owners) {
+                    if (o.done) continue;
+                    ZMQMessage msg = o.req->read();
+                    replies.push_back({o.idx->data() + o.cur, o.next - o.cur, move(msg)});
+                    if (o.next < o.idx->size()) {
+                        send_next(o);
+                    } else {
+                        o.done = true;
+                        --remaining;
+                    }
                 }
             }
 
-            // Read every reply before parsing any, so that a bad reply cannot
-            // leave another responder's request unread
-            vector<ZMQMessage> replies;
-            replies.reserve(pending.size());
-            for (auto & [req, idx] : pending)
-                replies.push_back(req->read());
-
             try {
                 if (local_error) rethrow_exception(local_error);
-                for (size_t r = 0; r < pending.size(); ++r) {
-                    const vector<size_t>& idx = *pending[r].second;
-                    const char* data = replies[r].data();
-                    unpack_values_reply(data, data + replies[r].size(), idx.size(), idx.data(), values);
+                for (auto & r : replies) {
+                    const char* data = r.msg.data();
+                    unpack_values_reply(data, data + r.msg.size(), r.count, r.positions, values);
                 }
             } catch (...) {
                 for (size_t i = 0; i < n; ++i) { free(values[i]); values[i] = nullptr; }
                 throw;
             }
         }
+
+        /** @brief Set the most keys get_entries_by_keys sends to one agent in
+         * one request (default 65536). A larger lookup is split into several
+         * requests to that agent; the caller still makes one call. This
+         * bounds the size of each request and reply message.
+         */
+        void set_max_keys_per_request(size_t n) {
+            if (n == 0) throw invalid_argument("max_keys_per_request must be at least 1");
+            max_keys_per_request_ = n;
+        }
+
+        /** @brief Return the most keys get_entries_by_keys sends in one request */
+        size_t max_keys_per_request() const { return max_keys_per_request_; }
 
         /** @brief Broadcast the message to add a filter directory to the internal DB */
         void recv_add_filter_dir_broadcast(zmq_socket_t sock, const char* data, const char* end) {
