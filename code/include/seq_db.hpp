@@ -1216,6 +1216,26 @@ class SeqDB {
             get_entry_value_by_key_worker(search_key, res);
         }
 
+        /** @brief Read one value from this DB's own map, with its exact
+         * length (values may contain NUL bytes)
+         * @return false if the key does not exist
+         */
+        bool get_value_if_exists(dbkey_t key, string& value) {
+            ZMQMessage resp = db_.retrieve_values_raw(1, &key);
+            const char* data = resp.data();
+            const char* end = data + resp.size();
+            if ((size_t)(end - data) < 2*sizeof(size_t) + sizeof(bool)) throw runtime_error("values reply: too short");
+            size_t count;
+            bool exists;
+            size_t len;
+            unpack_single(data, count);
+            unpack_single(data, exists);
+            unpack_single(data, len);
+            if (count != 1 || (size_t)(end - data) < len) throw runtime_error("values reply: malformed");
+            value.assign(data, len);
+            return exists;
+        }
+
         /** @brief Get the values for n keys with one request to the map
          *
          * values[i] receives a malloc'd, NUL-terminated copy of the value for
