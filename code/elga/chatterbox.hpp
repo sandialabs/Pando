@@ -38,7 +38,10 @@ namespace elga {
         private:
             zmq_msg_t msg_part_;
             zmq_socket_t sock_;
-            int size_;
+            /** Size in bytes. size_t, not int: zmq_msg_recv/zmq_msg_send
+             *  return an int clamped to INT_MAX, so sizes are taken from
+             *  zmq_msg_size() instead */
+            size_t size_;
             char *data_;
             bool closed_;
 
@@ -62,7 +65,7 @@ namespace elga {
             ZMQMessage& operator=(ZMQMessage&& that);
 
             /** Get the message size */
-            size_t size() const { return (size_t)size_; }
+            size_t size() const { return size_; }
 
             /** Access the message data */
             const char *data() const { return data_; }

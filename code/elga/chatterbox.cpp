@@ -277,10 +277,12 @@ ZMQMessage::ZMQMessage(zmq_socket_t sock, bool block) : msg_part_(), sock_(sock)
     // Initialize the message
     if (zmq_msg_init(&msg_part_) != 0) throw std::runtime_error("Unable to init msg");
 
-    // Read out the message
-    size_ = zmq_msg_recv(&msg_part_, sock_, (block) ? 0 : ZMQ_DONTWAIT);
+    // Read out the message. The return value is only used to detect errors:
+    // for messages over INT_MAX bytes it is clamped, so the real size comes
+    // from zmq_msg_size().
+    int ret = zmq_msg_recv(&msg_part_, sock_, (block) ? 0 : ZMQ_DONTWAIT);
 
-    if (size_ == -1 && !block && errno == EAGAIN) {
+    if (ret == -1 && !block && errno == EAGAIN) {
         // We are not blocking, and there are no messages
         zmq_msg_close(&msg_part_);
         closed_ = true;
@@ -289,9 +291,10 @@ ZMQMessage::ZMQMessage(zmq_socket_t sock, bool block) : msg_part_(), sock_(sock)
         return;
     }
 
-    if (size_ < 0) throw std::runtime_error("Unable to read message");
+    if (ret < 0) throw std::runtime_error("Unable to read message");
 
     // The message is now held up in the internal zmq_msg
+    size_ = zmq_msg_size(&msg_part_);
     data_ = (char*)zmq_msg_data(&msg_part_);
 }
 
@@ -300,7 +303,7 @@ ZMQMessage::ZMQMessage(zmq_socket_t sock, size_t size) : msg_part_(), sock_(sock
     if (zmq_msg_init_size(&msg_part_, size) != 0) throw std::runtime_error("Unable to init alloc msg");
 
     // Set the size
-    size_ = (int)size;
+    size_ = size;
 
     // The output buffer is now held up in the internal zmq_msg
     data_ = (char*)zmq_msg_data(&msg_part_);
@@ -346,6 +349,7 @@ ZMQMessage& ZMQMessage::operator=(ZMQMessage&& that) {
 }
 
 void ZMQMessage::send() {
-    int ret_size = zmq_msg_send(&msg_part_, sock_, 0);
-    if (ret_size != size_) throw std::runtime_error("Error while sending");
+    // zmq_msg_send returns the size clamped to INT_MAX, or -1 on error
+    int ret = zmq_msg_send(&msg_part_, sock_, 0);
+    if (ret < 0) throw std::runtime_error("Error while sending");
 }
