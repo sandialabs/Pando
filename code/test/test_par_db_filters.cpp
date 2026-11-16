@@ -903,9 +903,12 @@ TEST(subscribing_consensus) {
     TEST_PASS
 }
 
-// A filter on one agent looks up keys owned by all three agents (and a
-// missing one) with one batched call
-TEST(filter_get_entries_by_keys) {
+// A filter on one agent looks up n keys owned by all three agents (and a
+// missing one) with one batched call. The agent running the filter owns
+// some of the keys itself, which it reads from its own PandoMap. With a
+// small n, each owner's reply is only a few bytes (small enough for ZeroMQ
+// to keep inside the message object).
+TEST(filter_get_entries_by_keys, size_t n) {
     g_idx = 0;
 
     elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
@@ -934,7 +937,6 @@ TEST(filter_get_entries_by_keys) {
     c1.install_filter("test_pardb_filters_get_entries");
 
     // Values at {30, i, 0} = i, spread over the agents (placement hashes (a, b))
-    size_t n = 2000;
     for (size_t i = 0; i < n; ++i) {
         DBEntry<> e; e.set_key({30, (vtx_t)i, 0});
         e.add_tag("value"); e.value() = to_string(i);
@@ -947,8 +949,8 @@ TEST(filter_get_entries_by_keys) {
     for (int t = 0; t < 100 && c1.db_size() + c2.db_size() + c3.db_size() != n + 2; ++t)
         this_thread::sleep_for(chrono::milliseconds(50));
     EQ(c1.db_size() + c2.db_size() + c3.db_size(), n + 2);
-    // The keys really are spread over all three agents
-    EQ(c1.db_size() > 0 && c2.db_size() > 0 && c3.db_size() > 0, true);
+    // With many keys, they really are spread over all three agents
+    if (n >= 100) EQ(c1.db_size() > 0 && c2.db_size() > 0 && c3.db_size() > 0, true);
 
     c1.process();
     wait(addrs);
@@ -967,7 +969,8 @@ TESTS_BEGIN
 
     RUN_TEST(filter_new_entry)
     RUN_TEST(filter_new_entry_with_key)
-    RUN_TEST(filter_get_entries_by_keys)
+    RUN_TEST(filter_get_entries_by_keys, 2000)
+    RUN_TEST(filter_get_entries_by_keys, 2)
     RUN_TEST(filter_fail)
     RUN_TEST(dup_filters_fail)
     RUN_TEST(two_filters)

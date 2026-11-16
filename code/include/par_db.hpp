@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <list>
 #include <vector>
 #include <thread>
@@ -346,9 +347,11 @@ class ParDB : public PandoParticipant {
         /** @brief Look up many keys with one blocking call
          *
          * Keys are grouped by the agent that owns them. One request is sent
-         * to every owner's responder before any reply is awaited, so the
-         * owners look their keys up in parallel; each answers its whole group
-         * with a single PandoMap lookup.
+         * to every other owner's responder before any reply is awaited, so
+         * the owners look their keys up in parallel; each answers its whole
+         * group with a single PandoMap lookup. Keys this agent owns are read
+         * directly from its own PandoMap while the other owners work, rather
+         * than through its own responder.
          *
          * values[i] receives a malloc'd, NUL-terminated copy of the value
          * for keys[i] (the caller frees it), or nullptr if the key does not
@@ -360,10 +363,15 @@ class ParDB : public PandoParticipant {
             for (size_t i = 0; i < n; ++i) values[i] = nullptr;
             if (n == 0) return;
 
-            // Group the positions of the keys by owning agent
+            // Group the positions of the keys by owning agent, keeping this
+            // agent's own keys apart
             unordered_map<addr_t, vector<size_t>> by_owner;
-            for (size_t i = 0; i < n; ++i)
-                by_owner[lookup_agent(keys[i])].push_back(i);
+            vector<size_t> local_idx;
+            for (size_t i = 0; i < n; ++i) {
+                addr_t owner = lookup_agent(keys[i]);
+                if (owner == addr_ser_) local_idx.push_back(i);
+                else by_owner[owner].push_back(i);
+            }
 
             // Send one request to every owner before waiting for any reply
             using req_it = decltype(find_req(keys[0], true));
@@ -385,6 +393,25 @@ class ParDB : public PandoParticipant {
                 pending.push_back({req, &idx});
             }
 
+            // While the other owners work, read this agent's own keys from its
+            // PandoMap. This uses the ParDB thread's own map client, which is
+            // idle whenever a filter runs. Call the SeqDB worker directly: the
+            // virtual get_entry_values_by_keys on db_ comes back here.
+            // An error is held until every remote reply has been read.
+            exception_ptr local_error;
+            if (!local_idx.empty()) {
+                vector<dbkey_t> local_keys;
+                local_keys.reserve(local_idx.size());
+                for (size_t i : local_idx) local_keys.push_back(keys[i]);
+                vector<char*> local_values(local_idx.size(), nullptr);
+                try {
+                    db_.get_entry_values_by_keys_worker(local_keys.size(), local_keys.data(), local_values.data());
+                    for (size_t j = 0; j < local_idx.size(); ++j) values[local_idx[j]] = local_values[j];
+                } catch (...) {
+                    local_error = current_exception();
+                }
+            }
+
             // Read every reply before parsing any, so that a bad reply cannot
             // leave another responder's request unread
             vector<ZMQMessage> replies;
@@ -393,6 +420,7 @@ class ParDB : public PandoParticipant {
                 replies.push_back(req->read());
 
             try {
+                if (local_error) rethrow_exception(local_error);
                 for (size_t r = 0; r < pending.size(); ++r) {
                     const vector<size_t>& idx = *pending[r].second;
                     const char* data = replies[r].data();
