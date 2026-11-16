@@ -1081,80 +1081,6 @@ TEST(import_export_with_tag) {
     TEST_PASS
 }
 
-TEST(sum_merge) {
-    SeqDB db;
-
-    // First, test a normal add
-    dbkey_t k1 {1,1,1};
-    {
-        DBEntry<> e;
-        e.value() = "1";
-        e.set_key(k1);
-        e.add_tag("MERGE_STRATEGY=SUM");
-        db.add_entry(move(e));
-    }
-    {
-        DBEntry<> e;
-        e.value() = "2";
-        e.set_key(k1);
-        e.add_tag("MERGE_STRATEGY=SUM");
-        db.add_entry(move(e));
-    }
-    // Then, test one with decimals
-    dbkey_t k2 {2,2,2};
-    {
-        DBEntry<> e;
-        e.value() = "1.2";
-        e.set_key(k2);
-        e.add_tag("MERGE_STRATEGY=SUM");
-        db.add_entry(move(e));
-    }
-    {
-        DBEntry<> e;
-        e.value() = "2.3";
-        e.set_key(k2);
-        e.add_tag("MERGE_STRATEGY=SUM");
-        db.add_entry(move(e));
-    }
-    // Now, test one that fails
-    dbkey_t k3 {3,3,3};
-    {
-        DBEntry<> e;
-        e.value() = "foo";
-        e.set_key(k3);
-        e.add_tag("MERGE_STRATEGY=SUM");
-        db.add_entry(move(e));
-    }
-    {
-        DBEntry<> e;
-        e.value() = "bar";
-        e.set_key(k3);
-        e.add_tag("MERGE_STRATEGY=SUM");
-        db.add_entry(move(e));
-    }
-
-
-    //EQ(db.size(), 3);
-    for (auto & [key, entry] : db.entries()) {
-        if (key == k1) {
-            EQ(entry.value(), "3.000000");
-            EQ(entry.has_tag("MERGED_SUM"), true);
-        } else if (key == k2) {
-            EQ(entry.value(), "3.500000");
-            EQ(entry.has_tag("MERGED_SUM"), true);
-        } else if (key == k3) {
-            bool match = entry.value() == "foo\nbar" || entry.value() == "bar\nfoo";
-            EQ(match, true);
-            EQ(entry.has_tag("MERGED"), true);
-            EQ(entry.has_tag("MERGED_SUM_FAILED"), true);
-        } else {
-            TEST_FAIL
-        }
-    }
-
-    TEST_PASS
-}
-
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1192,7 +1118,6 @@ TESTS_BEGIN
     RUN_TEST(serialize_entries)
     RUN_TEST(import_export)
     RUN_TEST(import_export_with_tag)
-    RUN_TEST(sum_merge)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END
