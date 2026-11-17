@@ -32,6 +32,8 @@ class AlgDB : public SeqDB {
 
         // Find all filters that run on entry groups
         vector<filter_p> filters_;
+        // Counters for each entry of filters_ (same order)
+        vector<FilterCounters*> filter_counters_;
 
         // The entries behind every group edge. Each edge's DBAccess points
         // into one of these (its tags and value are not copied), so they must
@@ -101,6 +103,7 @@ class AlgDB : public SeqDB {
             for (auto & [filter_name, filter] : installed_filters_) {
                 if (filter->filter_type() == GROUP_ENTRIES) {
                     filters_.push_back(filter);
+                    filter_counters_.push_back(&stats_.filter(filter_name, PASS_GROUP).pass);
                 }
             }
 
@@ -169,8 +172,11 @@ class AlgDB : public SeqDB {
                     // Add the filter
                     vector<void*> fs_vec;
                     fs_vec.reserve(filters_.size());
-                    for (auto & filter : filters_) {
+                    for (size_t idx = 0; idx < filters_.size(); ++idx) {
+                        auto & filter = filters_[idx];
+                        ++filter_counters_[idx]->checked;
                         if (filter->should_run(access)) {
+                            CurrentFilter current { cur_filter_, filter_counters_[idx] };
                             fs_vec.push_back(filter->init(access));
                         } else {
                             fs_vec.push_back(nullptr);
@@ -237,13 +243,21 @@ class AlgDB : public SeqDB {
                     bool ran = false;
                     for (size_t idx = 0; idx < filters_.size(); ++idx) {
                         if (filter_state[idx] != nullptr) {
-                            filters_[idx]->run_with_state(filter_state[idx]);
+                            auto start = steady_clock::now();
+                            {
+                                CurrentFilter current { cur_filter_, filter_counters_[idx] };
+                                filters_[idx]->run_with_state(filter_state[idx]);
+                            }
+                            filter_counters_[idx]->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
+                            ++filter_counters_[idx]->ran;
                             ran = true;
                         }
                     }
 
                     if (ran && acc->group->state == ACTIVE)
                         ++active;
+
+                    report_progress_if_due_();
                 }
             }
 
@@ -259,6 +273,7 @@ class AlgDB : public SeqDB {
             }
 
             ++iter_;
+            stats_.group_iter = iter_;
             return active > 0 || pending;
         }
         void teardown_graph() {
@@ -298,6 +313,7 @@ class AlgDB : public SeqDB {
             vertices_.clear();
             filter_states_.clear();
             filters_.clear();
+            filter_counters_.clear();
         }
 
         // 4 parts:
@@ -333,6 +349,7 @@ class AlgDB : public SeqDB {
                 return false;
 
             // Next, process GROUP_ENTRY filters
+            stats_.begin_pass(PASS_GROUP);
             setup_graph_datastructures();
 
             // @TODO Right now, the state and message requirement checking is
@@ -354,6 +371,8 @@ class AlgDB : public SeqDB {
             stage_close();
 
             teardown_graph();
+
+            stats_.end_pass();
 
             return false;
         }
