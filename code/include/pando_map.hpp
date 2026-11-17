@@ -234,9 +234,22 @@ class PandoMap : public PandoParticipant {
          *          (len is 0 and no bytes follow if the key does not exist)
          * Only values are returned, not tags.
          */
-        void recv_map_retrieve_values(zmq_socket_t sock, const char* data, [[maybe_unused]] const char* end) {
-            size_t n;
-            unpack_single(data, n);
+        void recv_map_retrieve_values(zmq_socket_t sock, const char* data, const char* end) {
+            // A malformed request (too short, or a key count that does not
+            // match its size) gets a reply with no values. The caller's parser
+            // rejects that (wrong number of values), so it gets an error
+            // instead of waiting forever, and nothing past the message is read.
+            size_t n = 0;
+            bool valid = (size_t)(end - data) >= sizeof(size_t);
+            if (valid) {
+                unpack_single(data, n);
+                valid = (size_t)(end - data) == n*sizeof(dbkey_t);
+            }
+            if (!valid) {
+                size_t zero = 0;
+                ZMQChatterbox::send(sock, (const char*)&zero, sizeof(zero));
+                return;
+            }
             const char* keys_data = data;
 
             // Find each entry once and size the reply
