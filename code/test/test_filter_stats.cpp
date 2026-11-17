@@ -225,6 +225,8 @@ TEST(btc_filter_counts) {
 class StatsListener : public PandoParticipant {
     public:
         map<addr_t, ProgressSnapshot> progress;
+        /** The last report each agent sent while closing each pass */
+        map<pair<addr_t, uint64_t>, ProgressSnapshot> last_closing;
         vector<StageEvent> events;
         size_t bad_msgs = 0;
 
@@ -235,7 +237,10 @@ class StatsListener : public PandoParticipant {
         void process_msg(msg_type_t type, [[maybe_unused]] zmq_socket_t sock, const char *data, const char *end) {
             if (type == PROGRESS) {
                 ProgressSnapshot p;
-                if (p.deserialize(data, end)) progress[p.agent] = p;
+                if (p.deserialize(data, end)) {
+                    if (p.state == STAGE_CLOSING) last_closing[{p.agent, p.pass}] = p;
+                    progress[p.agent] = p;
+                }
                 else ++bad_msgs;
             } else if (type == STAGE_EVENT) {
                 StageEvent e;
@@ -327,6 +332,34 @@ TEST(par_db_publishes_stats) {
         EQ((size_t)count(seq.begin(), seq.end(), STAGE_PROCESSED) >= 1, true);
         EQ((size_t)count(seq.begin(), seq.end(), STAGE_CLOSING) >= 1, true);
     }
+
+    // Closing pass 1 applied exactly what its filters staged: summed over
+    // the mesh, the close totals match the filter outputs, and each agent's
+    // last report while closing has every staged change applied
+    CloseProgress close_sum;
+    size_t closing_reports = 0;
+    for (auto& [key, p] : l.last_closing) {
+        if (key.second != 1) continue;
+        ++closing_reports;
+        auto& c = p.close;
+        EQ(c.start_ms > 0, true);
+        EQ(c.entries_done, c.entries_total);
+        EQ(c.vals_done, c.vals_total);
+        EQ(c.tags_added_done, c.tags_added_total);
+        EQ(c.tags_removed_done, c.tags_removed_total);
+        EQ(c.remaining(), 0);
+        close_sum.entries_total += c.entries_total;
+        close_sum.vals_total += c.vals_total;
+        close_sum.tags_added_total += c.tags_added_total;
+        close_sum.tags_removed_total += c.tags_removed_total;
+    }
+    EQ(closing_reports, 2);
+    FilterCounters out1;
+    for (auto& [name, c] : by_pass[1]) out1 += c;
+    EQ(close_sum.entries_total, out1.entries_out);
+    EQ(close_sum.vals_total, out1.val_updates);
+    EQ(close_sum.tags_added_total, out1.tags_added);
+    EQ(close_sum.tags_removed_total, out1.tags_removed);
 
     // The last progress reports agree with the events
     uint64_t total_ran = 0;
