@@ -175,8 +175,12 @@ class DBEntry {
             return !(operator!=(other));
         }
 
-        /** @brief Compute the size required for serialization */
-        size_t serialize_size() const {
+        /** @brief Compute the size required for serialization
+         *
+         * @param with_value if false, the value is serialized as empty (only
+         * the key and tags are kept)
+         */
+        size_t serialize_size(bool with_value=true) const {
             // Format:
             // <key>
             // <size(value)>
@@ -191,7 +195,7 @@ class DBEntry {
             ser_size += sizeof(dbkey_t);
 
             ser_size += sizeof(size_t);
-            size_t value_size = value_.size();
+            size_t value_size = with_value ? value_.size() : 0;
             ser_size += value_size;
 
             ser_size += sizeof(size_t);
@@ -205,9 +209,13 @@ class DBEntry {
         }
 
         /** @brief Place the serialized version of the object into an
-         * already-allocated memory location */
-        void serialize(char*& ser_ptr) const {
-            size_t value_size = value_.size();
+         * already-allocated memory location
+         *
+         * @param with_value if false, the value is serialized as empty (only
+         * the key and tags are kept)
+         */
+        void serialize(char*& ser_ptr, bool with_value=true) const {
+            size_t value_size = with_value ? value_.size() : 0;
 
             // Copy in the data
             *(dbkey_t*)ser_ptr = key_; ser_ptr += sizeof(dbkey_t);

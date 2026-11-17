@@ -32,6 +32,14 @@ class AlgDB : public SeqDB {
 
         // Find all filters that run on entry groups
         vector<filter_p> filters_;
+        // Counters for each entry of filters_ (same order)
+        vector<FilterCounters*> filter_counters_;
+
+        // The entries behind every group edge. Each edge's DBAccess points
+        // into one of these (its tags and value are not copied), so they must
+        // stay alive, and must not move, until teardown_graph() deletes those
+        // accesses. A list never relocates its elements as it grows.
+        list<DBEntry<>> group_entries_;
 
         itkey_t iter_ = 0;
 
@@ -46,6 +54,18 @@ class AlgDB : public SeqDB {
             skip_group_filters_ = true;
         }
 
+        /** @brief Whether any installed filter runs on entry groups
+         *
+         * Without one there is nothing to compute, so the group phase can be
+         * skipped entirely (no vertex setup, no copy of the DB). */
+        bool has_group_filters() const {
+            for (const auto & [filter_name, filter] : installed_filters_) {
+                if (filter->filter_type() == GROUP_ENTRIES)
+                    return true;
+            }
+            return false;
+        }
+
         //                                 SEND it, DEST vtx,  data..
         //graph key (graph_t), then msg_t = <itkey_t, <vertex_t, vector<MData>>>
         unordered_map<graph_t, msg_t> in_graph_msgs;
@@ -53,15 +73,17 @@ class AlgDB : public SeqDB {
 
         void setup_graph_datastructures() {
             // Sequential version
-            // Setup 'vertices_' for myself
-            // FIXME
-            vector<DBEntry<>> ret_entries;
+            // Setup 'vertices_' for myself. Only the keys are needed here, so
+            // read keys rather than copying every entry (the entries
+            // themselves are read once, in setup_graph_datastructures_have_ids)
+            vector<dbkey_t> ret_keys;
             if (!skip_group_filters_) {
-                ret_entries = db_.retrieve_all_entries();
+                ret_keys = db_.keys();
             }
-            for (auto & entry : ret_entries) {         // TODO : replace this with a C++ iterator that automatically "batches" behind the scene
-                if (entry.random_key()) continue;
-                dbkey_t k = entry.get_key();
+            for (auto & k : ret_keys) {
+                // Random keys (e.g. entries created with INITIAL_KEY) are not
+                // part of any group
+                if (is_random_key(k)) continue;
                 add_alg_vertex({k.a, k.b});
                 add_alg_vertex({k.a, k.c});
             }
@@ -81,6 +103,7 @@ class AlgDB : public SeqDB {
             for (auto & [filter_name, filter] : installed_filters_) {
                 if (filter->filter_type() == GROUP_ENTRIES) {
                     filters_.push_back(filter);
+                    filter_counters_.push_back(&stats_.filter(filter_name, PASS_GROUP).pass);
                 }
             }
 
@@ -89,36 +112,49 @@ class AlgDB : public SeqDB {
                 graphs_[graph][vtx];
             }
 
-            list<DBEntry<>> entries;
+            group_entries_.clear();
 
-            vector<DBEntry<>> ret_entries;
+            // Only the keys and tags of each edge entry are loaded, never the
+            // values, so the whole DB is not copied into memory. Edge accesses
+            // therefore have value == nullptr; a group filter that needs an
+            // edge's value must look it up with get_entry_by_key. Entries are
+            // fetched in batches to keep each request/response small.
+            vector<dbkey_t> edge_keys;
             if (!skip_group_filters_) {
-                ret_entries = db_.retrieve_all_entries();
+                for (auto & k : db_.keys()) {
+                    // Random keys are not part of any group
+                    if (!is_random_key(k))
+                        edge_keys.push_back(k);
+                }
             }
-            for (auto & entry : ret_entries) {         // TODO : replace this with a C++ iterator that automatically "batches" behind the scene
-                if (entry.random_key()) continue;
-                dbkey_t k = entry.get_key();
 
-                entries.push_back(move(entry));
+            const size_t BATCH_SIZE = 1ull<<16;
+            for (size_t begin = 0; begin < edge_keys.size(); begin += BATCH_SIZE) {
+                for (auto & entry : db_.retrieve_tags_by_keys(edge_keys, begin, BATCH_SIZE)) {
+                    dbkey_t k = entry.get_key();
 
-                DBAccess* acc = entries.back().access();
-                add_db_access(acc);
+                    group_entries_.push_back(move(entry));
 
-                // Populate the graph
-                // We know we have [k.b] - by hash constraint on what is in our DB
-                // assume k.a is something fixed
-                // we have all db entries:
-                //  OUT [k.b][a1]
-                //  OUT [k.b][a2]
-                //  OUT [k.b][..]
-                //  OUT [k.b][aN]
-                //
-                //  \        /
-                //   --------- ---> due to hashing with k.c = 0
-                //
-                // we are the correct processor for k.b ✓
+                    DBAccess* acc = group_entries_.back().access();
+                    acc->value = nullptr;
+                    add_db_access(acc);
 
-                graphs_[k.a][k.b].out.emplace_back(k.c, acc);
+                    // Populate the graph
+                    // We know we have [k.b] - by hash constraint on what is in our DB
+                    // assume k.a is something fixed
+                    // we have all db entries:
+                    //  OUT [k.b][a1]
+                    //  OUT [k.b][a2]
+                    //  OUT [k.b][..]
+                    //  OUT [k.b][aN]
+                    //
+                    //  \        /
+                    //   --------- ---> due to hashing with k.c = 0
+                    //
+                    // we are the correct processor for k.b ✓
+
+                    graphs_[k.a][k.b].out.emplace_back(k.c, acc);
+                }
             }
 
             // Now, iterate through the graph and run on each entry group
@@ -136,8 +172,11 @@ class AlgDB : public SeqDB {
                     // Add the filter
                     vector<void*> fs_vec;
                     fs_vec.reserve(filters_.size());
-                    for (auto & filter : filters_) {
+                    for (size_t idx = 0; idx < filters_.size(); ++idx) {
+                        auto & filter = filters_[idx];
+                        ++filter_counters_[idx]->checked;
                         if (filter->should_run(access)) {
+                            CurrentFilter current { cur_filter_, filter_counters_[idx] };
                             fs_vec.push_back(filter->init(access));
                         } else {
                             fs_vec.push_back(nullptr);
@@ -148,34 +187,94 @@ class AlgDB : public SeqDB {
             }
 
         }
+        /** @brief Run one iteration (superstep) of the group filters
+         *
+         * Vertex-centric (Pregel) semantics:
+         *  - a vertex runs if it is ACTIVE or has messages for this iteration;
+         *    a message wakes up a vertex that voted to halt (INACTIVE);
+         *  - every vertex sees the global iteration in group->iter, whether or
+         *    not it ran in earlier iterations;
+         *  - the computation continues while any vertex is still ACTIVE or any
+         *    message was sent for the next iteration, so a message sent in the
+         *    same iteration a vertex halts is still delivered.
+         *
+         * Messages a filter sends go to out_msgs[iter+1]. Messages from earlier
+         * iterations are dropped here once they have been consumed or
+         * delivered.
+         *
+         * @return whether another iteration is needed
+         */
         bool compute_internal() {
-            int cont = 0;
-            // Note: this will terminate when cont is never set to true,
-            // which happens if all group state values are != ACTIVE after
-            // running
-            // If just 1 is ACTIVE, the loop will continue and execute
-            // every filter for every vertex again
+            // Drop consumed incoming messages and already-delivered outgoing ones
+            for (auto & [graph_key, msgs] : in_graph_msgs)
+                for (auto it = msgs.begin(); it != msgs.end();)
+                    it = (it->first < iter_) ? msgs.erase(it) : next(it);
+            for (auto & [graph_key, msgs] : out_graph_msgs)
+                for (auto it = msgs.begin(); it != msgs.end();)
+                    it = (it->first <= iter_) ? msgs.erase(it) : next(it);
 
-            // Begin the processing loop
+            size_t active = 0;
+
             for (auto & [graph_key, graph] : filter_states_) {
+                // Messages delivered to this graph for the current iteration
+                const itmsg_t* msgs_now = nullptr;
+                auto in_graph = in_graph_msgs.find(graph_key);
+                if (in_graph != in_graph_msgs.end()) {
+                    auto at_iter = in_graph->second.find(iter_);
+                    if (at_iter != in_graph->second.end())
+                        msgs_now = &(at_iter->second);
+                }
+
                 for (auto & [v, fs_pair] : graph) {
                     auto & [acc, filter_state] = fs_pair;
+                    acc->group->iter = iter_;
 
-                    // Always run, and keep track of whether there is some
-                    // ACTIVE output
+                    bool has_msgs = false;
+                    if (msgs_now != nullptr) {
+                        auto vtx_msgs = msgs_now->find(v);
+                        has_msgs = vtx_msgs != msgs_now->end() && !vtx_msgs->second.empty();
+                    }
+
+                    // Halted vertices are skipped unless a message wakes them
+                    if (acc->group->state != ACTIVE && !has_msgs)
+                        continue;
+                    acc->group->state = ACTIVE;
+
+                    bool ran = false;
                     for (size_t idx = 0; idx < filters_.size(); ++idx) {
                         if (filter_state[idx] != nullptr) {
-                            filters_[idx]->run_with_state(filter_state[idx]);
-                            if (acc->group->state == ACTIVE)
-                                ++cont;
+                            auto start = steady_clock::now();
+                            {
+                                CurrentFilter current { cur_filter_, filter_counters_[idx] };
+                                filters_[idx]->run_with_state(filter_state[idx]);
+                            }
+                            filter_counters_[idx]->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
+                            ++filter_counters_[idx]->ran;
+                            ran = true;
                         }
                     }
 
-                    ++acc->group->iter;
+                    if (ran && acc->group->state == ACTIVE)
+                        ++active;
+
+                    report_progress_if_due_();
                 }
             }
+
+            // Any message sent for the next iteration keeps the computation going
+            bool pending = false;
+            for (auto & [graph_key, msgs] : out_graph_msgs) {
+                auto next_iter = msgs.find(iter_ + 1);
+                if (next_iter == msgs.end()) continue;
+                for (auto & [vtx, vtx_msgs] : next_iter->second) {
+                    if (!vtx_msgs.empty()) { pending = true; break; }
+                }
+                if (pending) break;
+            }
+
             ++iter_;
-            return cont > 0;
+            stats_.group_iter = iter_;
+            return active > 0 || pending;
         }
         void teardown_graph() {
             // Clear messages
@@ -209,9 +308,12 @@ class AlgDB : public SeqDB {
             }
 
             graphs_.clear();
+            // Only now that the edge accesses are deleted can their entries go
+            group_entries_.clear();
             vertices_.clear();
             filter_states_.clear();
             filters_.clear();
+            filter_counters_.clear();
         }
 
         // 4 parts:
@@ -241,7 +343,13 @@ class AlgDB : public SeqDB {
             // First, process all SINGLE_ENTRY filters
             seq_process();
 
+            // Nothing more to do without group filters; skip building the
+            // graph, which would otherwise read every entry in the DB
+            if (skip_group_filters_ || !has_group_filters())
+                return false;
+
             // Next, process GROUP_ENTRY filters
+            stats_.begin_pass(PASS_GROUP);
             setup_graph_datastructures();
 
             // @TODO Right now, the state and message requirement checking is
@@ -250,9 +358,12 @@ class AlgDB : public SeqDB {
             // specific
 
             while (compute_internal()) {
-                // Move out to in msgs
-                for (auto & [graph, msg] : out_graph_msgs) {
-                    in_graph_msgs[graph] = msg;
+                // Deliver the messages sent for the next iteration (iter_ now
+                // names it); older ones are dropped by compute_internal()
+                for (auto & [graph, msgs] : out_graph_msgs) {
+                    auto next_iter = msgs.find(iter_);
+                    if (next_iter != msgs.end())
+                        in_graph_msgs[graph][iter_] = move(next_iter->second);
                 }
             }
 
@@ -260,6 +371,8 @@ class AlgDB : public SeqDB {
             stage_close();
 
             teardown_graph();
+
+            stats_.end_pass();
 
             return false;
         }

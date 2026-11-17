@@ -210,6 +210,55 @@ TEST(retrieve_all) {
 
 }
 
+TEST(retrieve_tags_by_keys) {
+    ZMQAddress map_addr {"127.0.0.1", ++g_idx};
+    ParDBThread<PandoMap> m {map_addr};
+    PandoMapClient c {map_addr, map_addr};
+
+    // Create entries with long values and a couple of tags each
+    size_t num_entries = 1000;
+    vector<dbkey_t> keys;
+    for (chain_info_t i = 0; i < num_entries; i++) {
+        DBEntry<> e;
+        e.value() = string(1000+i, 'a');
+        e.add_tag("tag").add_tag("i=" + to_string(i));
+        dbkey_t key {i, 1, 2};
+        keys.push_back(key);
+        e.set_key(key);
+        c.insert(move(e));
+    }
+    // A key that does not exist should be skipped
+    keys.push_back({num_entries + 5, 1, 2});
+
+    // Request in uneven batches, including one past the end
+    size_t total = 0;
+    const size_t batch = 300;
+    for (size_t begin = 0; begin < keys.size() + batch; begin += batch) {
+        auto entries = c.retrieve_tags_by_keys(keys, begin, batch);
+        for (auto & entry : entries) {
+            auto key = entry.get_key();
+            uint64_t i = key.a;
+            if (i >= num_entries) TEST_FAIL
+            EQ(key.b, 1);
+            EQ(key.c, 2);
+
+            // No value, but all of the tags
+            EQ(entry.value().size(), 0);
+            EQ(entry.tags().size(), 2);
+            EQ(entry.has_tag("tag"), true);
+            EQ(entry.has_tag("i=" + to_string(i)), true);
+            ++total;
+        }
+    }
+    EQ(total, num_entries);
+
+    // The stored values are untouched
+    auto e0 = c.retrieve(keys[0]);
+    EQ(e0.value().size(), 1000);
+
+    TEST_PASS
+}
+
 TEST(start_stop_quickly) {
     ZMQAddress addr {"127.0.0.1", 0};
     for (size_t i = 0; i < 25; i++) {
@@ -310,6 +359,7 @@ TESTS_BEGIN
     RUN_TEST(get_keys_ipc)
     RUN_TEST(get_keys_ipc_large)
     RUN_TEST(retrieve_all)
+    RUN_TEST(retrieve_tags_by_keys)
     //RUN_TEST(start_stop_quickly) //FIXME does this test even make sense? fails on ubuntu
     RUN_TEST(retrieve_if_exists)
     RUN_TEST(insert_multiple)
