@@ -80,7 +80,8 @@ namespace elga {
             void send();
             /** Send the message on another socket, e.g. to forward a message
              *  received on one socket without copying it. ZeroMQ takes over
-             *  the buffer, so this message is empty afterwards. */
+             *  the buffer, so this message is empty (and closed) afterwards;
+             *  sending it again throws. */
             void send(zmq_socket_t sock);
     };
 
