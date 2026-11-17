@@ -15,6 +15,7 @@
 #include <iterator>
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include "absl/container/flat_hash_map.h"
 #include "Python.h"
 
@@ -27,6 +28,7 @@
 #include "pando_map_client.hpp"
 #include "par_db_thread.hpp"
 #include "terr.hpp"
+#include "process_stats.hpp"
 
 using namespace std;
 using namespace std::chrono;
@@ -204,6 +206,36 @@ class SeqDB {
             scan_pos_ = 0;
         }
 
+    protected:
+        /** @brief Processing statistics, see process_stats.hpp */
+        ProcessStats stats_;
+
+        /** @brief Counters of the filter currently running, so that its
+         * outputs (new entries, tags, ...) are attributed to it */
+        FilterCounters* cur_filter_ = nullptr;
+
+        /** @brief Sets cur_filter_ for a scope, clearing it even on throw */
+        struct CurrentFilter {
+            FilterCounters*& slot;
+            CurrentFilter(FilterCounters*& s, FilterCounters* c) : slot(s) { slot = c; }
+            ~CurrentFilter() { slot = nullptr; }
+        };
+
+        /** @brief Called periodically while processing so progress can be
+         * reported (ParDB cannot service its message loop meanwhile) */
+        function<void()> progress_cb_;
+        steady_clock::duration progress_interval_ = seconds(1);
+        steady_clock::time_point next_progress_;
+
+        /** @brief Call the progress callback if the interval has passed */
+        void report_progress_if_due_() {
+            if (!progress_cb_) return;
+            auto now = steady_clock::now();
+            if (now < next_progress_) return;
+            next_progress_ = now + progress_interval_;
+            progress_cb_();
+        }
+
         /** @brief Run the installed single-entry filters for one processing pass
          *
          * Entries are scanned with a cursor that carries over between passes
@@ -229,6 +261,15 @@ class SeqDB {
             // after all filters have been offered an entry, so a pass can go
             // over it by up to (installed filters - 1).
             size_t num_filters_run = 0;
+
+            // Look up each SINGLE_ENTRY filter's counters once, not per entry
+            vector<pair<Filter*, FilterCounters*>> filters;
+            for (auto & [filter_name, filter] : installed_filters_) {
+                // Only run on filters that are SINGLE_ENTRY filters
+                if (filter->filter_type() != SINGLE_ENTRY) continue;
+                filters.push_back({filter.get(), &stats_.filter(filter_name, PASS_SINGLE).pass});
+            }
+
             #ifdef VERBOSE
             size_t i = 0;   // entries this pass
             #endif
@@ -240,43 +281,56 @@ class SeqDB {
             }
             bool lap_from_start = (scan_pos_ == 0);
 
+            stats_.stopped_early = false;
+
             while (true) {
+                // Progress is reported as the cursor's position in the current
+                // lap, so a pass that resumes mid-lap starts part-way through
+                stats_.keys_total = scan_keys_.size();
+                stats_.keys_scanned = scan_pos_;
+
                 while (scan_pos_ < scan_keys_.size()) {
                     dbkey_t key = scan_keys_[scan_pos_++];
                     // The snapshot can be older than this pass; skip anything gone
                     auto [entry, exists] = db_.retrieve_if_exists(key); //TODO also batch retrievals
                     ++entries_examined_;
-                    if (!exists) continue;
-                    #ifdef VERBOSE
-                    if (++i % 10000 == 0) {
-                        cerr << "I have processed " << i << " entries this pass (cursor at " << scan_pos_ << "/"
-                             << scan_keys_.size() << ") and run " << num_filters_run << " filters" << endl;
-                    }
-                    #endif
-                    // @TODO profile to determine if this needs to be optimized out.
-                    //       this costs (|F|*|E|)
-                    for (auto & [filter_name, filter] : installed_filters_) {
-                        // Only run on filters that are SINGLE_ENTRY filters
-                        if (filter->filter_type() != SINGLE_ENTRY) {
-                            continue;
+                    if (exists) {
+                        #ifdef VERBOSE
+                        if (++i % 10000 == 0) {
+                            cerr << "I have processed " << i << " entries this pass (cursor at " << scan_pos_ << "/"
+                                 << scan_keys_.size() << ") and run " << num_filters_run << " filters" << endl;
                         }
+                        #endif
+                        // @TODO profile to determine if this needs to be optimized out.
+                        //       this costs (|F|*|E|)
+                        for (auto & [filter, counters] : filters) {
+                            // @TODO move back out; make a test for add tags and then
+                            // get tags inside of a filter
+                            // Get the DB access -- need to redo this for each filter,
+                            // can't be pulled out of the loop because things can
+                            // change between filter runs
+                            DBAccess* access = entry.access();
+                            add_db_access(access);
 
-                        // @TODO move back out; make a test for add tags and then
-                        // get tags inside of a filter
-                        // Get the DB access -- need to redo this for each filter,
-                        // can't be pulled out of the loop because things can
-                        // change between filter runs
-                        DBAccess* access = entry.access();
-                        add_db_access(access);
+                            ++counters->checked;
+                            if (filter->should_run(access)) {
+                                filter_ran = true;
+                                auto start = steady_clock::now();
+                                {
+                                    CurrentFilter current { cur_filter_, counters };
+                                    filter->run(access);
+                                }
+                                counters->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
+                                ++counters->ran;
+                                ++num_filters_run;
+                            }
 
-                        if (filter->should_run(access)) {
-                            filter_ran = true;
-                            filter->run(access);
-                            ++num_filters_run;
+                            delete access;
                         }
-
-                        delete access;
                     }
+
+                    stats_.keys_scanned = scan_pos_;
+                    report_progress_if_due_();
 
                     if (num_filters_run >= max_filters_per_stage_) {
                         #ifdef VERBOSE
@@ -284,6 +338,7 @@ class SeqDB {
                              << scan_keys_.size() << ")" << endl;
                         #endif
                         // Keep the cursor; the next pass continues from here
+                        stats_.stopped_early = scan_pos_ < scan_keys_.size();
                         return true;
                     }
                 }
@@ -631,6 +686,9 @@ class SeqDB {
             string filter_name { filter->name() };
             // Add it to the installed list
             installed_filters_[filter_name] = filter;
+            // Register it with the stats now so that it is reported (e.g.,
+            // shown by pando_top) before any processing has happened
+            stats_.filter(filter_name, filter->filter_type() == GROUP_ENTRIES ? PASS_GROUP : PASS_SINGLE);
             // New filters may apply to entries behind the cursor
             reset_scan_();
         }
@@ -675,11 +733,31 @@ class SeqDB {
 
         /** @brief Process one iteration, returning whether any filters were ran */
         bool process_once() {
+            stats_.begin_pass(PASS_SINGLE);
             // Close any pending changes
             bool filter_ran = run_filters_();
             stage_close();
+            stats_.end_pass();
             return filter_ran;
         }
+
+        /** @brief Processing statistics (per filter, per pass) */
+        ProcessStats& stats() { return stats_; }
+        const ProcessStats& stats() const { return stats_; }
+
+        /** @brief Call cb at most once per interval while processing */
+        void set_progress_callback(function<void()> cb, steady_clock::duration interval = seconds(1)) {
+            progress_cb_ = move(cb);
+            progress_interval_ = interval;
+            next_progress_ = steady_clock::now() + interval;
+        }
+
+        /** @brief Called by the filter API to attribute outputs to the
+         * running filter; no-ops outside of a filter run */
+        void note_entry_out() { if (cur_filter_ != nullptr) ++cur_filter_->entries_out; }
+        void note_tag_added() { if (cur_filter_ != nullptr) ++cur_filter_->tags_added; }
+        void note_tag_removed() { if (cur_filter_ != nullptr) ++cur_filter_->tags_removed; }
+        void note_val_update() { if (cur_filter_ != nullptr) ++cur_filter_->val_updates; }
 
         /** @brief Process the database, applying filters as appropriate */
         virtual bool process() {
@@ -1011,6 +1089,7 @@ static void s_SeqDB_new_entry(const fn* s_this, ...) {
 
     pando::SeqDB* db = (pando::SeqDB*)s_this->state;
     pando::DBEntry<> entry { new_tags, new_value, new_key };
+    db->note_entry_out();
     db->stage_add_entry(move(entry));
 }
 
@@ -1061,6 +1140,7 @@ static void s_SeqDB_add_tag(const fn* s_this, ...) {
     DBAccess* acc = (DBAccess*)s_this->state;
     // Get the SeqDB from new_entry, the key from the key field
     pando::SeqDB* db = (pando::SeqDB*)acc->make_new_entry.state;
+    db->note_tag_added();
     db->stage_add_tag(acc->key, new_tag);
 }
 
@@ -1076,6 +1156,7 @@ static void s_SeqDB_remove_tag(const fn* s_this, ...) {
     DBAccess* acc = (DBAccess*)s_this->state;
     // Get the SeqDB from new_entry, the key from the key field
     pando::SeqDB* db = (pando::SeqDB*)acc->make_new_entry.state;
+    db->note_tag_removed();
     db->stage_remove_tag(key, old_tag);
 }
 
@@ -1103,6 +1184,7 @@ static void s_SeqDB_update_entry_val(const fn* s_this, ...) {
     string new_val {new_val_cstr};
     DBAccess* acc = (DBAccess*)s_this->state;
     pando::SeqDB* db = (pando::SeqDB*)acc->make_new_entry.state;
+    db->note_val_update();
     db->stage_update_entry_val(key, new_val);
 }
 

@@ -1,5 +1,11 @@
 #include "test.hpp"
 #include "alg_db.hpp"
+#include "gas_filter.hpp"
+
+#include <limits>
+#include <map>
+#include <set>
+#include <tuple>
 
 using namespace std;
 using namespace pando;
@@ -290,6 +296,250 @@ TEST(simple_group_test) {
     TEST_PASS
 }
 
+// Group filters must be able to read each edge's tags while they run, not just
+// during should_run/init. Each edge's DBAccess points into the entry rather
+// than copying it, so the entries must outlive setup and stay alive through
+// every compute iteration.
+//
+// Edge values are intentionally not loaded (so the AlgDB does not copy the
+// whole DB into memory): the edge access value is nullptr, and the value is
+// still available through get_entry_by_key.
+static const size_t G_EDGES_VALUE_LEN = 80;
+static size_t g_TEST_edges_checked;
+static vector<string> g_TEST_edges_errors;
+
+static string g_TEST_edge_value(graph_t a, vtx_t b, vtx_t c) {
+    string v = "edge " + to_string(a) + "/" + to_string(b) + "/" + to_string(c) + " ";
+    v.resize(G_EDGES_VALUE_LEN, '.');
+    return v;
+}
+
+bool g_TEST_edges_sroe(const DBAccess* acc) { return acc->key.a == 4; }
+
+void g_TEST_edges_run(void* access) {
+    DBAccess* acc = (DBAccess*)access;
+
+    // Allocate strings the size of the edge values first, as a real filter
+    // doing work would. If the entries had been freed, these reuse that
+    // memory and the reads below see it.
+    vector<string> churn;
+    for (size_t i = 0; i < 4096; ++i)
+        churn.emplace_back(G_EDGES_VALUE_LEN, 'Z');
+
+    for (auto & edge : acc->group->entry.out) {
+        string where = to_string(acc->group->vtx) + "->" + to_string(edge.n);
+
+        // The key identifies the edge; if it is wrong the access is likely
+        // garbage, so do not walk the tags
+        dbkey_t want_key {(chain_info_t)acc->key.a, acc->group->vtx, edge.n};
+        if (edge.acc->key != want_key) {
+            g_TEST_edges_errors.push_back("key of edge " + where);
+            continue;
+        }
+
+        if (edge.acc->value != nullptr)
+            g_TEST_edges_errors.push_back("value of edge " + where + " was loaded");
+
+        // The value is still available on demand
+        string want = g_TEST_edge_value(acc->key.a, acc->group->vtx, edge.n);
+        char* val = nullptr;
+        edge.acc->get_entry_by_key.run(&edge.acc->get_entry_by_key, edge.acc->key, &val);
+        if (val == nullptr || string(val) != want)
+            g_TEST_edges_errors.push_back("value lookup of edge " + where);
+        free(val);
+
+        set<string> tags;
+        size_t n = 0;
+        for (auto t = edge.acc->tags; t != nullptr && (*t)[0] != '\0' && n < 8; ++t, ++n)
+            tags.insert(*t);
+        set<string> want_tags {"edge", "c=" + to_string(edge.n)};
+        if (tags != want_tags)
+            g_TEST_edges_errors.push_back("tags of edge " + where);
+
+        ++g_TEST_edges_checked;
+    }
+
+    acc->group->state = INACTIVE;
+}
+
+TEST(group_edges_readable_in_run) {
+    AlgDB db;
+
+    const vtx_t NUM_VERTICES = 50, EDGES_PER_VERTEX = 20;
+    for (vtx_t b = 1; b <= NUM_VERTICES; ++b) {
+        for (vtx_t c = 1000; c < 1000 + EDGES_PER_VERTEX; ++c) {
+            DBEntry<> e;
+            e.clear().add_tag("edge").add_tag("c=" + to_string(c)).set_key({4, b, c});
+            e.value() = g_TEST_edge_value(4, b, c);
+            db.add_entry(move(e));
+        }
+    }
+
+    FilterInterface i {
+        filter_name: "TEST",
+        filter_type: GROUP_ENTRIES,
+        should_run: &g_TEST_edges_sroe,
+        init: &g_forward_init,
+        destroy: &g_forward_destroy,
+        run: &g_TEST_edges_run
+    };
+    g_TEST_edges_checked = 0;
+    g_TEST_edges_errors.clear();
+    db.install_filter(make_shared<Filter>(&i));
+    db.process();
+
+    for (size_t k = 0; k < g_TEST_edges_errors.size() && k < 5; ++k)
+        cerr << "  bad edge entry: " << g_TEST_edges_errors[k] << endl;
+    EQ(g_TEST_edges_errors.size(), 0u);
+    EQ(g_TEST_edges_checked, (size_t)(NUM_VERTICES * EDGES_PER_VERTEX));
+
+    TEST_PASS
+}
+
+// Vertex-centric termination: a message wakes a halted vertex, a vertex that
+// halts without messages does not run again, and the computation only ends
+// once no vertex is active and no message is pending.
+//
+// A token is passed along the chain 1 -> 2 -> 3. Every vertex votes to halt
+// (INACTIVE) in every iteration, including in the same iteration it sends the
+// token, so the token only arrives if pending messages keep the loop going.
+static vector<pair<vtx_t, itkey_t>> g_TEST_chain_runs;
+static vector<tuple<vtx_t, itkey_t, int>> g_TEST_chain_received;
+static bool g_TEST_chain_stale_msgs;
+
+bool g_TEST_chain_sroe(const DBAccess* acc) { return acc->key.a == 6; }
+void g_TEST_chain_run(void* access) {
+    DBAccess* acc = (DBAccess*)access;
+    auto& group = *(acc->group);
+    vtx_t v = group.vtx;
+    g_TEST_chain_runs.push_back({v, group.iter});
+
+    auto& in_msgs = *(group.in_msgs);
+    auto& out_msgs = *(group.out_msgs);
+
+    // Messages from earlier iterations should have been dropped by now
+    for (auto& [it, msgs] : in_msgs)
+        if (it < group.iter && !msgs.empty()) g_TEST_chain_stale_msgs = true;
+
+    // Vertex 1 starts the token; anyone receiving it passes it on
+    bool forward = (group.iter == 0 && v == 1);
+    auto received = in_msgs.find(group.iter);
+    if (received != in_msgs.end()) {
+        auto mine = received->second.find(v);
+        if (mine != received->second.end()) {
+            for (auto& msg : mine->second)
+                g_TEST_chain_received.push_back({v, group.iter, msg.getval<int>()});
+            forward = !mine->second.empty();
+        }
+    }
+    if (forward)
+        for (auto& edge : group.entry.out)
+            out_msgs[group.iter+1][edge.n].push_back(MData {(int)(100 + v)});
+
+    group.state = INACTIVE;
+}
+
+TEST(halting_vertex_message_is_delivered) {
+    AlgDB db;
+    {DBEntry<> e; e.clear().add_tag("e").set_key({6, 1, 2}); db.add_entry(move(e));}
+    {DBEntry<> e; e.clear().add_tag("e").set_key({6, 2, 3}); db.add_entry(move(e));}
+
+    FilterInterface i {
+        filter_name: "TEST",
+        filter_type: GROUP_ENTRIES,
+        should_run: &g_TEST_chain_sroe,
+        init: &g_forward_init,
+        destroy: &g_forward_destroy,
+        run: &g_TEST_chain_run
+    };
+    g_TEST_chain_runs.clear();
+    g_TEST_chain_received.clear();
+    g_TEST_chain_stale_msgs = false;
+    db.install_filter(make_shared<Filter>(&i));
+    db.process();
+
+    // Iteration 0: every vertex runs. After that only the woken receiver runs:
+    // vertex 2 at iteration 1, vertex 3 at iteration 2. Vertex 1 never reruns.
+    set<pair<vtx_t, itkey_t>> runs(g_TEST_chain_runs.begin(), g_TEST_chain_runs.end());
+    set<pair<vtx_t, itkey_t>> want_runs {{1, 0}, {2, 0}, {3, 0}, {2, 1}, {3, 2}};
+    EQ(g_TEST_chain_runs.size(), want_runs.size());
+    EQ(runs == want_runs, true);
+
+    // Each message arrived at the right vertex, in the right iteration
+    EQ(g_TEST_chain_received.size(), 2u);
+    EQ(g_TEST_chain_received[0] == make_tuple((vtx_t)2, (itkey_t)1, 101), true);
+    EQ(g_TEST_chain_received[1] == make_tuple((vtx_t)3, (itkey_t)2, 102), true);
+
+    EQ(g_TEST_chain_stale_msgs, false);
+
+    TEST_PASS
+}
+
+// GASFilter-based BFS must still converge to the right distances and
+// terminate: with message-aware termination it may only scatter when its
+// value changed, otherwise a message would always be pending.
+static map<vtx_t, uint64_t> g_TEST_bfs_dist;
+static itkey_t g_TEST_bfs_max_iter;
+static const uint64_t BFS_INF = numeric_limits<uint64_t>::max();
+
+class TestBFS : public GASFilter<uint64_t, uint64_t> {
+    protected:
+        uint64_t G(uint64_t a, uint64_t b) { return min(a, b); }
+        uint64_t A(uint64_t v, uint64_t a) { return min(v, a); }
+        uint64_t S(uint64_t v) { return v == BFS_INF ? BFS_INF : v + 1; }
+        uint64_t gather_init([[maybe_unused]] DBAccess* acc) { return BFS_INF; }
+        uint64_t init(DBAccess* acc) { return acc->key.b == 1 ? 0 : BFS_INF; }
+        void save_output(DBAccess* acc, uint64_t val) { g_TEST_bfs_dist[acc->key.b] = val; }
+    public:
+        using GASFilter<uint64_t, uint64_t>::GASFilter;
+        size_t current_iter() const { return iter; }
+};
+
+bool g_TEST_bfs_sroe(const DBAccess* acc) { return acc->key.a == 7; }
+void* g_TEST_bfs_init(DBAccess* access) { return (void*)(new TestBFS(access)); }
+void g_TEST_bfs_destroy(void* state) { delete (TestBFS*)state; }
+void g_TEST_bfs_run(void* state) {
+    TestBFS* bfs = (TestBFS*)state;
+    bfs->run();
+}
+
+TEST(gas_bfs_terminates) {
+    AlgDB db;
+    // Directed edges b -> c in graph 7, with a cycle (2 -> 4 -> 5 -> 2) and a
+    // part unreachable from vertex 1 (8 -> 9)
+    vector<pair<vtx_t, vtx_t>> edges {{1, 2}, {1, 3}, {2, 4}, {3, 4}, {4, 5}, {5, 2}, {8, 9}};
+    for (auto [b, c] : edges) {
+        DBEntry<> e; e.clear().add_tag("e").set_key({7, b, c}); db.add_entry(move(e));
+    }
+
+    FilterInterface i {
+        filter_name: "TEST_BFS",
+        filter_type: GROUP_ENTRIES,
+        should_run: &g_TEST_bfs_sroe,
+        init: &g_TEST_bfs_init,
+        destroy: &g_TEST_bfs_destroy,
+        run: [](void* state) {
+            // Fail instead of hanging if the computation does not terminate
+            auto iter = ((TestBFS*)state)->current_iter();
+            g_TEST_bfs_max_iter = max(g_TEST_bfs_max_iter, iter);
+            if (iter > 100) throw runtime_error("BFS did not terminate");
+            g_TEST_bfs_run(state);
+        }
+    };
+    g_TEST_bfs_dist.clear();
+    g_TEST_bfs_max_iter = 0;
+    db.install_filter(make_shared<Filter>(&i));
+    db.process();
+
+    map<vtx_t, uint64_t> want {{1, 0}, {2, 1}, {3, 1}, {4, 2}, {5, 3}, {8, BFS_INF}, {9, BFS_INF}};
+    EQ(g_TEST_bfs_dist.size(), want.size());
+    for (auto [v, d] : want) EQ(g_TEST_bfs_dist.at(v), d);
+    // The longest shortest path is 3 hops, so it settles within a few iterations
+    EQ(g_TEST_bfs_max_iter <= 6, true);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
     RUN_TEST(msg_data)
@@ -300,5 +550,8 @@ TESTS_BEGIN
     RUN_TEST(should_run_tags)
     RUN_TEST(create_entry)
     RUN_TEST(simple_group_test)
+    RUN_TEST(group_edges_readable_in_run)
+    RUN_TEST(halting_vertex_message_is_delivered)
+    RUN_TEST(gas_bfs_terminates)
     elga::ZMQChatterbox::Teardown();
 TESTS_END

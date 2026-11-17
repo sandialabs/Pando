@@ -176,6 +176,43 @@ class PandoMap : public PandoParticipant {
             delete [] msg;
         }
 
+        /** @brief Return the keys and tags (but not values) of the requested entries
+         *
+         * Request: <num keys> <key>...
+         * Response: <msg size> <entry serialized with an empty value>...
+         * Keys that do not exist are skipped.
+         */
+        void recv_map_get_tags_by_keys(zmq_socket_t sock, const char* data, [[maybe_unused]] const char* end) {
+            size_t num_keys;
+            unpack_single(data, num_keys);
+
+            vector<const DBEntry<Alloc>*> found;
+            found.reserve(num_keys);
+            size_t msg_size = sizeof(size_t);
+            for (size_t i = 0; i < num_keys; ++i) {
+                dbkey_t key;
+                unpack_single(data, key);
+                auto it = map_.find(key);
+                if (it == map_.end()) continue;
+                it->second.set_key(key);
+                found.push_back(&(it->second));
+                msg_size += it->second.serialize_size(false);
+            }
+
+            char* msg = new char[msg_size];
+            char *msg_ptr = msg;
+
+            // Pack the size ourselves, as in recv_map_get_entries
+            pack_single(msg_ptr, msg_size);
+
+            for (auto entry : found)
+                entry->serialize(msg_ptr, false);
+
+            ZMQChatterbox::send(sock, msg, msg_size);
+
+            delete [] msg;
+        }
+
         void recv_map_does_key_exist(zmq_socket_t sock, const char* data, [[maybe_unused]] const char* end) {
             dbkey_t key;
             unpack_single(data, key);
@@ -204,6 +241,8 @@ class PandoMap : public PandoParticipant {
                 recv_map_get_keys(sock, data, end);
             else if (type == MAP_GET_ENTRIES)
                 recv_map_get_entries(sock, data, end);
+            else if (type == MAP_GET_TAGS_BY_KEYS)
+                recv_map_get_tags_by_keys(sock, data, end);
             else if (type == MAP_DOES_KEY_EXIST)
                 recv_map_does_key_exist(sock, data, end);
             else

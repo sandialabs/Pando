@@ -119,7 +119,14 @@ namespace pando {
                 } else
                     g_.state = ACTIVE;
 
-                // Scatter phase
+                // Scatter phase: only on the first iteration or when the value
+                // changed. An unchanged vertex has nothing new to tell its
+                // neighbors (they already have its last value), and the AlgDB
+                // keeps iterating while any message is pending, so scattering
+                // unconditionally would never terminate.
+                if (g_.iter > 0 && g_.state == INACTIVE)
+                    return;
+
                 N sval = S(val_);
                 for (auto &out_edge: g_.entry.out) {
                     MData md {sval};

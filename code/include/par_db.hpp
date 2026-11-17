@@ -15,19 +15,12 @@
 #include "par_db_access.hpp"
 #include "par_db_thread.hpp"
 #include "par_db_responder.hpp"
+#include "process_stats.hpp"
 
 using namespace std;
 using namespace elga;
 
 namespace pando {
-
-typedef enum state_t {
-    PRELOAD,
-    STAGE_BEGIN,
-    STAGE_PROCESSED,
-    STAGE_CLOSING,
-    STAGE_ALG_PROCESS
-} state_t;
 
 void s_ref_add_entry(fn_ref, DBEntry<>);
 void s_ref_add_tag_to_entry(fn_ref, dbkey_t, string);
@@ -66,6 +59,10 @@ class ParDB : public PandoParticipant {
         size_t alg_vertex_msgs_received_ = 0;
 
         bool waiting_for_barrier_ = false;
+
+        /** @brief Done with local work and waiting at a barrier for the
+         * rest of the mesh (reported to pando_top to spot stragglers) */
+        bool at_barrier_ = false;
 
         ParDBThread<PandoResponder> responder_;
 
@@ -107,6 +104,10 @@ class ParDB : public PandoParticipant {
 
             if (skip_group_filters_) db_.disable_group_filters();
             if (max_filters_per_stage != 0) db_.set_max_filters_per_stage(max_filters_per_stage);
+
+            // The message loop does not run while filters run, so publish
+            // progress from inside the filter loops instead
+            db_.set_progress_callback([this]() { publish_progress(); });
         }
         ParDB(ZMQAddress addr) : ParDB(addr, 2ull*(1ull<<29)) { }
 
@@ -123,6 +124,61 @@ class ParDB : public PandoParticipant {
             pack_single(msg_ptr, stat_size);
 
             pub(msg, msg_size);
+
+            publish_progress();
+        }
+
+        /** @brief Publish a PROGRESS message describing our processing */
+        void publish_progress() {
+            ProgressSnapshot p;
+            p.agent = addr_ser_;
+            p.time_ms = wall_ms();
+            p.db_size = db_size();
+            p.state = state_;
+            p.at_barrier = at_barrier_;
+            p.set_stats(db_.stats());
+
+            StatsWriter w { PROGRESS };
+            p.serialize(w);
+            pub(w.data(), w.size());
+        }
+
+        /** @brief Publish a STAGE_EVENT message */
+        void publish_stage_event(const StageEvent& e) {
+            StatsWriter w { STAGE_EVENT };
+            e.serialize(w);
+            pub(w.data(), w.size());
+        }
+
+        /** @brief Change state, publishing the transition */
+        void set_state_(state_t new_state) {
+            if (new_state == state_) return;
+            StageEvent e;
+            e.agent = addr_ser_;
+            e.time_ms = wall_ms();
+            e.kind = EVENT_STATE_CHANGE;
+            e.from_state = state_;
+            e.to_state = new_state;
+            e.summary.pass = db_.stats().pass;
+            e.summary.kind = db_.stats().pass_kind;
+            state_ = new_state;
+            publish_stage_event(e);
+        }
+
+        /** @brief Publish a summary of the pass that just finished and
+         * fold it into the totals */
+        void end_pass_() {
+            auto& stats = db_.stats();
+            if (stats.pass_kind == PASS_NONE) return;
+            StageEvent e;
+            e.agent = addr_ser_;
+            e.time_ms = wall_ms();
+            e.kind = EVENT_PASS_END;
+            e.from_state = state_;
+            e.to_state = state_;
+            e.summary = stats.current_summary();
+            publish_stage_event(e);
+            stats.end_pass();
         }
 
         /** @brief Handle specific, custom messages */
@@ -629,6 +685,9 @@ class ParDB : public PandoParticipant {
 
         /** @brief Begin waiting for a barrier */
         void start_barrier_wait() {
+            at_barrier_ = true;
+            publish_progress();
+
             // We are at the barrier, let the synchronizer know
             auto req = find_req(sync_key);
             // We want to send the distribution of messages we sent out
@@ -763,7 +822,7 @@ class ParDB : public PandoParticipant {
         // fixme start_db_process and finish_db_process not actually setup yet
         void finish_db_process() {
             // Wait for the next barrier
-            state_ = STAGE_PROCESSED;
+            set_state_(STAGE_PROCESSED);
             start_barrier_wait();
         }
 
@@ -771,7 +830,7 @@ class ParDB : public PandoParticipant {
             start_db_process();
         }
         void end_barrier_stage_processed() {
-            state_ = STAGE_CLOSING;
+            set_state_(STAGE_CLOSING);
             #ifdef VERBOSE
             cerr << "starting stage close" << endl;
             #endif
@@ -784,15 +843,17 @@ class ParDB : public PandoParticipant {
             start_barrier_wait();
         }
         void end_barrier_stage_closing() {
-            // Now all agents have closed their stages
+            // Now all agents have closed their stages, so the pass is over
+            end_pass_();
+
             // We can start the loop again
             if (local_process_again_) {
                 // this is mostly unnecessary, but it is nice to not set to
                 // PRELOAD if we're going to process again so it's easier to
                 // know that the entire mesh has not finished processing
-                state_ = STAGE_BEGIN;
+                set_state_(STAGE_BEGIN);
             } else
-                state_ = PRELOAD;
+                set_state_(PRELOAD);
 
             //if we are the synchronizer, and need to process again, let everyone know to do that
             if (has_ownership(sync_key)) {
@@ -803,7 +864,9 @@ class ParDB : public PandoParticipant {
                     broadcast_process();
                 } else {
                     // move everyone into the alg db process
-                    if (skip_group_filters_) has_alg_processed_ = true;
+                    // Filter installs are broadcast to every agent, so the
+                    // synchronizer's installed filters match everyone's
+                    if (skip_group_filters_ || !db_.has_group_filters()) has_alg_processed_ = true;
                     if (!has_alg_processed_) {
                         has_alg_processed_ = true;
                         #ifdef VERBOSE
@@ -891,6 +954,7 @@ class ParDB : public PandoParticipant {
             // The barrier is over, we have not done anything inside of the barrier
             // So, zero out the sent counters
             sent_distribution_.clear();
+            at_barrier_ = false;
 
             // Proceed to the next state, depending on current state
             if (state_ == STAGE_BEGIN) {
@@ -932,7 +996,7 @@ class ParDB : public PandoParticipant {
             // received anyway. However, let's set it here also to make the
             // "processing" function easier to use (i.e. ensure there's no gap
             // where that returns false, but really we're already processing)
-            state_ = STAGE_BEGIN;
+            set_state_(STAGE_BEGIN);
 
             broadcast_process();
 
@@ -946,7 +1010,8 @@ class ParDB : public PandoParticipant {
             has_alg_processed_ = false;
 
             // First, enter STAGE_BEGIN
-            state_ = STAGE_BEGIN;
+            db_.stats().begin_pass(PASS_SINGLE);
+            set_state_(STAGE_BEGIN);
 
             // Then, wait for a barrier
             start_barrier_wait();
@@ -958,7 +1023,8 @@ class ParDB : public PandoParticipant {
 
         /** @brief Start the internal alg db process mechanism */
         void recv_algprocess(zmq_socket_t sock, [[maybe_unused]] const char* data, [[maybe_unused]] const char* end) {
-            state_ = STAGE_ALG_PROCESS;
+            db_.stats().begin_pass(PASS_GROUP);
+            set_state_(STAGE_ALG_PROCESS);
 
             // Then, wait for a barrier
             start_barrier_wait();
@@ -1166,17 +1232,7 @@ class ParDB : public PandoParticipant {
         }
 
         void recv_get_state(zmq_socket_t sock, [[maybe_unused]] const char* data, [[maybe_unused]] const char* end) {
-            string ret = "";
-            if (state_ == PRELOAD)
-                ret = "PRELOAD";
-            if (state_ == STAGE_BEGIN)
-                ret = "STAGE_BEGIN";
-            if (state_ == STAGE_PROCESSED)
-                ret = "STAGE_PROCESSED";
-            if (state_ == STAGE_CLOSING)
-                ret = "STAGE_CLOSING";
-            if (state_ == STAGE_ALG_PROCESS)
-                ret = "STAGE_ALG_PROCESS";
+            string ret = state_name(state_);
 
             size_t msg_size = sizeof(msg_type_t) + ret.size();
             char* msg = new char[msg_size];
@@ -1303,6 +1359,10 @@ class ParDB : public PandoParticipant {
                 ret_entry_keys = db_.keys();
             }
             for (auto & k : ret_entry_keys) {
+                // Random keys are not part of any group (the sequential
+                // version and setup_graph_datastructures_have_ids skip them too)
+                if (is_random_key(k)) continue;
+
                 // Get the address of the host that owns k.b (should always be "us") and k.c
                 dbkey_t lookup_key_b {k.a, k.b, 0};
                 addr_t neigh_addr_b = lookup_agent(lookup_key_b);
