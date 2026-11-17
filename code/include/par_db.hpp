@@ -4,6 +4,7 @@
 #include <exception>
 #include <stdexcept>
 #include <list>
+#include <memory>
 #include <vector>
 #include <thread>
 
@@ -424,13 +425,16 @@ class ParDB : public PandoParticipant {
                 size_t count = e - b;
 
                 size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + count*sizeof(dbkey_t);
-                vector<char> msg(msg_size);   // freed even if the send throws
-                char* msg_ptr = msg.data();
+                // Freed even if the send throws. Not zero-filled (unlike
+                // vector<char>(n) or make_unique<char[]>(n)): every byte is
+                // written below before it is sent.
+                unique_ptr<char[]> msg(new char[msg_size]);
+                char* msg_ptr = msg.get();
                 pack_msg(msg_ptr, GET_ENTRIES_BY_KEYS);
                 pack_single(msg_ptr, count);
                 for (size_t j = b; j < e; ++j) pack_single(msg_ptr, keys[(*o.idx)[j]]);
 
-                o.req->send(msg.data(), msg_size);
+                o.req->send(msg.get(), msg_size);
 
                 o.cur = b;
                 o.next = e;

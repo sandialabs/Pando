@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include "util.hpp"
 #include "chatterbox.hpp"
 
@@ -183,14 +185,17 @@ class PandoMapClient : public ZMQRequester {
          */
         ZMQMessage retrieve_values_raw(size_t n, const dbkey_t* keys) {
             size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + n*sizeof(dbkey_t);
-            vector<char> msg(msg_size);   // freed even if the send throws
-            char* msg_ptr = msg.data();
+            // Freed even if the send throws. Not zero-filled (unlike
+            // vector<char>(n) or make_unique<char[]>(n)): every byte is
+            // written below before it is sent.
+            unique_ptr<char[]> msg(new char[msg_size]);
+            char* msg_ptr = msg.get();
 
             pack_msg(msg_ptr, MAP_RETRIEVE_VALUES);
             pack_single(msg_ptr, n);
             if (n) memcpy(msg_ptr, keys, n*sizeof(dbkey_t));
 
-            send(msg.data(), msg_size);
+            send(msg.get(), msg_size);
 
             return read();
         }
