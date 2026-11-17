@@ -321,12 +321,20 @@ ZMQMessage::~ZMQMessage() {
  * would point into the moved-from message. */
 void ZMQMessage::take_(ZMQMessage& that) {
     sock_ = that.sock_;
-    size_ = that.size_;
-    closed_ = that.closed_;
+    size_ = 0;
     data_ = nullptr;
-    if (!closed_) {
+    // Stay closed until the message has really been taken over, so that if
+    // zmq_msg_init or zmq_msg_move fails the destructor does not close an
+    // invalid message
+    closed_ = true;
+    if (!that.closed_) {
         if (zmq_msg_init(&msg_part_) != 0) throw std::runtime_error("Unable to init msg");
-        if (zmq_msg_move(&msg_part_, &that.msg_part_) != 0) throw std::runtime_error("Unable to move msg");
+        if (zmq_msg_move(&msg_part_, &that.msg_part_) != 0) {
+            zmq_msg_close(&msg_part_);
+            throw std::runtime_error("Unable to move msg");
+        }
+        closed_ = false;
+        size_ = that.size_;
         data_ = (char*)zmq_msg_data(&msg_part_);
     }
     // The moved-from message no longer owns anything
@@ -343,6 +351,7 @@ ZMQMessage& ZMQMessage::operator=(ZMQMessage&& that) {
     if (this != &that) {
         // Release the message this one held before taking over the other
         if (!closed_) zmq_msg_close(&msg_part_);
+        closed_ = true;
         take_(that);
     }
     return *this;
