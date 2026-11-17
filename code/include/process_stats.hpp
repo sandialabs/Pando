@@ -128,6 +128,55 @@ struct PassSummary {
     std::map<std::string, FilterCounters> filters;
 };
 
+/** @brief Progress of applying staged changes during a stage close
+ *
+ * In the parallel DB, closing the stage sends every staged change back
+ * through the message loop (to this agent, which owns the keys), and the
+ * changes are only applied as those messages are received. The totals are
+ * set when the close starts; the done counts go up as each change is applied.
+ */
+struct CloseProgress {
+    uint64_t start_ms = 0;              // when the close started; 0 if none yet
+    uint64_t entries_total = 0, entries_done = 0;
+    uint64_t vals_total = 0, vals_done = 0;
+    uint64_t tags_added_total = 0, tags_added_done = 0;
+    uint64_t tags_removed_total = 0, tags_removed_done = 0;
+
+    /** @brief Start a close with the given numbers of staged changes */
+    void begin(uint64_t entries, uint64_t vals, uint64_t tags_added, uint64_t tags_removed) {
+        *this = CloseProgress{};
+        start_ms = wall_ms();
+        entries_total = entries;
+        vals_total = vals;
+        tags_added_total = tags_added;
+        tags_removed_total = tags_removed;
+    }
+
+    // Done counts are clamped to the totals, in case something not counted
+    // in the totals (e.g. a change from another agent) is applied too
+    static uint64_t clamp(uint64_t done, uint64_t total) { return done < total ? done : total; }
+    uint64_t entries() const { return clamp(entries_done, entries_total); }
+    uint64_t vals() const { return clamp(vals_done, vals_total); }
+    uint64_t tags_added() const { return clamp(tags_added_done, tags_added_total); }
+    uint64_t tags_removed() const { return clamp(tags_removed_done, tags_removed_total); }
+    /** Tag adds and removes together */
+    uint64_t tags() const { return tags_added() + tags_removed(); }
+    uint64_t tags_total() const { return tags_added_total + tags_removed_total; }
+
+    uint64_t total() const { return entries_total + vals_total + tags_total(); }
+    uint64_t done() const { return entries() + vals() + tags(); }
+    uint64_t remaining() const { return total() - done(); }
+
+    bool operator==(const CloseProgress& o) const {
+        return start_ms == o.start_ms &&
+            entries_total == o.entries_total && entries_done == o.entries_done &&
+            vals_total == o.vals_total && vals_done == o.vals_done &&
+            tags_added_total == o.tags_added_total && tags_added_done == o.tags_added_done &&
+            tags_removed_total == o.tags_removed_total && tags_removed_done == o.tags_removed_done;
+    }
+    bool operator!=(const CloseProgress& o) const { return !(*this == o); }
+};
+
 /** @brief Processing statistics collected by one DB */
 struct ProcessStats {
     /** Number of the current (or last) pass; 0 before the first pass */
@@ -143,6 +192,9 @@ struct ProcessStats {
 
     /** Iteration of the current GROUP_ENTRIES computation */
     uint64_t group_iter = 0;
+
+    /** Progress of the latest stage close (ParDB only) */
+    CloseProgress close;
 
     /** Keyed by filter name; std::map keeps references stable and sorted */
     std::map<std::string, FilterStats> filters;
@@ -186,6 +238,7 @@ struct ProcessStats {
         keys_scanned = 0;
         stopped_early = false;
         group_iter = 0;
+        close = CloseProgress{};
     }
 
     /** @brief Record the current pass in the history and fold its counters
@@ -281,6 +334,32 @@ inline FilterCounters read_counters(StatsReader& r) {
     return c;
 }
 
+inline void write_close(StatsWriter& w, const CloseProgress& c) {
+    w.put(c.start_ms);
+    w.put(c.entries_total);
+    w.put(c.entries_done);
+    w.put(c.vals_total);
+    w.put(c.vals_done);
+    w.put(c.tags_added_total);
+    w.put(c.tags_added_done);
+    w.put(c.tags_removed_total);
+    w.put(c.tags_removed_done);
+}
+
+inline CloseProgress read_close(StatsReader& r) {
+    CloseProgress c;
+    c.start_ms = r.get<uint64_t>();
+    c.entries_total = r.get<uint64_t>();
+    c.entries_done = r.get<uint64_t>();
+    c.vals_total = r.get<uint64_t>();
+    c.vals_done = r.get<uint64_t>();
+    c.tags_added_total = r.get<uint64_t>();
+    c.tags_added_done = r.get<uint64_t>();
+    c.tags_removed_total = r.get<uint64_t>();
+    c.tags_removed_done = r.get<uint64_t>();
+    return c;
+}
+
 /** @brief One filter's counters as carried in a PROGRESS message */
 struct FilterSnapshot {
     uint8_t kind = PASS_SINGLE;
@@ -302,6 +381,7 @@ struct ProgressSnapshot {
     uint64_t keys_scanned = 0;
     bool stopped_early = false;
     uint64_t group_iter = 0;
+    CloseProgress close;
     std::map<std::string, FilterSnapshot> filters;
 
     /** @brief Fill the processing fields from a DB's stats */
@@ -313,6 +393,7 @@ struct ProgressSnapshot {
         keys_scanned = s.keys_scanned;
         stopped_early = s.stopped_early;
         group_iter = s.group_iter;
+        close = s.close;
         filters.clear();
         for (auto& [name, f] : s.filters)
             filters[name] = FilterSnapshot { f.kind, f.pass, f.total() };
@@ -331,6 +412,7 @@ struct ProgressSnapshot {
         w.put(keys_scanned);
         w.put((uint8_t)stopped_early);
         w.put(group_iter);
+        write_close(w, close);
         w.put((uint64_t)filters.size());
         for (auto& [name, f] : filters) {
             w.put_string(name);
@@ -355,6 +437,7 @@ struct ProgressSnapshot {
         keys_scanned = r.get<uint64_t>();
         stopped_early = r.get<uint8_t>() != 0;
         group_iter = r.get<uint64_t>();
+        close = read_close(r);
         uint64_t n = r.get<uint64_t>();
         filters.clear();
         for (uint64_t i = 0; i < n && r.ok(); ++i) {

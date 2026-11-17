@@ -52,9 +52,20 @@ class SeqDBParAccess : public AlgDB {
         }
 
         virtual void stage_close() {
+            // Record how much there is to apply. Everything below is sent
+            // back through the ParDB (to the owner, which is us) and only
+            // applied as those messages are received; the ParDB counts them
+            // off in stats_.close.
+            stats_.close.begin(new_entries_.size(), val_updates_.size(),
+                tags_to_add_.size(), tags_to_remove_.size());
+            // Report the totals now: the message loop does not run until
+            // everything has been sent
+            if (progress_cb_) progress_cb_();
+
             // Add new entries
             for (auto & [key, entry] : new_entries_) {
                 b_refs_.add_entry(b_refs_.ref, move(entry));
+                report_progress_if_due_();
             }
             new_entries_.clear();
 
@@ -62,6 +73,7 @@ class SeqDBParAccess : public AlgDB {
             if (val_updates_.size() != 0) {
                 for (auto & [key, new_val] : val_updates_) {
                     b_refs_.update_entry_val(b_refs_.ref, key, new_val);
+                    report_progress_if_due_();
                 }
             }
             val_updates_.clear();
@@ -69,12 +81,15 @@ class SeqDBParAccess : public AlgDB {
             // Add tags
             for (auto & [key, tag] : tags_to_add_) {
                 b_refs_.add_tag_to_entry(b_refs_.ref, key, tag);
+                report_progress_if_due_();
             }
             tags_to_add_.clear();
 
             // Remove tags
-            for (auto & [key, tag] : tags_to_remove_)
-               b_refs_.remove_tag_from_entry(b_refs_.ref, key, tag);
+            for (auto & [key, tag] : tags_to_remove_) {
+                b_refs_.remove_tag_from_entry(b_refs_.ref, key, tag);
+                report_progress_if_due_();
+            }
             tags_to_remove_.clear();
         }
 

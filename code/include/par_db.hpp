@@ -131,6 +131,12 @@ class ParDB : public PandoParticipant {
             p.state = state_;
             p.at_barrier = at_barrier_;
             p.set_stats(db_.stats());
+            // During a stage close we reach the barrier as soon as the staged
+            // changes are sent to ourselves, but applying them happens after
+            // that, as the messages are received. Until they are all applied
+            // we are still working, not waiting on the rest of the mesh.
+            if (state_ == STAGE_CLOSING && p.close.remaining() > 0)
+                p.at_barrier = false;
 
             StatsWriter w { PROGRESS };
             p.serialize(w);
@@ -837,6 +843,10 @@ class ParDB : public PandoParticipant {
             start_barrier_wait();
         }
         void end_barrier_stage_closing() {
+            // Report the finished close (every staged change is applied by
+            // now) before the counters are reset by the next pass
+            publish_progress();
+
             // Now all agents have closed their stages, so the pass is over
             end_pass_();
 
@@ -1080,6 +1090,7 @@ class ParDB : public PandoParticipant {
                 // If so, add to our database
                 if (state_ == STAGE_CLOSING || state_ == PRELOAD) {
                     db_.add_entry_worker(move(e));
+                    if (state_ == STAGE_CLOSING) ++db_.stats().close.entries_done;
                 }
                 else {
                     db_.stage_add_entry_worker(move(e));
@@ -1111,6 +1122,7 @@ class ParDB : public PandoParticipant {
                 // our process() call, and currently closing the stage
                 if (state_ == STAGE_CLOSING) {
                     db_.add_tag_to_entry(key, tag);
+                    ++db_.stats().close.tags_added_done;
                 }
                 else {
                     db_.stage_add_tag_worker(key, tag);
@@ -1140,7 +1152,10 @@ class ParDB : public PandoParticipant {
 
                 // We can only process if we are in a state of having finished
                 // our process() call, and currently closing the stage
-                if (state_ == STAGE_CLOSING || state_ == PRELOAD) db_.remove_tag_from_entry(key, tag);
+                if (state_ == STAGE_CLOSING || state_ == PRELOAD) {
+                    db_.remove_tag_from_entry(key, tag);
+                    if (state_ == STAGE_CLOSING) ++db_.stats().close.tags_removed_done;
+                }
                 else db_.stage_remove_tag_worker(key, tag);
             } else {
                 // If not, simply forward to the owner
@@ -1168,7 +1183,10 @@ class ParDB : public PandoParticipant {
 
                 // We can only process if we are in a state of having finished
                 // our process() call, and currently closing the stage
-                if (state_ == STAGE_CLOSING || state_ == PRELOAD) db_.update_entry_val(key, val);
+                if (state_ == STAGE_CLOSING || state_ == PRELOAD) {
+                    db_.update_entry_val(key, val);
+                    if (state_ == STAGE_CLOSING) ++db_.stats().close.vals_done;
+                }
                 else db_.stage_update_entry_val_worker(key, val);
             } else {
                 // If not, simply forward to the owner
