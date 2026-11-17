@@ -183,15 +183,14 @@ class PandoMapClient : public ZMQRequester {
          */
         ZMQMessage retrieve_values_raw(size_t n, const dbkey_t* keys) {
             size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + n*sizeof(dbkey_t);
-            char* msg = new char[msg_size];
-            char* msg_ptr = msg;
+            vector<char> msg(msg_size);   // freed even if the send throws
+            char* msg_ptr = msg.data();
 
             pack_msg(msg_ptr, MAP_RETRIEVE_VALUES);
             pack_single(msg_ptr, n);
             if (n) memcpy(msg_ptr, keys, n*sizeof(dbkey_t));
 
-            send(msg, msg_size);
-            delete [] msg;
+            send(msg.data(), msg_size);
 
             return read();
         }
