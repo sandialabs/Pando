@@ -77,6 +77,10 @@ TEST(zmq_message_forward) {
             EQ(as_string(m), s);
             m.send(c);                // ... forwarded on c
             EQ(m.size(), 0);
+            // A message can only be sent once
+            bool threw = false;
+            try { m.send(c); } catch (const std::runtime_error&) { threw = true; }
+            EQ(threw, true);
         }
         ZMQMessage out(d);
         EQ(as_string(out), s);
