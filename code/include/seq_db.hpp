@@ -15,7 +15,11 @@
 #include <iterator>
 #include <algorithm>
 #include <chrono>
+#include <charconv>
+#include <cmath>
 #include <functional>
+#include <string_view>
+#include <system_error>
 #include "absl/container/flat_hash_map.h"
 #include "Python.h"
 
@@ -49,6 +53,11 @@ typedef int (*db_query_t)(dbkey_t, const char*, const char* const*, const DBAcce
 namespace pando {
 
 static string MERGE_STRATEGY_FORCE = "MERGE_STRATEGY=FORCE_MERGE";
+/** Entries with the same key that both carry this tag have their numeric
+ * values added when merged (see SeqDB::sum_entries) */
+static string MERGE_STRATEGY_SUM = "MERGE_STRATEGY=SUM";
+static string MERGED_SUM = "MERGED_SUM";
+static string MERGED_SUM_FAILED = "MERGED_SUM_FAILED";
 
 /** @brief Start the embedded Python interpreter once per process
  *
@@ -493,9 +502,6 @@ class SeqDB {
             }
 
             dbkey_t key = entry->get_key();
-            for (auto &tag : entry->tags()) {
-                add_to_tag_index_(key, tag);
-            }
             handle_subscriptions(key);
 
             //If the key already exists, we concatenate the entries' values and tags
@@ -509,8 +515,19 @@ class SeqDB {
                 force_merge |= entry->has_tag(MERGE_STRATEGY_FORCE);
                 should_concat |= force_merge;
 
+                if (e.has_tag(MERGE_STRATEGY_SUM) && entry->has_tag(MERGE_STRATEGY_SUM)) {
+                    should_concat = false;
+                    *entry = sum_entries(&e, entry);
+                }
+
                 if (should_concat)
                     *entry = concat_entries(&e, entry, force_merge);
+            }
+
+            // Index the tags after merging, so tags the merge added (MERGED,
+            // MERGED_SUM, MERGED_SUM_FAILED) are indexed too
+            for (auto &tag : entry->tags()) {
+                add_to_tag_index_(key, tag);
             }
         }
 
@@ -525,6 +542,119 @@ class SeqDB {
                 prepare_to_add_entry(&entry);
             }
             db_.insert_multiple(entries);
+        }
+
+        /** @brief A parsed MERGE_STRATEGY=SUM value */
+        struct sum_value_t {
+            bool is_int;
+            __int128 i;     // valid if is_int
+            double d;       // always valid
+        };
+
+        /** @brief Parse an optionally negative base-10 integer into an __int128
+         * @return false if s is not an integer or does not fit
+         */
+        static bool parse_sum_int_(string_view s, __int128& out) {
+            bool neg = false;
+            if (!s.empty() && s[0] == '-') { neg = true; s.remove_prefix(1); }
+            if (s.empty()) return false;
+            // Accumulate the magnitude; the negative range is one larger
+            const unsigned __int128 limit = neg
+                ? (unsigned __int128)1 << 127
+                : ((unsigned __int128)1 << 127) - 1;
+            unsigned __int128 mag = 0;
+            for (char c : s) {
+                if (c < '0' || c > '9') return false;
+                unsigned d = c - '0';
+                if (mag > (limit - d) / 10) return false;
+                mag = mag * 10 + d;
+            }
+            if (mag == 0) out = 0;
+            else out = neg ? -(__int128)(mag - 1) - 1 : (__int128)mag;
+            return true;
+        }
+
+        /** @brief Parse a value to sum. Leading and trailing whitespace is
+         * ignored, so values built with DBEntry::add_to_value() (which ends
+         * them with a newline) can be summed.
+         * @return false if the value is not a finite number
+         */
+        static bool parse_sum_value_(const string& value, sum_value_t& out) {
+            static const char* ws = " \t\n\r\f\v";
+            size_t b = value.find_first_not_of(ws);
+            if (b == string::npos) return false;
+            size_t e = value.find_last_not_of(ws);
+            string_view s {value.data() + b, e - b + 1};
+
+            if (parse_sum_int_(s, out.i)) {
+                out.is_int = true;
+                out.d = (double)out.i;
+                return true;
+            }
+
+            double d = 0;
+            auto [ptr, ec] = from_chars(s.data(), s.data() + s.size(), d);
+            if (ec != errc() || ptr != s.data() + s.size() || !isfinite(d)) return false;
+            out.is_int = false;
+            out.d = d;
+            return true;
+        }
+
+        static string format_sum_int_(__int128 v) {
+            bool neg = v < 0;
+            unsigned __int128 mag = neg ? (unsigned __int128)(-(v + 1)) + 1 : (unsigned __int128)v;
+            string digits;
+            do { digits += (char)('0' + (int)(mag % 10)); mag /= 10; } while (mag != 0);
+            if (neg) digits += '-';
+            return string(digits.rbegin(), digits.rend());
+        }
+
+        /** @brief Shortest decimal form that reads back as the same double */
+        static string format_sum_double_(double v) {
+            char buf[64];
+            auto [ptr, ec] = to_chars(buf, buf + sizeof(buf), v);
+            if (ec != errc()) throw runtime_error("Unable to format summed value");
+            return string(buf, ptr);
+        }
+
+        /** @brief Merge two MERGE_STRATEGY=SUM entries by adding their values
+         *
+         * If both values are integers, they are added exactly (128-bit) and
+         * stored as an integer, e.g. "1" + "2" = "3". Otherwise they are
+         * added as doubles and stored in the shortest form that reads back
+         * exactly, e.g. "1.2" + "2.3" = "3.5". The result is tagged
+         * MERGED_SUM.
+         *
+         * If either value is not a number, the entries are concatenated
+         * instead, as concat_entries does, and tagged MERGED_SUM_FAILED, so
+         * no data is lost. Later merges on that key will also fail; a warning
+         * is printed the first time a key fails.
+         */
+        DBEntry<> sum_entries(DBEntry<>* e1, DBEntry<>* e2) {
+            sum_value_t v1 {}, v2 {};
+            if (!parse_sum_value_(e1->value(), v1) || !parse_sum_value_(e2->value(), v2)) {
+                if (!e1->has_tag(MERGED_SUM_FAILED) && !e2->has_tag(MERGED_SUM_FAILED)) {
+                    cerr << "[Pando] [WARNING] " << MERGE_STRATEGY_SUM << ": value for key " << e1->get_key()
+                         << " is not a number; concatenating instead (tagged " << MERGED_SUM_FAILED << ")" << endl;
+                }
+                DBEntry<> failed = concat_entries(e1, e2);
+                failed.add_tag(MERGED_SUM_FAILED);
+                return failed;
+            }
+
+            DBEntry<> new_entry;
+            new_entry.set_key(e1->get_key());
+            for (auto &tag : e1->tags()) new_entry.add_tag(tag);
+            for (auto &tag : e2->tags()) new_entry.add_tag(tag);
+            new_entry.add_tag(MERGED_SUM);
+
+            __int128 isum = 0;
+            if (v1.is_int && v2.is_int && !__builtin_add_overflow(v1.i, v2.i, &isum))
+                new_entry.value() = format_sum_int_(isum);
+            else
+                new_entry.value() = format_sum_double_(v1.d + v2.d);
+
+            return new_entry;
         }
 
         DBEntry<> concat_entries(DBEntry<>* e1, DBEntry<>* e2, bool force_merge=false) {
@@ -577,7 +707,13 @@ class SeqDB {
                 force_merge |= new_entries_it->second.has_tag(MERGE_STRATEGY_FORCE);
                 should_concat |= force_merge;
 
-                if (should_concat) {
+                // Sum numeric values when both entries ask for it, as
+                // add_entry does. Without this, two identical staged entries
+                // (e.g. two values of "1") compare equal and the second is
+                // dropped, and differing ones are concatenated instead of added.
+                if (new_entries_it->second.has_tag(MERGE_STRATEGY_SUM) && entry.has_tag(MERGE_STRATEGY_SUM)) {
+                    new_entries_it->second = sum_entries(&(new_entries_it->second), &entry);
+                } else if (should_concat) {
                     entry = concat_entries(&(new_entries_it->second), &entry, force_merge);
                     new_entries_it->second = move(entry);
                 }
