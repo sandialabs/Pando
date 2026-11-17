@@ -231,7 +231,8 @@ class PandoTop : public PandoParticipant {
                 auto& p = ai.progress;
                 if (p.pass != pass || p.pass_kind == PASS_NONE) continue;
                 if (finished != nullptr && finished->count(a)) continue;
-                for (auto& [name, f] : p.filters) res[name] += f.pass;
+                for (auto& [name, f] : p.filters)
+                    if (f.kind == p.pass_kind) res[name] += f.pass;
             }
             return res;
         }

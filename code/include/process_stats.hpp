@@ -168,8 +168,11 @@ struct ProcessStats {
         s.duration_ms = (pass_start_ms > 0 && now > pass_start_ms) ? now - pass_start_ms : 0;
         s.keys_total = keys_total;
         s.stopped_early = stopped_early;
+        // Only the filters this kind of pass runs, so that e.g. a GROUP_ENTRIES
+        // filter is not reported as having run on nothing in a SINGLE_ENTRY pass
         for (auto& [name, f] : filters)
-            s.filters[name] = f.pass;
+            if (f.kind == pass_kind)
+                s.filters[name] = f.pass;
         return s;
     }
 

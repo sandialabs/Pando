@@ -602,6 +602,9 @@ class SeqDB {
             string filter_name { filter->name() };
             // Add it to the installed list
             installed_filters_[filter_name] = filter;
+            // Register it with the stats now so that it is reported (e.g.,
+            // shown by pando_top) before any processing has happened
+            stats_.filter(filter_name, filter->filter_type() == GROUP_ENTRIES ? PASS_GROUP : PASS_SINGLE);
         }
 
         /** @brief Return the number of installed filters*/

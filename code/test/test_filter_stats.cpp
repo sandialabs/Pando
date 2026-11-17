@@ -342,12 +342,50 @@ TEST(par_db_publishes_stats) {
     TEST_PASS
 }
 
+// Installed filters are reported before any processing, so pando_top can
+// show what is installed; each pass only summarizes filters of its kind
+TEST(installed_filters_reported_before_processing) {
+    AlgDB db;
+    db.install_filter(make_shared<Filter>(&g_single));
+    db.install_filter(make_shared<Filter>(&g_group));
+
+    auto& s = db.stats();
+    EQ(s.pass, 0);
+    EQ(s.filters.size(), 2);
+    EQ(s.filters.at("TEST_single").kind, PASS_SINGLE);
+    EQ(s.filters.at("TEST_group").kind, PASS_GROUP);
+    NOPRINT_EQ(s.filters.at("TEST_single").total(), FilterCounters{});
+
+    // ... and carried in the PROGRESS payload
+    ProgressSnapshot p;
+    p.set_stats(s);
+    StatsWriter w { PROGRESS };
+    p.serialize(w);
+    ProgressSnapshot q;
+    EQ(q.deserialize(w.data() + sizeof(msg_type_t), w.data() + w.size()), true);
+    EQ(q.filters.size(), 2);
+    EQ(q.filters.at("TEST_group").kind, PASS_GROUP);
+
+    {DBEntry<> e; e.add_tag("e"); e.set_key({0,0,5}); db.add_entry(move(e));}
+    db.process();
+    EQ(s.history.size(), 2);
+    EQ(s.history[0].kind, PASS_SINGLE);
+    EQ(s.history[0].filters.count("TEST_single"), 1);
+    EQ(s.history[0].filters.count("TEST_group"), 0);
+    EQ(s.history[1].kind, PASS_GROUP);
+    EQ(s.history[1].filters.count("TEST_single"), 0);
+    EQ(s.history[1].filters.count("TEST_group"), 1);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
     RUN_TEST(single_entry_counts)
     RUN_TEST(outputs_outside_filter)
     RUN_TEST(group_counts)
+    RUN_TEST(installed_filters_reported_before_processing)
     RUN_TEST(btc_filter_counts)
     RUN_TEST(par_db_publishes_stats)
 
