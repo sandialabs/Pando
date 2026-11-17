@@ -80,6 +80,11 @@ TEST(progress_round_trip) {
     s.filter("BTC_block_to_tx", PASS_SINGLE).pass = make_counters(10);
     s.filter("BTC_block_to_tx", PASS_SINGLE).prior = make_counters(100);
     s.filter("group_f", PASS_GROUP).pass = make_counters(20);
+    s.close.begin(10, 20, 30, 40);
+    s.close.entries_done = 1;
+    s.close.vals_done = 2;
+    s.close.tags_added_done = 3;
+    s.close.tags_removed_done = 4;
 
     ProgressSnapshot p;
     p.agent = 0x123456789ull;
@@ -115,6 +120,53 @@ TEST(progress_round_trip) {
     NOPRINT_EQ(q.filters["BTC_block_to_tx"].total, make_counters(10) + make_counters(100));
     EQ(q.filters["group_f"].kind, PASS_GROUP);
     NOPRINT_EQ(q.filters["group_f"].pass, make_counters(20));
+    NOPRINT_EQ(q.close, s.close);
+    EQ(q.close.start_ms > 0, true);
+    EQ(q.close.tags_removed_total, 40);
+    EQ(q.close.tags_removed_done, 4);
+
+    TEST_PASS
+}
+
+TEST(close_progress) {
+    CloseProgress c;
+    EQ(c.start_ms, 0);
+    EQ(c.total(), 0);
+    EQ(c.remaining(), 0);
+
+    c.begin(5, 1, 3, 2);
+    EQ(c.start_ms > 0, true);
+    EQ(c.total(), 11);
+    EQ(c.tags_total(), 5);
+    EQ(c.done(), 0);
+    EQ(c.remaining(), 11);
+
+    c.entries_done = 5;
+    c.tags_added_done = 2;
+    EQ(c.entries(), 5);
+    EQ(c.tags(), 2);
+    EQ(c.done(), 7);
+    EQ(c.remaining(), 4);
+
+    // Done counts past the totals are clamped, so remaining never wraps
+    c.tags_removed_done = 9;
+    EQ(c.tags_removed(), 2);
+    EQ(c.done(), 9);
+    EQ(c.remaining(), 2);
+
+    // begin() starts over
+    c.begin(1, 0, 0, 0);
+    EQ(c.entries_done, 0);
+    EQ(c.tags_removed_done, 0);
+    EQ(c.total(), 1);
+
+    // A new pass clears the last close
+    ProcessStats s;
+    s.begin_pass(PASS_SINGLE);
+    s.close.begin(3, 0, 0, 0);
+    s.close.entries_done = 3;
+    s.begin_pass(PASS_SINGLE);
+    NOPRINT_EQ(s.close, CloseProgress{});
 
     TEST_PASS
 }
@@ -208,6 +260,7 @@ TESTS_BEGIN
     RUN_TEST(pass_lifecycle)
     RUN_TEST(history_capped)
     RUN_TEST(progress_round_trip)
+    RUN_TEST(close_progress)
     RUN_TEST(progress_truncated)
     RUN_TEST(stage_event_round_trip)
     RUN_TEST(state_names)

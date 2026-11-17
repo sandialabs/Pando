@@ -101,6 +101,8 @@ struct AgentInfo {
         steady::time_point t;
         uint64_t pass;
         uint64_t keys_scanned;
+        uint64_t close_start_ms;    // identifies the stage close
+        uint64_t close_done;        // changes applied in that close
         map<string, uint64_t> ran;
     };
     deque<Sample> samples;
@@ -134,7 +136,7 @@ class PandoTop : public PandoParticipant {
             ai.db_size = p.db_size;
             ai.has_progress = true;
 
-            AgentInfo::Sample s { steady::now(), p.pass, p.keys_scanned, {} };
+            AgentInfo::Sample s { steady::now(), p.pass, p.keys_scanned, p.close.start_ms, p.close.done(), {} };
             for (auto& [name, f] : p.filters) s.ran[name] = f.total.ran;
             ai.samples.push_back(move(s));
             while (ai.samples.size() > 2 && ai.samples.front().t < steady::now() - RATE_WINDOW)
@@ -283,6 +285,19 @@ class PandoTop : public PandoParticipant {
             }
             return 0.0;
         }
+
+        /** @brief Changes/s an agent is applying in its current stage close (0 if unknown) */
+        static double close_rate(const AgentInfo& ai) {
+            if (ai.samples.size() < 2) return 0.0;
+            auto& last = ai.samples.back();
+            for (auto& s : ai.samples) {
+                if (s.close_start_ms != last.close_start_ms) continue;
+                double dt = chrono::duration<double>(last.t - s.t).count();
+                if (dt <= 0.0 || last.close_done <= s.close_done) return 0.0;
+                return (last.close_done - s.close_done) / dt;
+            }
+            return 0.0;
+        }
 };
 
 /** @brief Whether an agent is sweeping its entries right now */
@@ -290,6 +305,12 @@ static bool scanning(const AgentInfo& ai) {
     auto& p = ai.progress;
     return ai.has_progress && p.state == STAGE_BEGIN && !p.at_barrier &&
         p.pass_kind == PASS_SINGLE && p.keys_total > 0;
+}
+
+/** @brief Whether an agent is applying the changes staged by its pass */
+static bool closing(const AgentInfo& ai) {
+    auto& p = ai.progress;
+    return ai.has_progress && p.state == STAGE_CLOSING && p.close.start_ms > 0;
 }
 
 /** @brief Agents holding up a barrier: still working while others wait */
@@ -318,6 +339,10 @@ static string progress_line(const PandoTop& pp) {
     bool eta_known = true, any_scanning = false;
     uint64_t mesh_pass = pp.mesh_pass();
     uint8_t kind = PASS_NONE;
+    // Stage close progress, summed over the agents closing this pass
+    CloseProgress cl;
+    double close_eta_s = 0.0;
+    bool close_eta_known = true, any_closing = false;
     for (auto& [a, ai] : pp.infos()) {
         if (!ai.has_progress) continue;
         auto& p = ai.progress;
@@ -332,6 +357,23 @@ static string progress_line(const PandoTop& pp) {
             double rate = PandoTop::scan_rate(ai);
             if (rate > 0.0) eta_s = max(eta_s, (p.keys_total - p.keys_scanned) / rate);
             else eta_known = false;
+        }
+        if (closing(ai) && p.pass == mesh_pass) {
+            any_closing = true;
+            // Sum the clamped counts so that the mesh totals stay consistent
+            cl.entries_total += p.close.entries_total;
+            cl.entries_done += p.close.entries();
+            cl.vals_total += p.close.vals_total;
+            cl.vals_done += p.close.vals();
+            cl.tags_added_total += p.close.tags_added_total;
+            cl.tags_added_done += p.close.tags_added();
+            cl.tags_removed_total += p.close.tags_removed_total;
+            cl.tags_removed_done += p.close.tags_removed();
+            if (p.close.remaining() > 0) {
+                double rate = PandoTop::close_rate(ai);
+                if (rate > 0.0) close_eta_s = max(close_eta_s, p.close.remaining() / rate);
+                else close_eta_known = false;
+            }
         }
     }
 
@@ -354,6 +396,13 @@ static string progress_line(const PandoTop& pp) {
     if (any_scanning && total > 0) {
         s += "  " + fmt_count(scanned) + "/" + fmt_count(total) + " " + to_string(100 * scanned / total) + "%";
         if (eta_known && eta_s > 0.0) s += " ETA " + fmt_duration_ms((uint64_t)(eta_s * 1000));
+    }
+    if (any_closing && cl.total() > 0) {
+        s += "  ent " + fmt_count(cl.entries()) + "/" + fmt_count(cl.entries_total);
+        s += " tag " + fmt_count(cl.tags()) + "/" + fmt_count(cl.tags_total());
+        if (cl.vals_total > 0) s += " val " + fmt_count(cl.vals()) + "/" + fmt_count(cl.vals_total);
+        if (cl.remaining() > 0 && close_eta_known && close_eta_s > 0.0)
+            s += " ETA " + fmt_duration_ms((uint64_t)(close_eta_s * 1000));
     }
     size_t waiting = 0, n = 0;
     stragglers(pp, &waiting, &n);
@@ -401,9 +450,10 @@ static const int BODY_Y = 8;
 
 // Smallest terminal the layout fits in: the stats box needs 31 columns
 // ("Total DB size : " plus an 11-digit size) after the 14-column header and
-// the 7-column spinner. Agent boxes are 4 rows tall, starting at BODY_Y, and
-// the last row is kept for the footer, so one row of agents needs 13.
-static const int MIN_ROWS = BODY_Y + 4 + 1;
+// the 7-column spinner. Agent boxes are 6 rows tall, starting at BODY_Y, and
+// the last row is kept for the footer, so one row of agents needs 15.
+static const int AGENT_BOX_H = 6;
+static const int MIN_ROWS = BODY_Y + AGENT_BOX_H + 1;
 static const int MIN_COLS = 52;
 
 struct AgentBox {
@@ -417,7 +467,7 @@ class AgentsView {
         map<addr_t, AgentBox> boxes_;
         size_t hidden_agents_ = 0;
 
-        const int blk_h_ = 4;
+        const int blk_h_ = AGENT_BOX_H;
         const int blk_w_ = 22;
         const int blk_pad_ = 1;
 
@@ -483,7 +533,7 @@ class AgentsView {
                 mvwaddnstr(w, 0, 1, addr_str(addr).c_str(), blk_w_-2);
                 put(w, 1, 2, blk_w_-3, "DB size : " + to_string(ai ? ai->db_size : 0));
 
-                string line;
+                string line, detail1, detail2;
                 if (ai && ai->has_progress) {
                     auto& p = ai->progress;
                     if (p.pass > 0) line = "p" + to_string(p.pass) + " ";
@@ -491,8 +541,17 @@ class AgentsView {
                     if (p.at_barrier) line += " @barrier";
                     else if (scanning(*ai)) line += " " + to_string(100 * p.keys_scanned / p.keys_total) + "%";
                     else if (p.state == STAGE_ALG_PROCESS && p.group_iter > 0) line += " it " + to_string(p.group_iter);
+                    else if (closing(*ai) && p.close.total() > 0) line += " " + to_string(100 * p.close.done() / p.close.total()) + "%";
+
+                    // Staged changes applied so far / staged in total
+                    if (closing(*ai)) {
+                        detail1 = "ent " + fmt_count(p.close.entries()) + "/" + fmt_count(p.close.entries_total);
+                        detail2 = "tag " + fmt_count(p.close.tags()) + "/" + fmt_count(p.close.tags_total());
+                    }
                 }
                 put(w, 2, 2, blk_w_-3, line);
+                put(w, 3, 2, blk_w_-3, detail1);
+                put(w, 4, 2, blk_w_-3, detail2);
                 wnoutrefresh(w);
             }
         }
