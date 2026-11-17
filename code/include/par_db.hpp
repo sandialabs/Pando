@@ -484,18 +484,19 @@ class ParDB : public PandoParticipant {
                 any_in_flight = false;
                 for (auto & o : owners) {
                     if (!o.in_flight) continue;
-                    {
+                    o.in_flight = false;
+                    // A failed read (e.g. EINTR from a signal) must not stop the
+                    // other owners' replies from being read; it is recorded like
+                    // any other error. That one socket cannot be recovered.
+                    try {
                         ZMQMessage msg = o.req->read();
-                        o.in_flight = false;
                         if (!error) {
-                            try {
-                                const char* data = msg.data();
-                                unpack_values_reply(data, data + msg.size(), o.next - o.cur,
-                                                    o.idx->data() + o.cur, values);
-                            } catch (...) {
-                                error = current_exception();
-                            }
+                            const char* data = msg.data();
+                            unpack_values_reply(data, data + msg.size(), o.next - o.cur,
+                                                o.idx->data() + o.cur, values);
                         }
+                    } catch (...) {
+                        if (!error) error = current_exception();
                     } // the reply is freed here
                     if (!error && o.next < o.idx->size()) {
                         try {
