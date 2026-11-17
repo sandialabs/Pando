@@ -1110,7 +1110,7 @@ TEST(max_filters_per_stage) {
     };
 
     SeqDB d;
-    EQ(d.max_filters_per_stage(), 100000);
+    EQ(d.max_filters_per_stage(), SeqDB::UNLIMITED_FILTERS_PER_STAGE);
     for (int k = 0; k < 5; ++k) { DBEntry<> e; e.clear().add_tag("A"); d.add_entry(e); }
     { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
 
@@ -1146,7 +1146,33 @@ TEST(max_filters_per_stage_rejects_zero) {
         threw = true;
     }
     EQ(threw, true);
-    EQ(d.max_filters_per_stage(), 100000);
+    EQ(d.max_filters_per_stage(), SeqDB::UNLIMITED_FILTERS_PER_STAGE);
+
+    TEST_PASS
+}
+
+// With the default (unlimited) max_filters_per_stage, one pass runs the filter
+// on every qualifying entry instead of stopping early
+TEST(max_filters_per_stage_default_unlimited) {
+    g_TEST_max_filters_runs = 0;
+    FilterInterface i {
+        filter_name: "TEST_max_filters",
+        filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_max_filters_should_run,
+        init: nullptr,
+        destroy: nullptr,
+        run: &g_TEST_max_filters_run
+    };
+
+    SeqDB d;
+    const size_t n = 1000;
+    for (size_t k = 0; k < n; ++k) { DBEntry<> e; e.clear().add_tag("A"); d.add_entry(e); }
+    d.install_filter(make_shared<Filter>(&i));
+
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, n);
+    EQ(d.process_once(), false);
+    EQ(g_TEST_max_filters_runs, n);
 
     TEST_PASS
 }
@@ -1303,6 +1329,7 @@ TESTS_BEGIN
     RUN_TEST(import_export_with_tag)
     RUN_TEST(max_filters_per_stage)
     RUN_TEST(max_filters_per_stage_rejects_zero)
+    RUN_TEST(max_filters_per_stage_default_unlimited)
     RUN_TEST(cursor_runs_entries_behind_cursor)
     RUN_TEST(cursor_scan_cost)
 

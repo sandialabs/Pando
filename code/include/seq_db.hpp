@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <exception>
 #include <stdexcept>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -179,9 +180,10 @@ class SeqDB {
          * before it stops, so the stage can close. Entries created by those
          * runs (and messages for them) are held in memory until the stage
          * closes, so a smaller value bounds that memory at the cost of more
-         * passes.
+         * passes. Defaults to UNLIMITED_FILTERS_PER_STAGE, i.e. a pass only
+         * stops at the end of its snapshot of the keys.
          */
-        size_t max_filters_per_stage_ = 100000;
+        size_t max_filters_per_stage_ = UNLIMITED_FILTERS_PER_STAGE;
 
         /** @brief Cursor over the entries for run_filters_(): a snapshot of
          * the keys and the next position in it. A pass that stops at
@@ -633,8 +635,12 @@ class SeqDB {
             reset_scan_();
         }
 
+        /** @brief Value of max_filters_per_stage() meaning no limit (the default) */
+        static constexpr size_t UNLIMITED_FILTERS_PER_STAGE = numeric_limits<size_t>::max();
+
         /** @brief Set how many filter runs one processing pass may do
-         * before stopping so the stage can close (default 100000)
+         * before stopping so the stage can close (default
+         * UNLIMITED_FILTERS_PER_STAGE, i.e. no limit)
          */
         void set_max_filters_per_stage(size_t n) {
             if (n == 0) throw invalid_argument("max_filters_per_stage must be at least 1");

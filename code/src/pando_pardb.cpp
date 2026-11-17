@@ -40,7 +40,7 @@ int main_(int argc, char **argv) {
             "  -M<mem> : memory in GB, defaults to 16 (e.g., -M8 would allocate 8 GB)\n"
             "  --skip-group-filters : skip processing of group filters\n"
             "  --max-filters-per-stage=N : run at most N filters per processing pass before\n"
-            "                              closing the stage (bounds memory; default 100000)\n"
+            "                              closing the stage (bounds memory; default unlimited)\n"
             "\n"
             "Addresses are of the form: IPv4-string,ID\n"
             "  IPv4-string : a period separated IP address, e.g., 1.2.3.4\n"
@@ -53,7 +53,7 @@ int main_(int argc, char **argv) {
     string seed_addr;
     size_t sz = 16ull*(1ull<<30);
     bool skip_group_filters = false;
-    size_t max_filters_per_stage = 0;  // 0 = SeqDB default
+    size_t max_filters_per_stage = 0;  // 0 = SeqDB default (unlimited)
     const string max_filters_flag = "--max-filters-per-stage=";
     for (int idx = 2; idx < argc; ++idx) {
         if (argv[idx][0] == '-' && argv[idx][1] == 'M') {
@@ -77,7 +77,7 @@ int main_(int argc, char **argv) {
     }
 
     cerr << "[Pando] [DEBUG] Bind addr=" << bind_addr.get_conn_str(bind_addr, REQUEST) << " memory=" << sz
-         << " max_filters_per_stage=" << (max_filters_per_stage ? to_string(max_filters_per_stage) : string("default")) << endl;
+         << " max_filters_per_stage=" << (max_filters_per_stage ? to_string(max_filters_per_stage) : string("unlimited")) << endl;
     ParDBThread db { bind_addr, sz, skip_group_filters, max_filters_per_stage };
 
     if (argc > 2) {

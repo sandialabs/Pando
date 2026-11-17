@@ -76,7 +76,7 @@ class ParDB : public PandoParticipant {
          *
          * @param max_filters_per_stage if nonzero, how many filter runs one
          *        processing pass may do before the stage closes (see
-         *        SeqDB::set_max_filters_per_stage); 0 keeps the default
+         *        SeqDB::set_max_filters_per_stage); 0 keeps the default (unlimited)
          */
         ParDB(ZMQAddress addr, size_t sz, bool skip_group_filters=false, size_t max_filters_per_stage=0) :
                 PandoParticipant(addr, true),

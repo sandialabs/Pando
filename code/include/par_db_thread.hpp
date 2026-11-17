@@ -27,7 +27,7 @@ class ParDBThread {
             t_ = thread(&ParDBThread::launch, this);
         }
 
-        /** @brief As above, also limiting filter runs per processing pass (0 = default) */
+        /** @brief As above, also limiting filter runs per processing pass (0 = default, unlimited) */
         ParDBThread(ZMQAddress addr, size_t sz, bool skip_group_filters, size_t max_filters_per_stage) :
                 db_(addr, sz, skip_group_filters, max_filters_per_stage), shutdown_(false) {
             t_ = thread(&ParDBThread::launch, this);
