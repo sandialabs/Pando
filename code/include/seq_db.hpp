@@ -3,6 +3,8 @@
 #include <unordered_map>
 #include <filesystem>
 #include <exception>
+#include <stdexcept>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -176,6 +178,34 @@ class SeqDB {
         /** @brief Hold entries that need their values updates */
         absl::flat_hash_map<dbkey_t, string> val_updates_;
 
+        /** @brief How many filter runs one pass of run_filters_() may do
+         * before it stops, so the stage can close. Entries created by those
+         * runs (and messages for them) are held in memory until the stage
+         * closes, so a smaller value bounds that memory at the cost of more
+         * passes. Defaults to UNLIMITED_FILTERS_PER_STAGE, i.e. a pass only
+         * stops at the end of its snapshot of the keys.
+         */
+        size_t max_filters_per_stage_ = UNLIMITED_FILTERS_PER_STAGE;
+
+        /** @brief Cursor over the entries for run_filters_(): a snapshot of
+         * the keys and the next position in it. A pass that stops at
+         * max_filters_per_stage_ leaves the cursor where it stopped, so the
+         * next pass continues there instead of rescanning from the first key.
+         * scan_pos_ == 0 means the next pass starts a new lap on a fresh
+         * snapshot.
+         */
+        vector<dbkey_t> scan_keys_;
+        size_t scan_pos_ = 0;
+
+        /** @brief Total entries offered to the filters (for tests/diagnostics) */
+        size_t entries_examined_ = 0;
+
+        /** @brief Start the next pass on a fresh snapshot, freeing the old one */
+        void reset_scan_() {
+            vector<dbkey_t>().swap(scan_keys_);
+            scan_pos_ = 0;
+        }
+
     protected:
         /** @brief Processing statistics, see process_stats.hpp */
         ProcessStats stats_;
@@ -206,14 +236,30 @@ class SeqDB {
             progress_cb_();
         }
 
+        /** @brief Run the installed single-entry filters for one processing pass
+         *
+         * Entries are scanned with a cursor that carries over between passes
+         * (see scan_keys_): when a pass stops at max_filters_per_stage_, the
+         * next one continues from where it stopped.
+         *
+         * @return true if any filter ran. false only once a full lap, over a
+         * snapshot of the keys taken during this pass, ran no filter. The DB
+         * does not change during a pass (filter output is staged until the
+         * stage closes, and nothing is received while filters run), so at
+         * that point no entry qualifies for any filter. An entry behind the
+         * cursor that becomes runnable at a stage close (from this agent or
+         * another) is therefore always picked up on a later lap.
+         *
+         * Within one pass, an entry is not offered again after any filter has
+         * run, since that filter's staged changes are not visible yet.
+         */
         bool run_filters_() {
             bool filter_ran = false;
-            auto keys = db_.keys();
-            size_t i = 0;
-            size_t num_keys = keys.size();
 
-            // limit how many filters we run before a stage close to help with memory usage
-            size_t MAX_FILTERS_TO_RUN = 100000;
+            // Limit how many filters we run before a stage close to help with
+            // memory usage (see max_filters_per_stage_). The limit is checked
+            // after all filters have been offered an entry, so a pass can go
+            // over it by up to (installed filters - 1).
             size_t num_filters_run = 0;
 
             // Look up each SINGLE_ENTRY filter's counters once, not per entry
@@ -224,63 +270,101 @@ class SeqDB {
                 filters.push_back({filter.get(), &stats_.filter(filter_name, PASS_SINGLE).pass});
             }
 
-            stats_.keys_total = num_keys;
-            stats_.keys_scanned = 0;
-            stats_.stopped_early = false;
-
-            // Iterate through the database
-            for (auto & key : keys) {         // TODO : replace this with a C++ iterator that automatically "batches" behind the scene
-                auto entry = db_.retrieve(key); //TODO also batch retrievals
-                ++i;
-                #ifdef VERBOSE
-                if (i % 10000 == 0) {
-                    cerr << "I have processed " << i << "/" <<  num_keys << " entries and run " << num_filters_run << " filters"  << endl;
-                }
-                #endif
-                // @TODO profile to determine if this needs to be optimized out.
-                //       this costs (|F|*|E|)
-                for (auto & [filter, counters] : filters) {
-                    // @TODO move back out; make a test for add tags and then
-                    // get tags inside of a filter
-                    // Get the DB access -- need to redo this for each filter,
-                    // can't be pulled out of the loop because things can
-                    // change between filter runs
-                    DBAccess* access = entry.access();
-                    add_db_access(access);
-
-                    ++counters->checked;
-                    if (filter->should_run(access)) {
-                        filter_ran = true;
-                        auto start = steady_clock::now();
-                        {
-                            CurrentFilter current { cur_filter_, counters };
-                            filter->run(access);
-                        }
-                        counters->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
-                        ++counters->ran;
-                        ++num_filters_run;
-                    }
-
-                    delete access;
-                }
-
-                stats_.keys_scanned = i;
-                report_progress_if_due_();
-
-                if (num_filters_run > MAX_FILTERS_TO_RUN) {
-                    #ifdef VERBOSE
-                    cerr << "breaking early due to max filter run limit" << endl;
-                    #endif
-                    stats_.stopped_early = i < num_keys;
-                    break;
-                }
-            }
-
             #ifdef VERBOSE
-            cerr << "done processing" << endl;
+            size_t i = 0;   // entries this pass
             #endif
 
-            return filter_ran;
+            // Start a new lap on a fresh snapshot if the last one finished
+            if (scan_pos_ == 0 || scan_pos_ >= scan_keys_.size()) {
+                scan_keys_ = db_.keys();
+                scan_pos_ = 0;
+            }
+            bool lap_from_start = (scan_pos_ == 0);
+
+            stats_.stopped_early = false;
+
+            while (true) {
+                // Progress is reported as the cursor's position in the current
+                // lap, so a pass that resumes mid-lap starts part-way through
+                stats_.keys_total = scan_keys_.size();
+                stats_.keys_scanned = scan_pos_;
+
+                while (scan_pos_ < scan_keys_.size()) {
+                    dbkey_t key = scan_keys_[scan_pos_++];
+                    // The snapshot can be older than this pass; skip anything gone
+                    auto [entry, exists] = db_.retrieve_if_exists(key); //TODO also batch retrievals
+                    ++entries_examined_;
+                    if (exists) {
+                        #ifdef VERBOSE
+                        if (++i % 10000 == 0) {
+                            cerr << "I have processed " << i << " entries this pass (cursor at " << scan_pos_ << "/"
+                                 << scan_keys_.size() << ") and run " << num_filters_run << " filters" << endl;
+                        }
+                        #endif
+                        // @TODO profile to determine if this needs to be optimized out.
+                        //       this costs (|F|*|E|)
+                        for (auto & [filter, counters] : filters) {
+                            // @TODO move back out; make a test for add tags and then
+                            // get tags inside of a filter
+                            // Get the DB access -- need to redo this for each filter,
+                            // can't be pulled out of the loop because things can
+                            // change between filter runs
+                            DBAccess* access = entry.access();
+                            add_db_access(access);
+
+                            ++counters->checked;
+                            if (filter->should_run(access)) {
+                                filter_ran = true;
+                                auto start = steady_clock::now();
+                                {
+                                    CurrentFilter current { cur_filter_, counters };
+                                    filter->run(access);
+                                }
+                                counters->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
+                                ++counters->ran;
+                                ++num_filters_run;
+                            }
+
+                            delete access;
+                        }
+                    }
+
+                    stats_.keys_scanned = scan_pos_;
+                    report_progress_if_due_();
+
+                    if (num_filters_run >= max_filters_per_stage_) {
+                        #ifdef VERBOSE
+                        cerr << "breaking early due to max filter run limit (cursor at " << scan_pos_ << "/"
+                             << scan_keys_.size() << ")" << endl;
+                        #endif
+                        // Keep the cursor; the next pass continues from here
+                        stats_.stopped_early = scan_pos_ < scan_keys_.size();
+                        return true;
+                    }
+                }
+
+                // Reached the end of the snapshot
+                if (filter_ran) {
+                    // Next pass starts a new lap, which will see this pass's changes
+                    reset_scan_();
+                    return true;
+                }
+                if (lap_from_start) {
+                    // A full lap of a current snapshot ran nothing: done
+                    #ifdef VERBOSE
+                    cerr << "done processing" << endl;
+                    #endif
+                    reset_scan_();
+                    return false;
+                }
+                // Nothing ran, but this pass began mid-snapshot, so entries
+                // before the cursor have not been checked in their current
+                // state. Nothing is staged yet, so it is safe to start a full
+                // lap on a fresh snapshot within this same pass.
+                scan_keys_ = db_.keys();
+                scan_pos_ = 0;
+                lap_from_start = true;
+            }
         }
 
 
@@ -605,7 +689,29 @@ class SeqDB {
             // Register it with the stats now so that it is reported (e.g.,
             // shown by pando_top) before any processing has happened
             stats_.filter(filter_name, filter->filter_type() == GROUP_ENTRIES ? PASS_GROUP : PASS_SINGLE);
+            // New filters may apply to entries behind the cursor
+            reset_scan_();
         }
+
+        /** @brief Value of max_filters_per_stage() meaning no limit (the default) */
+        static constexpr size_t UNLIMITED_FILTERS_PER_STAGE = numeric_limits<size_t>::max();
+
+        /** @brief Set how many filter runs one processing pass may do
+         * before stopping so the stage can close (default
+         * UNLIMITED_FILTERS_PER_STAGE, i.e. no limit)
+         */
+        void set_max_filters_per_stage(size_t n) {
+            if (n == 0) throw invalid_argument("max_filters_per_stage must be at least 1");
+            max_filters_per_stage_ = n;
+        }
+
+        /** @brief Return how many filter runs one processing pass may do */
+        size_t max_filters_per_stage() const { return max_filters_per_stage_; }
+
+        /** @brief Return how many entries have been offered to the filters in
+         * total (each entry fetched by a processing pass counts once)
+         */
+        size_t entries_examined() const { return entries_examined_; }
 
         /** @brief Return the number of installed filters*/
         size_t num_filters() {return installed_filters_.size();}
@@ -622,6 +728,7 @@ class SeqDB {
         /** @brief Clear the installed filters */
         void clear_filters() {
             installed_filters_.clear();
+            reset_scan_();
         }
 
         /** @brief Process one iteration, returning whether any filters were ran */

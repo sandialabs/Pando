@@ -69,8 +69,13 @@ class ParDB : public PandoParticipant {
         bool skip_group_filters_ = false;
 
     public:
-        /** @brief Initialize the parallel DB */
-        ParDB(ZMQAddress addr, size_t sz, bool skip_group_filters=false) :
+        /** @brief Initialize the parallel DB
+         *
+         * @param max_filters_per_stage if nonzero, how many filter runs one
+         *        processing pass may do before the stage closes (see
+         *        SeqDB::set_max_filters_per_stage); 0 keeps the default (unlimited)
+         */
+        ParDB(ZMQAddress addr, size_t sz, bool skip_group_filters=false, size_t max_filters_per_stage=0) :
                 PandoParticipant(addr, true),
                 db_refs_(this,
                     s_ref_add_entry,
@@ -98,6 +103,7 @@ class ParDB : public PandoParticipant {
             sub(EXPORT_DB_WITH_TAG);
 
             if (skip_group_filters_) db_.disable_group_filters();
+            if (max_filters_per_stage != 0) db_.set_max_filters_per_stage(max_filters_per_stage);
 
             // The message loop does not run while filters run, so publish
             // progress from inside the filter loops instead

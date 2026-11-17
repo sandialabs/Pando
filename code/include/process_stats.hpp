@@ -184,10 +184,11 @@ struct ProcessStats {
     uint8_t pass_kind = PASS_NONE;
     uint64_t pass_start_ms = 0;
 
-    /** Progress of the current SINGLE_ENTRY sweep */
+    /** Progress of the current SINGLE_ENTRY sweep: the cursor position in
+     * the current lap over the keys, which a resumed pass starts part-way */
     uint64_t keys_total = 0;
     uint64_t keys_scanned = 0;
-    /** The sweep stopped at MAX_FILTERS_TO_RUN and will continue next pass */
+    /** The sweep stopped at max_filters_per_stage and will continue next pass */
     bool stopped_early = false;
 
     /** Iteration of the current GROUP_ENTRIES computation */

@@ -1081,6 +1081,215 @@ TEST(import_export_with_tag) {
     TEST_PASS
 }
 
+// Filter for the max_filters_per_stage tests: runs on entries tagged "A" that
+// it hasn't tagged "A:done" yet, so each entry is filtered exactly once
+static size_t g_TEST_max_filters_runs;
+bool g_TEST_max_filters_should_run(const DBAccess* acc) {
+    bool found_a = false;
+    for (auto tags = acc->tags; *tags[0] != '\0'; ++tags) {
+        if (string(*tags) == "A:done") return false;
+        if (string(*tags) == "A") found_a = true;
+    }
+    return found_a;
+}
+void g_TEST_max_filters_run(void* access) {
+    const DBAccess* acc = (const DBAccess*)access;
+    ++g_TEST_max_filters_runs;
+    acc->add_tag.run(&acc->add_tag, "A:done");
+}
+
+TEST(max_filters_per_stage) {
+    g_TEST_max_filters_runs = 0;
+    FilterInterface i {
+        filter_name: "TEST_max_filters",
+        filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_max_filters_should_run,
+        init: nullptr,
+        destroy: nullptr,
+        run: &g_TEST_max_filters_run
+    };
+
+    SeqDB d;
+    EQ(d.max_filters_per_stage(), SeqDB::UNLIMITED_FILTERS_PER_STAGE);
+    for (int k = 0; k < 5; ++k) { DBEntry<> e; e.clear().add_tag("A"); d.add_entry(e); }
+    { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
+
+    d.set_max_filters_per_stage(2);
+    EQ(d.max_filters_per_stage(), 2);
+    d.install_filter(make_shared<Filter>(&i));
+
+    // Each pass runs at most 2 filters; the "A:done" tags are applied when
+    // the stage closes, so the next pass picks up the remaining entries
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, 2);
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, 4);
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, 5);
+    EQ(d.process_once(), false);
+    EQ(g_TEST_max_filters_runs, 5);
+
+    size_t done = 0;
+    for (auto & [key, entry] : d.entries())
+        if (entry.has_tag("A:done")) ++done;
+    EQ(done, 5);
+
+    TEST_PASS
+}
+
+TEST(max_filters_per_stage_rejects_zero) {
+    SeqDB d;
+    bool threw = false;
+    try {
+        d.set_max_filters_per_stage(0);
+    } catch (const invalid_argument&) {
+        threw = true;
+    }
+    EQ(threw, true);
+    EQ(d.max_filters_per_stage(), SeqDB::UNLIMITED_FILTERS_PER_STAGE);
+
+    TEST_PASS
+}
+
+// With the default (unlimited) max_filters_per_stage, one pass runs the filter
+// on every qualifying entry instead of stopping early
+TEST(max_filters_per_stage_default_unlimited) {
+    g_TEST_max_filters_runs = 0;
+    FilterInterface i {
+        filter_name: "TEST_max_filters",
+        filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_max_filters_should_run,
+        init: nullptr,
+        destroy: nullptr,
+        run: &g_TEST_max_filters_run
+    };
+
+    SeqDB d;
+    const size_t n = 1000;
+    for (size_t k = 0; k < n; ++k) { DBEntry<> e; e.clear().add_tag("A"); d.add_entry(e); }
+    d.install_filter(make_shared<Filter>(&i));
+
+    EQ(d.process_once(), true);
+    EQ(g_TEST_max_filters_runs, n);
+    EQ(d.process_once(), false);
+    EQ(g_TEST_max_filters_runs, n);
+
+    TEST_PASS
+}
+
+// Filters for the scan cursor tests. tag_other runs on entries tagged "Y" and
+// adds "TagB" to the entry at {a+1, b, c} (a new entry with that key merges
+// into it). on_tag_b runs once on each entry tagged "TagB".
+static size_t g_TEST_on_tag_b_runs;
+static bool g_TEST_has_tag(const DBAccess* acc, const string& want) {
+    for (auto tags = acc->tags; *tags[0] != '\0'; ++tags)
+        if (string(*tags) == want) return true;
+    return false;
+}
+bool g_TEST_tag_other_should_run(const DBAccess* acc) {
+    return g_TEST_has_tag(acc, "Y") && !g_TEST_has_tag(acc, "tag_other:done");
+}
+void g_TEST_tag_other_run(void* access) {
+    const DBAccess* acc = (const DBAccess*)access;
+    dbkey_t target {acc->key.a + 1, acc->key.b, acc->key.c};
+    const char* new_tags[] = {"TagB", ""};
+    acc->make_new_entry.run(&acc->make_new_entry, new_tags, "", target);
+    acc->add_tag.run(&acc->add_tag, "tag_other:done");
+}
+bool g_TEST_on_tag_b_should_run(const DBAccess* acc) {
+    return g_TEST_has_tag(acc, "TagB") && !g_TEST_has_tag(acc, "on_tag_b:done");
+}
+void g_TEST_on_tag_b_run(void* access) {
+    const DBAccess* acc = (const DBAccess*)access;
+    ++g_TEST_on_tag_b_runs;
+    acc->add_tag.run(&acc->add_tag, "on_tag_b:done");
+}
+
+// A filter made runnable on an entry the scan has already passed (here by
+// another filter tagging it) must still run before processing reports done
+TEST(cursor_runs_entries_behind_cursor) {
+    g_TEST_on_tag_b_runs = 0;
+    FilterInterface tag_other {
+        filter_name: "TEST_tag_other",
+        filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_tag_other_should_run,
+        init: nullptr,
+        destroy: nullptr,
+        run: &g_TEST_tag_other_run
+    };
+    FilterInterface on_tag_b {
+        filter_name: "TEST_on_tag_b",
+        filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_on_tag_b_should_run,
+        init: nullptr,
+        destroy: nullptr,
+        run: &g_TEST_on_tag_b_run
+    };
+
+    // Pairs: Y_i at {20, i, 0} tags X_i at {21, i, 0}. Scan order is the
+    // hash order, so about half the X_i come before their Y_i
+    size_t pairs = 20;
+    SeqDB d;
+    for (size_t k = 0; k < pairs; ++k) {
+        { DBEntry<> e; e.clear().add_tag("X").value() = "x"; e.set_key({21, (vtx_t)k, 0}); d.add_entry(move(e)); }
+        { DBEntry<> e; e.clear().add_tag("Y").value() = "y"; e.set_key({20, (vtx_t)k, 0}); d.add_entry(move(e)); }
+    }
+    d.set_max_filters_per_stage(1);
+    d.install_filter(make_shared<Filter>(&tag_other));
+    d.install_filter(make_shared<Filter>(&on_tag_b));
+
+    size_t passes = 0;
+    while (d.process_once()) {
+        ++passes;
+        if (passes > 10*pairs) TEST_FAIL
+    }
+
+    EQ(g_TEST_on_tag_b_runs, pairs);
+    size_t done = 0;
+    for (auto & [key, entry] : d.entries())
+        if (entry.has_tag("X") && entry.has_tag("on_tag_b:done")) ++done;
+    EQ(done, pairs);
+
+    // Without the cursor every pass rescans from the first key (about 40
+    // passes x 20 entries); with it, a few laps of 40
+    EQ(d.entries_examined() <= 6*2*pairs, true);
+
+    TEST_PASS
+}
+
+// The scan resumes where the last pass stopped instead of starting over
+TEST(cursor_scan_cost) {
+    g_TEST_max_filters_runs = 0;
+    FilterInterface i {
+        filter_name: "TEST_max_filters",
+        filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_max_filters_should_run,
+        init: nullptr,
+        destroy: nullptr,
+        run: &g_TEST_max_filters_run
+    };
+
+    SeqDB d;
+    for (int k = 0; k < 10; ++k) { DBEntry<> e; e.clear().add_tag("A"); d.add_entry(e); }
+    for (int k = 0; k < 90; ++k) { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
+    d.set_max_filters_per_stage(2);
+    d.install_filter(make_shared<Filter>(&i));
+
+    while (d.process_once()) {}
+    EQ(g_TEST_max_filters_runs, 10);
+
+    // One lap doing the work plus one clean lap confirming it is done
+    size_t examined = d.entries_examined();
+    EQ(examined <= 2*100, true);
+
+    // Once done, another pass runs nothing and reports done again after one lap
+    EQ(d.process_once(), false);
+    EQ(g_TEST_max_filters_runs, 10);
+    EQ(d.entries_examined(), examined + 100);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1118,6 +1327,11 @@ TESTS_BEGIN
     RUN_TEST(serialize_entries)
     RUN_TEST(import_export)
     RUN_TEST(import_export_with_tag)
+    RUN_TEST(max_filters_per_stage)
+    RUN_TEST(max_filters_per_stage_rejects_zero)
+    RUN_TEST(max_filters_per_stage_default_unlimited)
+    RUN_TEST(cursor_runs_entries_behind_cursor)
+    RUN_TEST(cursor_scan_cost)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END
