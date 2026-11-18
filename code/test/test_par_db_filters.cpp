@@ -2,6 +2,10 @@
 #include "par_db.hpp"
 #include "test_helpers.hpp"
 
+#include <algorithm>
+#include <map>
+#include <sstream>
+
 using namespace std;
 using namespace pando;
 
@@ -1240,6 +1244,372 @@ TEST(filter_get_entry_by_key_local_and_remote) {
     TEST_PASS
 }
 
+// Run test_pardb_filters_mixed_writes on 3 agents with the given write
+// batch flush size (0 = one message per write) and filter runs per pass
+// (0 = default), check the result, and return every entry as
+// "a:b:c" -> "sorted tags | value" (for {52,0,0}, whose value is concatenated
+// in an arbitrary order, the value's lines are sorted)
+static int run_mixed_writes(const string& build_dir, size_t batch_bytes, size_t max_filters,
+                            map<string, string>& snapshot, uint64_t& batches, uint64_t& batched_writes) {
+    g_idx = 0;
+    const size_t n = 30;
+    const size_t sz = 2ull*(1ull<<29);
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr, sz, false, max_filters, batch_bytes };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr, sz, false, max_filters, batch_bytes };
+    elga::ZMQAddress db3_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db3 { db3_addr, sz, false, max_filters, batch_bytes };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    ParDBClient c3 { db3_addr };
+    vector<ZMQAddress> addrs { db1_addr, db2_addr, db3_addr };
+
+    c2.add_neighbor(db1_addr);
+    c3.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 3 || c2.num_neighbors() != 3 || c3.num_neighbors() != 3); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 3);
+    EQ(c2.num_neighbors(), 3);
+    EQ(c3.num_neighbors(), 3);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_mixed_writes");
+
+    for (size_t i = 0; i < n; ++i) {
+        { DBEntry<> e; e.set_key({50, (vtx_t)i, 0}); e.add_tag("W"); e.value() = to_string(i); c1.add_entry(e); }
+        { DBEntry<> e; e.set_key({53, (vtx_t)i, 0}); e.add_tag("T"); e.add_tag("keep"); e.value() = "orig"; c1.add_entry(e); }
+        { DBEntry<> e; e.set_key({51, (vtx_t)i, 1}); e.add_tag("waiting"); e.value() = "sub"; c1.add_entry(e); }
+    }
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() + c3.db_size() != 3*n; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size() + c3.db_size(), 3*n);
+
+    c1.process();
+    wait(addrs);
+
+    batches = db1.db().write_batches_sent() + db2.db().write_batches_sent() + db3.db().write_batches_sent();
+    batched_writes = db1.db().writes_batched() + db2.db().writes_batched() + db3.db().writes_batched();
+
+    vector<DBEntry<>> entries;
+    for (auto* c : {&c1, &c2, &c3})
+        for (auto & entry : c->get_entries())
+            entries.push_back(move(entry));
+
+    // The 3n preloaded entries, n created {51,i,0}, and the shared {52,0,0}
+    EQ(entries.size(), 4*n + 1);
+
+    snapshot.clear();
+    size_t done = 0, made = 0, released = 0, updated = 0;
+    for (auto & entry : entries) {
+        dbkey_t k = entry.get_key();
+        vector<string> tags(entry.tags().begin(), entry.tags().end());
+        sort(tags.begin(), tags.end());
+        string value = entry.value();
+        if (k == dbkey_t{52, 0, 0}) {
+            vector<string> lines;
+            stringstream ss(value);
+            for (string line; getline(ss, line);) lines.push_back(line);
+            sort(lines.begin(), lines.end());
+            EQ(lines.size(), n);
+            value.clear();
+            for (auto & line : lines) value += line + "\n";
+            EQ(entry.has_tag("shared"), true);
+        }
+        string tag_list;
+        for (auto & t : tags) tag_list += t + ",";
+        snapshot[to_string(k.a) + ":" + to_string(k.b) + ":" + to_string(k.c)] = tag_list + "|" + value;
+
+        string idx = to_string(k.b);
+        if (k.a == 50) {
+            EQ(entry.has_tag("test_pardb_filters_mixed_writes:done"), true);
+            ++done;
+        } else if (k.a == 51 && k.c == 0) {
+            EQ(entry.has_tag("made"), true);
+            EQ(value, "v" + idx);
+            ++made;
+        } else if (k.a == 51 && k.c == 1) {
+            // Released by its subscription to {51,i,0}
+            EQ(entry.has_tag("waiting"), false);
+            ++released;
+        } else if (k.a == 53) {
+            EQ(entry.has_tag("T"), false);
+            EQ(entry.has_tag("keep"), true);
+            // The second of the two updates, in the order they were made
+            EQ(value, "u" + idx);
+            ++updated;
+        }
+    }
+    EQ(done, n);
+    EQ(made, n);
+    EQ(released, n);
+    EQ(updated, n);
+
+    TEST_PASS
+}
+
+// Every kind of write a filter can make gives the same result batched as
+// unbatched: unbatched (0), batches flushed after almost every write (64
+// bytes, so each owner gets many batches per pass), and the default size
+// (each owner gets one batch, at the end of the pass)
+//
+// The batch counters show batching really happened: each filter run makes 7
+// writes (2 new entries, a tag removal, 2 value updates, a subscription and
+// its own done tag), so 7n writes must go out in batches when batching is on
+TEST(filter_write_batching) {
+    const uint64_t writes = 7 * 30;
+    map<string, string> unbatched, tiny, by_default;
+    uint64_t batches, batched;
+
+    EQ(run_mixed_writes(build_dir, 0, 0, unbatched, batches, batched), 0);
+    EQ(batches, 0);
+    EQ(batched, 0);
+
+    // A 64-byte batch is flushed once it holds 64 bytes: no write is smaller
+    // than 34 bytes, so a batch holds at most 2 writes
+    EQ(run_mixed_writes(build_dir, 64, 0, tiny, batches, batched), 0);
+    EQ(batched, writes);
+    EQ(batches >= writes / 2, true);
+
+    // At the default size nothing fills up: each of the 3 agents sends at
+    // most one batch to each of the 3 owners, at the end of the one pass
+    // that runs filters
+    EQ(run_mixed_writes(build_dir, ParDB::DEFAULT_WRITE_BATCH_BYTES, 0, by_default, batches, batched), 0);
+    EQ(batched, writes);
+    EQ(batches >= 1 && batches <= 9, true);
+
+    EQ(tiny == unbatched, true);
+    EQ(by_default == unbatched, true);
+
+    TEST_PASS
+}
+
+// With one filter run per pass, batches are flushed at every pass boundary;
+// processing must still finish with the same result
+TEST(filter_write_batching_one_filter_per_pass) {
+    map<string, string> unbatched, batched;
+    uint64_t batches, batched_writes;
+    EQ(run_mixed_writes(build_dir, 0, 1, unbatched, batches, batched_writes), 0);
+    EQ(batches, 0);
+    EQ(run_mixed_writes(build_dir, 64, 1, batched, batches, batched_writes), 0);
+    EQ(batched_writes, 7 * 30);
+    EQ(batched == unbatched, true);
+
+    TEST_PASS
+}
+
+// Run test_pardb_filters_edge_writes on 3 agents with the given write batch
+// flush size, check every value, and return every entry as
+// "a:b:c" -> "sorted tags | value"
+static int run_edge_writes(const string& build_dir, size_t batch_bytes,
+                           map<string, string>& snapshot, uint64_t& batches, uint64_t& batched_writes) {
+    g_idx = 0;
+    const size_t n = 6;
+    const size_t sz = 2ull*(1ull<<29);
+    const string odd_value = "a,b|c:d\n\x01\x7f\xff end";   // as in the filter
+    auto big_value = [](vtx_t i) { return string(300*1024 + i, (char)('a' + i % 26)); };
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr, sz, false, 0, batch_bytes };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr, sz, false, 0, batch_bytes };
+    elga::ZMQAddress db3_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db3 { db3_addr, sz, false, 0, batch_bytes };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    ParDBClient c3 { db3_addr };
+    vector<ZMQAddress> addrs { db1_addr, db2_addr, db3_addr };
+
+    c2.add_neighbor(db1_addr);
+    c3.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 3 || c2.num_neighbors() != 3 || c3.num_neighbors() != 3); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 3);
+    EQ(c2.num_neighbors(), 3);
+    EQ(c3.num_neighbors(), 3);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_edge_writes");
+
+    for (size_t i = 0; i < n; ++i) {
+        { DBEntry<> e; e.set_key({70, (vtx_t)i, 0}); e.add_tag("E"); e.value() = to_string(i); c1.add_entry(e); }
+        { DBEntry<> e; e.set_key({73, (vtx_t)i, 0}); e.add_tag("to_empty"); e.value() = "orig"; c1.add_entry(e); }
+        { DBEntry<> e; e.set_key({74, (vtx_t)i, 0}); e.add_tag("to_big"); e.value() = "orig"; c1.add_entry(e); }
+    }
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() + c3.db_size() != 3*n; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size() + c3.db_size(), 3*n);
+
+    c1.process();
+    wait(addrs);
+
+    batches = db1.db().write_batches_sent() + db2.db().write_batches_sent() + db3.db().write_batches_sent();
+    batched_writes = db1.db().writes_batched() + db2.db().writes_batched() + db3.db().writes_batched();
+
+    vector<DBEntry<>> entries;
+    for (auto* c : {&c1, &c2, &c3})
+        for (auto & entry : c->get_entries())
+            entries.push_back(move(entry));
+    EQ(entries.size(), 6*n);
+
+    snapshot.clear();
+    size_t checked = 0;
+    for (auto & entry : entries) {
+        dbkey_t k = entry.get_key();
+        vector<string> tags(entry.tags().begin(), entry.tags().end());
+        sort(tags.begin(), tags.end());
+        string tag_list;
+        for (auto & t : tags) tag_list += t + ",";
+        snapshot[to_string(k.a) + ":" + to_string(k.b) + ":" + to_string(k.c)] = tag_list + "|" + entry.value();
+
+        if (k.a == 70) { EQ(entry.has_tag("test_pardb_filters_edge_writes:done"), true); ++checked; }
+        else if (k.a == 71) { EQ(entry.has_tag("big"), true); EQ(entry.value() == big_value(k.b), true); ++checked; }
+        else if (k.a == 72) { EQ(entry.has_tag("empty"), true); EQ(entry.value().size(), 0); ++checked; }
+        else if (k.a == 73) { EQ(entry.value().size(), 0); ++checked; }
+        else if (k.a == 74) { EQ(entry.value() == string(200*1024, 'z'), true); ++checked; }
+        else if (k.a == 75) { EQ(entry.has_tag("odd"), true); EQ(entry.value() == odd_value, true); ++checked; }
+    }
+    EQ(checked, 6*n);
+
+    TEST_PASS
+}
+
+// Unusual values are carried exactly, batched or not: values larger than a
+// whole batch (each of those forces its owner's batch out on its own), empty
+// values, and values with separators, a newline, control and high bytes.
+// Each run makes 6 writes (3 new entries, 2 value updates, its done tag).
+TEST(filter_write_batching_edge_values) {
+    const uint64_t n = 6, writes = 6 * n;
+    map<string, string> unbatched, tiny, by_default;
+    uint64_t batches, batched;
+
+    EQ(run_edge_writes(build_dir, 0, unbatched, batches, batched), 0);
+    EQ(batches, 0);
+
+    EQ(run_edge_writes(build_dir, 64, tiny, batches, batched), 0);
+    EQ(batched, writes);
+
+    // Every 300 KB value is bigger than the 256 KB default, so its batch is
+    // sent as soon as it is added: at least one batch per run
+    EQ(run_edge_writes(build_dir, ParDB::DEFAULT_WRITE_BATCH_BYTES, by_default, batches, batched), 0);
+    EQ(batched, writes);
+    EQ(batches >= n, true);
+
+    EQ(tiny == unbatched, true);
+    EQ(by_default == unbatched, true);
+
+    TEST_PASS
+}
+
+// Sends hand-built messages to one agent, as ParDBClient does
+struct RawSender : ZMQChatterbox {
+    ZMQRequester req_;
+    RawSender(ZMQAddress server) : ZMQChatterbox(ZMQAddress {}), req_(server, addr_) { }
+    void send_and_wait(const vector<char>& msg) {
+        req_.send(msg.data(), msg.size());
+        req_.wait_ack();
+    }
+};
+
+static vector<char> key_string_msg(msg_type_t type, dbkey_t key, const string& str) {
+    vector<char> msg(sizeof(msg_type_t) + sizeof(dbkey_t) + str.size());
+    char* p = msg.data();
+    pack_msg(p, type);
+    pack_single(p, key);
+    memcpy(p, str.data(), str.size());
+    return msg;
+}
+
+// Before processing, a tag add, tag removal, value update or subscription
+// that reaches an agent which does not own the key is forwarded to the owner
+// whole (the forwarded message must start at the message type, not part way
+// into the key)
+TEST(forward_writes_to_owner) {
+    g_idx = 0;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr };
+    vector<ZMQAddress> addrs { db1_addr, db2_addr };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    c2.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 2 || c2.num_neighbors() != 2); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 2);
+    EQ(c2.num_neighbors(), 2);
+
+    // Keys db1 owns (placement hashes (a, b), so all three share an owner)
+    vtx_t b = 0;
+    while (!db1.db().has_ownership(dbkey_t{60, b, 0})) ++b;
+    dbkey_t target {60, b, 0};     // tags and value are changed
+    dbkey_t waiter {60, b, 1};     // subscribes to the creation of created
+    dbkey_t created {60, b, 2};
+    EQ(db2.db().has_ownership(target), false);
+
+    { DBEntry<> e; e.set_key(target); e.add_tag("T"); e.value() = "orig"; c1.add_entry(e); }
+    { DBEntry<> e; e.set_key(waiter); e.add_tag("waiting"); e.value() = "sub"; c1.add_entry(e); }
+    EQ(c1.db_size(), 2);
+
+    // All sent to db2, which must forward them to db1, in this order
+    RawSender to_db2 { db2_addr };
+    to_db2.send_and_wait(key_string_msg(ADD_TAG_TO_ENTRY, target, "added"));
+    {
+        string tag = "waiting";
+        vector<char> msg(sizeof(msg_type_t) + 2*sizeof(dbkey_t) + tag.size());
+        char* p = msg.data();
+        pack_msg(p, SUBSCRIBE_TO_ENTRY);
+        pack_single(p, waiter);
+        pack_single(p, created);
+        memcpy(p, tag.data(), tag.size());
+        to_db2.send_and_wait(msg);
+    }
+    to_db2.send_and_wait(key_string_msg(REMOVE_TAG_FROM_ENTRY, target, "T"));
+    to_db2.send_and_wait(key_string_msg(UPDATE_ENTRY_VAL, target, "new"));
+
+    // Tag removals and value updates are applied right away before
+    // processing. Once the last one shows, db1 has handled the earlier ones.
+    auto target_entry = [&]() {
+        for (auto & e : c1.get_entries())
+            if (e.get_key() == target) return e;
+        return DBEntry<> {};
+    };
+    for (int t = 0; t < 100 && target_entry().value() != "new"; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(target_entry().value(), "new");
+    EQ(target_entry().has_tag("T"), false);
+
+    // Creating the entry releases the subscription; the release and the tag
+    // add are staged, and applied when a stage closes
+    { DBEntry<> e; e.set_key(created); e.value() = "c"; c1.add_entry(e); }
+    c1.process();
+    wait(addrs);
+
+    EQ(c1.db_size(), 3);
+    EQ(c2.db_size(), 0);
+    bool waiter_found = false;
+    for (auto & e : c1.get_entries()) {
+        if (e.get_key() == target) {
+            EQ(e.has_tag("added"), true);
+            EQ(e.has_tag("T"), false);
+            EQ(e.value(), "new");
+        } else if (e.get_key() == waiter) {
+            EQ(e.has_tag("waiting"), false);
+            waiter_found = true;
+        }
+    }
+    EQ(waiter_found, true);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1247,6 +1617,10 @@ TESTS_BEGIN
     RUN_TEST(filter_new_entry_with_key)
     RUN_TEST(filter_max_filters_per_stage)
     RUN_TEST(filter_cursor_cross_agent)
+    RUN_TEST(filter_write_batching)
+    RUN_TEST(filter_write_batching_one_filter_per_pass)
+    RUN_TEST(filter_write_batching_edge_values)
+    RUN_TEST(forward_writes_to_owner)
     RUN_TEST(filter_fail)
     RUN_TEST(dup_filters_fail)
     RUN_TEST(two_filters)

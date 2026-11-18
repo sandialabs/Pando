@@ -117,6 +117,9 @@ using it_t = int32_t;
 #define CLOSE_EARLY                   0xd7
 #define GET_ENTRIES_BY_KEYS           0xd8
 #define MAP_RETRIEVE_VALUES           0xd9
+/* Several writes (new entries, tag adds/removes, value updates,
+ * subscriptions) to one agent in one message; see ParDB::recv_write_batch */
+#define WRITE_BATCH                   0xda
 #define WANT_HEARTBEAT                0xfe
 #define HEARTBEAT                     0xff
 
