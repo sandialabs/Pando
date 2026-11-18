@@ -17,6 +17,7 @@
 #include "timer.hpp"
 #include "address.hpp"
 
+#include <functional>
 #include <string>
 #include <vector>
 #include <tuple>
@@ -155,6 +156,12 @@ namespace elga {
             zmq_socket_t sock_sub_;
             /** Socket for our pulls */
             zmq_socket_t sock_pull_;
+            /** Second subscription socket, connected to the same publishers
+             * as sock_sub_ but with its own subscriptions. It is not part of
+             * poll(), so it can be drained (see drain_ctrl) from inside
+             * long-running work without taking messages meant for the main
+             * loop off sock_sub_. */
+            zmq_socket_t sock_ctrl_sub_;
 
             /** Keep track of the time since the last heartbeat */
             timer::TimePoint last_heartbeat_;
@@ -210,6 +217,16 @@ namespace elga {
 
             /** Unsubscribe from a feed */
             void unsub(const char *data, size_t size);
+
+            /** Subscribe the control socket to a feed. Messages of this type
+             * are then only delivered through drain_ctrl(), so the type
+             * should not also be subscribed with sub(). */
+            void ctrl_sub(msg_type_t type);
+
+            /** Receive every message waiting on the control socket without
+             * blocking, calling fn(data, end) on each (data starts at the
+             * message type). Returns how many messages were received. */
+            size_t drain_ctrl(const std::function<void(const char*, const char*)>& fn);
 
             /** Determine if a heartbeat should be sent */
             bool should_send_heartbeat() {

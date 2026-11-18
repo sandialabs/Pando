@@ -33,6 +33,11 @@
 #include "par_db_thread.hpp"
 #include "terr.hpp"
 #include "process_stats.hpp"
+#include "memory_policy.hpp"
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 using namespace std;
 using namespace std::chrono;
@@ -209,6 +214,88 @@ class SeqDB {
         /** @brief Total entries offered to the filters (for tests/diagnostics) */
         size_t entries_examined_ = 0;
 
+        /** @brief When to end a pass early to bound memory; enabled by
+         * default (see memory_policy.hpp and set_memory_policy) */
+        MemoryPolicy mem_policy_;
+
+        /** @brief Where the system memory is read from (replaceable for tests) */
+        function<MemInfo()> meminfo_source_ = []() { return read_meminfo(); };
+
+        /** @brief Works out the agents sharing the node when the policy's
+         * agents_per_node is 0 (auto); unset means 1 */
+        function<uint64_t()> agents_per_node_source_;
+
+        /** @brief Asked (at most every check_interval, after
+         * min_filter_runs) whether another agent wants this pass to end */
+        function<bool()> stop_requested_cb_;
+
+        /** @brief This pass checks MemAvailable against mem_reserve_bytes_ */
+        bool mem_pressure_check_ = false;
+        uint64_t mem_reserve_bytes_ = 0;
+        steady_clock::time_point next_stop_check_;
+        bool meminfo_warned_ = false;
+
+        /** @brief Set up the stop checks for a new pass: reset the byte count
+         * and, if the policy is enabled, compute this pass's budget from the
+         * memory headroom now */
+        void begin_stop_checks_() {
+            stats_.stop_reason = STOP_NONE;
+            stats_.bytes_emitted = 0;
+            stats_.byte_budget = NO_BYTE_BUDGET;
+            mem_pressure_check_ = false;
+            mem_reserve_bytes_ = 0;
+            // The first timed check happens as soon as the run floor is met
+            next_stop_check_ = steady_clock::now();
+
+            if (!mem_policy_.enabled()) return;
+
+            uint64_t budget = mem_policy_.pass_budget_bytes > 0 ? mem_policy_.pass_budget_bytes : NO_BYTE_BUDGET;
+            if (mem_policy_.limit_pct > 0) {
+                MemInfo mem = meminfo_source_();
+                if (mem.ok) {
+                    PassBudget b = compute_pass_budget(mem_policy_, mem, agents_per_node());
+                    mem_pressure_check_ = true;
+                    mem_reserve_bytes_ = b.reserve_bytes;
+                    budget = min(budget, b.budget_bytes);
+                } else if (!meminfo_warned_) {
+                    meminfo_warned_ = true;
+                    cerr << "[Pando] [WARNING] unable to read system memory; the memory limit is not applied"
+                         << (mem_policy_.pass_budget_bytes > 0 ? " (the fixed pass budget still is)" : "") << endl;
+                }
+            }
+            stats_.byte_budget = budget;
+        }
+
+        /** @brief Decide whether the pass should stop now
+         *
+         * Called after each entry. max_filters_per_stage_ applies as always.
+         * The memory checks and requests from other agents only apply once
+         * min_filter_runs filters have run this pass, which guarantees
+         * progress however high memory is when the pass starts. The byte
+         * budget is checked every time (it is just a comparison); reading the
+         * system memory and asking stop_requested_cb_ are rate limited by
+         * check_interval.
+         *
+         * @return a stop_reason_t, STOP_NONE to keep going
+         */
+        uint8_t check_stop_(size_t num_filters_run) {
+            if (num_filters_run >= max_filters_per_stage_) return STOP_MAX_FILTERS;
+            if (num_filters_run < mem_policy_.min_filter_runs) return STOP_NONE;
+            if (stats_.bytes_emitted >= stats_.byte_budget) return STOP_MEM_BUDGET;
+            if (!mem_pressure_check_ && !stop_requested_cb_) return STOP_NONE;
+
+            auto now = steady_clock::now();
+            if (now < next_stop_check_) return STOP_NONE;
+            next_stop_check_ = now + mem_policy_.check_interval;
+
+            if (mem_pressure_check_) {
+                MemInfo mem = meminfo_source_();
+                if (mem.ok && mem.available_bytes < mem_reserve_bytes_) return STOP_MEM_PRESSURE;
+            }
+            if (stop_requested_cb_ && stop_requested_cb_()) return STOP_REMOTE;
+            return STOP_NONE;
+        }
+
         /** @brief Start the next pass on a fresh snapshot, freeing the old one */
         void reset_scan_() {
             vector<dbkey_t>().swap(scan_keys_);
@@ -248,8 +335,9 @@ class SeqDB {
         /** @brief Run the installed single-entry filters for one processing pass
          *
          * Entries are scanned with a cursor that carries over between passes
-         * (see scan_keys_): when a pass stops at max_filters_per_stage_, the
-         * next one continues from where it stopped.
+         * (see scan_keys_): when a pass stops early (max_filters_per_stage_,
+         * the memory policy, or a request from another agent; see
+         * check_stop_), the next one continues from where it stopped.
          *
          * @return true if any filter ran. false only once a full lap, over a
          * snapshot of the keys taken during this pass, ran no filter. The DB
@@ -265,11 +353,12 @@ class SeqDB {
         bool run_filters_() {
             bool filter_ran = false;
 
-            // Limit how many filters we run before a stage close to help with
-            // memory usage (see max_filters_per_stage_). The limit is checked
-            // after all filters have been offered an entry, so a pass can go
-            // over it by up to (installed filters - 1).
+            // Limit how much we run before a stage close to help with memory
+            // usage (see max_filters_per_stage_ and mem_policy_). The limits
+            // are checked after all filters have been offered an entry, so a
+            // pass can go over them by up to one entry's worth of filter runs.
             size_t num_filters_run = 0;
+            begin_stop_checks_();
 
             // Look up each SINGLE_ENTRY filter's counters once, not per entry
             vector<pair<Filter*, FilterCounters*>> filters;
@@ -341,13 +430,19 @@ class SeqDB {
                     stats_.keys_scanned = scan_pos_;
                     report_progress_if_due_();
 
-                    if (num_filters_run >= max_filters_per_stage_) {
+                    uint8_t reason = check_stop_(num_filters_run);
+                    if (reason != STOP_NONE) {
                         #ifdef VERBOSE
-                        cerr << "breaking early due to max filter run limit (cursor at " << scan_pos_ << "/"
-                             << scan_keys_.size() << ")" << endl;
+                        cerr << "breaking early: " << stop_reason_name(reason) << " (cursor at " << scan_pos_ << "/"
+                             << scan_keys_.size() << ", " << num_filters_run << " filters run, "
+                             << stats_.bytes_emitted << " bytes emitted)" << endl;
                         #endif
-                        // Keep the cursor; the next pass continues from here
+                        // Keep the cursor; the next pass continues from here.
+                        // Every reason requires at least one filter run (the
+                        // run limit and min_filter_runs are both >= 1), so
+                        // returning true (process again) is correct.
                         stats_.stopped_early = scan_pos_ < scan_keys_.size();
+                        stats_.stop_reason = reason;
                         return true;
                     }
                 }
@@ -844,6 +939,64 @@ class SeqDB {
         /** @brief Return how many filter runs one processing pass may do */
         size_t max_filters_per_stage() const { return max_filters_per_stage_; }
 
+        /** @brief Set when a processing pass ends early to bound memory (see
+         * memory_policy.hpp). Applies from the next pass.
+         * @throws invalid_argument if a setting is out of range
+         */
+        void set_memory_policy(const MemoryPolicy& policy) {
+            policy.validate();
+            mem_policy_ = policy;
+        }
+
+        /** @brief Return the memory policy */
+        const MemoryPolicy& memory_policy() const { return mem_policy_; }
+
+        /** @brief Replace where system memory is read from (for tests) */
+        void set_meminfo_source(function<MemInfo()> source) {
+            meminfo_source_ = move(source);
+        }
+
+        /** @brief Set how to work out the agents sharing this node's memory
+         * when the policy's agents_per_node is 0 (auto). Asked when each pass
+         * starts, so it can follow a changing mesh; a result of 0 means 1. */
+        void set_agents_per_node_source(function<uint64_t()> source) {
+            agents_per_node_source_ = move(source);
+        }
+
+        /** @brief The agents the headroom is split between: the policy's
+         * agents_per_node if set, else the source's answer, else 1 */
+        uint64_t agents_per_node() {
+            uint64_t n = mem_policy_.agents_per_node;
+            if (n == 0 && agents_per_node_source_) n = agents_per_node_source_();
+            return n == 0 ? 1 : n;
+        }
+
+        /** @brief Set a check for requests (e.g. from other agents) to end the
+         * current pass early. It is called while filters run, at most every
+         * check_interval and only after min_filter_runs runs this pass (both
+         * from the memory policy, which need not be enabled for this). */
+        void set_stop_requested_callback(function<bool()> cb) {
+            stop_requested_cb_ = move(cb);
+        }
+
+        /** @brief Whether system memory is above the limit right now. Uses
+         * the reserve computed when the last pass started; false if the
+         * policy has no limit_pct or memory could not be read then. */
+        bool under_memory_pressure() {
+            if (!mem_pressure_check_) return false;
+            MemInfo mem = meminfo_source_();
+            return mem.ok && mem.available_bytes < mem_reserve_bytes_;
+        }
+
+        /** @brief Return memory freed by the stage close to the system, so
+         * that the next pass's headroom reflects it. glibc keeps freed memory
+         * in its heap otherwise. Only done when the memory policy is enabled. */
+        void release_free_memory() {
+            #ifdef __GLIBC__
+            if (mem_policy_.enabled()) malloc_trim(0);
+            #endif
+        }
+
         /** @brief Return how many entries have been offered to the filters in
          * total (each entry fetched by a processing pass counts once)
          */
@@ -873,6 +1026,7 @@ class SeqDB {
             // Close any pending changes
             bool filter_ran = run_filters_();
             stage_close();
+            release_free_memory();
             stats_.end_pass();
             return filter_ran;
         }
@@ -894,6 +1048,9 @@ class SeqDB {
         void note_tag_added() { if (cur_filter_ != nullptr) ++cur_filter_->tags_added; }
         void note_tag_removed() { if (cur_filter_ != nullptr) ++cur_filter_->tags_removed; }
         void note_val_update() { if (cur_filter_ != nullptr) ++cur_filter_->val_updates; }
+        /** @brief Count output a filter created against this pass's byte
+         * budget (see ProcessStats::bytes_emitted); no-op outside a filter run */
+        void note_bytes_out(size_t n) { if (cur_filter_ != nullptr) stats_.bytes_emitted += n; }
 
         /** @brief Process the database, applying filters as appropriate */
         virtual bool process() {
@@ -1226,6 +1383,7 @@ static void s_SeqDB_new_entry(const fn* s_this, ...) {
     pando::SeqDB* db = (pando::SeqDB*)s_this->state;
     pando::DBEntry<> entry { new_tags, new_value, new_key };
     db->note_entry_out();
+    db->note_bytes_out(entry.serialize_size());
     db->stage_add_entry(move(entry));
 }
 
@@ -1277,6 +1435,7 @@ static void s_SeqDB_add_tag(const fn* s_this, ...) {
     // Get the SeqDB from new_entry, the key from the key field
     pando::SeqDB* db = (pando::SeqDB*)acc->make_new_entry.state;
     db->note_tag_added();
+    db->note_bytes_out(sizeof(dbkey_t) + strlen(new_tag));
     db->stage_add_tag(acc->key, new_tag);
 }
 
@@ -1293,6 +1452,7 @@ static void s_SeqDB_remove_tag(const fn* s_this, ...) {
     // Get the SeqDB from new_entry, the key from the key field
     pando::SeqDB* db = (pando::SeqDB*)acc->make_new_entry.state;
     db->note_tag_removed();
+    db->note_bytes_out(sizeof(dbkey_t) + strlen(old_tag));
     db->stage_remove_tag(key, old_tag);
 }
 
@@ -1309,6 +1469,7 @@ static void s_SeqDB_subscribe_to_entry(const fn* s_this, ...) {
     DBAccess* acc = (DBAccess*)s_this->state;
     // Get the SeqDB from new_entry, the key from the key field
     pando::SeqDB* db = (pando::SeqDB*)acc->make_new_entry.state;
+    db->note_bytes_out(2*sizeof(dbkey_t) + tag.size());
     db->subscribe_to_entry_wrapper(my_key, wait_key, tag);
 }
 
@@ -1321,6 +1482,7 @@ static void s_SeqDB_update_entry_val(const fn* s_this, ...) {
     DBAccess* acc = (DBAccess*)s_this->state;
     pando::SeqDB* db = (pando::SeqDB*)acc->make_new_entry.state;
     db->note_val_update();
+    db->note_bytes_out(sizeof(dbkey_t) + new_val.size());
     db->stage_update_entry_val(key, new_val);
 }
 

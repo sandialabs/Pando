@@ -2,6 +2,8 @@
 
 #include <thread>
 
+#include "memory_policy.hpp"
+
 using namespace std;
 using namespace elga;
 
@@ -30,6 +32,12 @@ class ParDBThread {
         /** @brief As above, also limiting filter runs per processing pass (0 = default, unlimited) */
         ParDBThread(ZMQAddress addr, size_t sz, bool skip_group_filters, size_t max_filters_per_stage) :
                 db_(addr, sz, skip_group_filters, max_filters_per_stage), shutdown_(false) {
+            t_ = thread(&ParDBThread::launch, this);
+        }
+
+        /** @brief As above, also ending passes early to bound memory (see memory_policy.hpp) */
+        ParDBThread(ZMQAddress addr, size_t sz, bool skip_group_filters, size_t max_filters_per_stage, const MemoryPolicy& mem_policy) :
+                db_(addr, sz, skip_group_filters, max_filters_per_stage, mem_policy), shutdown_(false) {
             t_ = thread(&ParDBThread::launch, this);
         }
 

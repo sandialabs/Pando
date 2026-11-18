@@ -69,6 +69,29 @@ inline const char* pass_kind_name(uint8_t k) {
     return "-";
 }
 
+/** @brief Why a SINGLE_ENTRY pass stopped before running out of work */
+enum stop_reason_t : uint8_t {
+    STOP_NONE = 0,          // the pass ran to the end of its lap
+    STOP_MAX_FILTERS = 1,   // hit max_filters_per_stage
+    STOP_MEM_BUDGET = 2,    // emitted its byte budget for the pass
+    STOP_MEM_PRESSURE = 3,  // node memory went above the limit
+    STOP_REMOTE = 4         // another agent asked every agent to close early
+};
+
+inline const char* stop_reason_name(uint8_t r) {
+    switch (r) {
+        case STOP_NONE: return "none";
+        case STOP_MAX_FILTERS: return "run limit";
+        case STOP_MEM_BUDGET: return "memory budget";
+        case STOP_MEM_PRESSURE: return "memory pressure";
+        case STOP_REMOTE: return "another agent";
+    }
+    return "?";
+}
+
+/** @brief Value of byte_budget meaning the pass has no byte budget */
+inline constexpr uint64_t NO_BYTE_BUDGET = UINT64_MAX;
+
 /** @brief Milliseconds since the Unix epoch, for cross-agent timestamps */
 inline uint64_t wall_ms() {
     using namespace std::chrono;
@@ -125,6 +148,9 @@ struct PassSummary {
     uint64_t duration_ms = 0;
     uint64_t keys_total = 0;
     bool stopped_early = false;
+    uint8_t stop_reason = STOP_NONE;
+    uint64_t bytes_emitted = 0;
+    uint64_t byte_budget = NO_BYTE_BUDGET;
     std::map<std::string, FilterCounters> filters;
 };
 
@@ -188,8 +214,20 @@ struct ProcessStats {
      * the current lap over the keys, which a resumed pass starts part-way */
     uint64_t keys_total = 0;
     uint64_t keys_scanned = 0;
-    /** The sweep stopped at max_filters_per_stage and will continue next pass */
+    /** The sweep stopped before the end of its lap (see stop_reason) and
+     * will continue from there next pass */
     bool stopped_early = false;
+    /** Which check ended the sweep; STOP_NONE if it ran to the end of its
+     * lap. A check can also fire on the last key of a lap, so this can be set
+     * while stopped_early is false. */
+    uint8_t stop_reason = STOP_NONE;
+    /** Bytes of output (entries, tags, value updates, subscriptions) the
+     * filters have created this pass, as serialized. This is what is held in
+     * memory (here or in other agents' queues) until the stage closes. */
+    uint64_t bytes_emitted = 0;
+    /** The pass stops once bytes_emitted reaches this; NO_BYTE_BUDGET if
+     * there is no budget (see SeqDB::set_memory_policy) */
+    uint64_t byte_budget = NO_BYTE_BUDGET;
 
     /** Iteration of the current GROUP_ENTRIES computation */
     uint64_t group_iter = 0;
@@ -221,6 +259,9 @@ struct ProcessStats {
         s.duration_ms = (pass_start_ms > 0 && now > pass_start_ms) ? now - pass_start_ms : 0;
         s.keys_total = keys_total;
         s.stopped_early = stopped_early;
+        s.stop_reason = stop_reason;
+        s.bytes_emitted = bytes_emitted;
+        s.byte_budget = byte_budget;
         // Only the filters this kind of pass runs, so that e.g. a GROUP_ENTRIES
         // filter is not reported as having run on nothing in a SINGLE_ENTRY pass
         for (auto& [name, f] : filters)
@@ -238,6 +279,9 @@ struct ProcessStats {
         keys_total = 0;
         keys_scanned = 0;
         stopped_early = false;
+        stop_reason = STOP_NONE;
+        bytes_emitted = 0;
+        byte_budget = NO_BYTE_BUDGET;
         group_iter = 0;
         close = CloseProgress{};
     }
@@ -381,6 +425,9 @@ struct ProgressSnapshot {
     uint64_t keys_total = 0;
     uint64_t keys_scanned = 0;
     bool stopped_early = false;
+    uint8_t stop_reason = STOP_NONE;
+    uint64_t bytes_emitted = 0;
+    uint64_t byte_budget = NO_BYTE_BUDGET;
     uint64_t group_iter = 0;
     CloseProgress close;
     std::map<std::string, FilterSnapshot> filters;
@@ -393,6 +440,9 @@ struct ProgressSnapshot {
         keys_total = s.keys_total;
         keys_scanned = s.keys_scanned;
         stopped_early = s.stopped_early;
+        stop_reason = s.stop_reason;
+        bytes_emitted = s.bytes_emitted;
+        byte_budget = s.byte_budget;
         group_iter = s.group_iter;
         close = s.close;
         filters.clear();
@@ -412,6 +462,9 @@ struct ProgressSnapshot {
         w.put(keys_total);
         w.put(keys_scanned);
         w.put((uint8_t)stopped_early);
+        w.put(stop_reason);
+        w.put(bytes_emitted);
+        w.put(byte_budget);
         w.put(group_iter);
         write_close(w, close);
         w.put((uint64_t)filters.size());
@@ -437,6 +490,9 @@ struct ProgressSnapshot {
         keys_total = r.get<uint64_t>();
         keys_scanned = r.get<uint64_t>();
         stopped_early = r.get<uint8_t>() != 0;
+        stop_reason = r.get<uint8_t>();
+        bytes_emitted = r.get<uint64_t>();
+        byte_budget = r.get<uint64_t>();
         group_iter = r.get<uint64_t>();
         close = read_close(r);
         uint64_t n = r.get<uint64_t>();
@@ -481,6 +537,9 @@ struct StageEvent {
         w.put(summary.duration_ms);
         w.put(summary.keys_total);
         w.put((uint8_t)summary.stopped_early);
+        w.put(summary.stop_reason);
+        w.put(summary.bytes_emitted);
+        w.put(summary.byte_budget);
         w.put((uint64_t)summary.filters.size());
         for (auto& [name, c] : summary.filters) {
             w.put_string(name);
@@ -502,6 +561,9 @@ struct StageEvent {
         summary.duration_ms = r.get<uint64_t>();
         summary.keys_total = r.get<uint64_t>();
         summary.stopped_early = r.get<uint8_t>() != 0;
+        summary.stop_reason = r.get<uint8_t>();
+        summary.bytes_emitted = r.get<uint64_t>();
+        summary.byte_budget = r.get<uint64_t>();
         uint64_t n = r.get<uint64_t>();
         for (uint64_t i = 0; i < n && r.ok(); ++i) {
             std::string name = r.get_string();

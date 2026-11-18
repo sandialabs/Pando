@@ -375,6 +375,111 @@ TEST(par_db_publishes_stats) {
     TEST_PASS
 }
 
+// An agent that ends a pass to bound memory asks every agent to end it
+// (CLOSE_EARLY), since their output fills its queues until the stage closes.
+// db1 has a 1-byte budget, so it stops after every filter run and asks the
+// others to stop; db2 has no limits of its own but honors the requests. The
+// filter takes ~2ms per entry, so db2 is still busy when a request arrives.
+TEST(par_db_close_early) {
+    MemoryPolicy tiny = MemoryPolicy::disabled();
+    tiny.pass_budget_bytes = 1;
+    tiny.min_filter_runs = 1;
+    tiny.check_interval = chrono::milliseconds(0);
+    // No limits of its own, but honors requests after 1 run
+    MemoryPolicy follower = MemoryPolicy::disabled();
+    follower.min_filter_runs = 1;
+    follower.check_interval = chrono::milliseconds(0);
+    EQ(follower.enabled(), false);
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", 186 };
+    ParDBThread db1 { db1_addr, 2ull*(1ull<<29), false, 0, tiny };
+    elga::ZMQAddress db2_addr { "127.0.0.1", 189 };
+    ParDBThread db2 { db2_addr, 2ull*(1ull<<29), false, 0, follower };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    c1.add_neighbor(db2_addr);
+    this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 2);
+
+    StatsListener l;
+    l.add_neighbor(db1_addr.serialize(), false);
+    l.request_mesh(db1_addr.serialize());
+    l.pump(chrono::milliseconds(2500));
+    EQ(l.agents().size(), 2);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_slow_tag");
+
+    // Placement hashes (a, b), so the entries are spread over both agents
+    const size_t n = 40;
+    for (size_t k = 0; k < n; ++k) {
+        DBEntry<> e; e.set_key({30, (vtx_t)k, 0});
+        e.add_tag("S").add_to_value("s");
+        c1.add_entry(e);
+    }
+    this_thread::sleep_for(chrono::milliseconds(50));
+    size_t on_db2 = c2.db_size();
+    EQ(c1.db_size() + on_db2, n);
+    // Both agents need work for this test to mean anything
+    EQ(c1.db_size() > 0, true);
+    EQ(on_db2 > 1, true);
+
+    c1.process();
+    auto deadline = chrono::steady_clock::now() + chrono::seconds(120);
+    do {
+        l.pump(chrono::milliseconds(200));
+    } while ((c1.processing() || c2.processing()) && chrono::steady_clock::now() < deadline);
+    l.pump(chrono::milliseconds(1500));
+    EQ(c1.processing() || c2.processing(), false);
+    EQ(l.bad_msgs, 0);
+
+    // Stopping early loses nothing: every entry was filtered, exactly once
+    size_t done = 0;
+    vector<DBEntry<>> entries = c1.get_entries();
+    auto c2_entries = c2.get_entries();
+    move(c2_entries.begin(), c2_entries.end(), std::back_inserter(entries));
+    for (auto& e : entries)
+        if (e.has_tag("S") && e.has_tag("test_pardb_filters_slow_tag:done")) ++done;
+    EQ(done, n);
+    EQ(entries.size(), n);
+
+    size_t db1_budget_stops = 0, db2_remote_stops = 0, db2_other_stops = 0;
+    uint64_t ran_total = 0, db2_pass1_ran = 0;
+    for (auto& e : l.events) {
+        if (e.kind != EVENT_PASS_END || e.summary.kind != PASS_SINGLE) continue;
+        uint64_t ran = 0;
+        if (e.summary.filters.count("test_pardb_filters_slow_tag"))
+            ran = e.summary.filters.at("test_pardb_filters_slow_tag").ran;
+        ran_total += ran;
+        if (e.agent == db1_addr.serialize()) {
+            EQ(e.summary.byte_budget, 1);
+            // Every run emits more than the budget, so a pass runs at most once
+            EQ(ran <= 1, true);
+            if (e.summary.stop_reason == STOP_MEM_BUDGET) {
+                ++db1_budget_stops;
+                EQ(e.summary.bytes_emitted >= 1, true);
+            }
+        } else if (e.agent == db2_addr.serialize()) {
+            EQ(e.summary.byte_budget, NO_BYTE_BUDGET);
+            if (e.summary.stop_reason == STOP_REMOTE) ++db2_remote_stops;
+            else if (e.summary.stop_reason != STOP_NONE) ++db2_other_stops;
+            if (e.summary.pass == 1) db2_pass1_ran = ran;
+        }
+    }
+    EQ(ran_total, n);
+    EQ(db1_budget_stops >= 1, true);
+    // db2 was asked to stop and did, and never stopped for any other reason
+    EQ(db2_remote_stops >= 1, true);
+    EQ(db2_other_stops, 0);
+    // In pass 1 db2 stopped well before running on all of its entries
+    EQ(db2_pass1_ran >= 1, true);
+    EQ(db2_pass1_ran < on_db2, true);
+
+    TEST_PASS
+}
+
 // Installed filters are reported before any processing, so pando_top can
 // show what is installed; each pass only summarizes filters of its kind
 TEST(installed_filters_reported_before_processing) {
@@ -421,6 +526,7 @@ TESTS_BEGIN
     RUN_TEST(installed_filters_reported_before_processing)
     RUN_TEST(btc_filter_counts)
     RUN_TEST(par_db_publishes_stats)
+    RUN_TEST(par_db_close_early)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END
