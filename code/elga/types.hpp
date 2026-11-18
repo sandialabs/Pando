@@ -111,6 +111,10 @@ using it_t = int32_t;
 #define MAP_GET_TAGS_BY_KEYS          0xd4
 #define PROGRESS                      0xd5
 #define STAGE_EVENT                   0xd6
+/** An agent asks every agent to end the current processing pass early so the
+ * stage can close and staged memory is freed. Only received on the dedicated
+ * control subscription (ZMQChatterbox::ctrl_sub), never by the main loop. */
+#define CLOSE_EARLY                   0xd7
 #define WANT_HEARTBEAT                0xfe
 #define HEARTBEAT                     0xff
 

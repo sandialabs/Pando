@@ -38,6 +38,18 @@ static string fmt_count(uint64_t n, size_t width = 0) {
     return buf;
 }
 
+/** @brief Compact byte count in powers of 1024 (512B, 1.50K, 12.3M, ...) */
+static string fmt_bytes(uint64_t n) {
+    if (n < 1024) return to_string(n) + "B";
+    const char* units = "KMGTPE";
+    double v = (double)n;
+    int u = -1;
+    while (v >= 1024.0 && u < 5) { v /= 1024.0; ++u; }
+    char buf[32];
+    snprintf(buf, sizeof(buf), v < 10.0 ? "%.2f%c" : v < 100.0 ? "%.1f%c" : "%.0f%c", v, units[u]);
+    return buf;
+}
+
 static string fmt_rate(double per_s) {
     if (per_s <= 0.0) return "-";
     if (per_s < 10.0) {
@@ -547,6 +559,11 @@ class AgentsView {
                     if (closing(*ai)) {
                         detail1 = "ent " + fmt_count(p.close.entries()) + "/" + fmt_count(p.close.entries_total);
                         detail2 = "tag " + fmt_count(p.close.tags()) + "/" + fmt_count(p.close.tags_total());
+                    } else if (p.pass_kind == PASS_SINGLE && (p.state == STAGE_BEGIN || p.state == STAGE_PROCESSED)) {
+                        // Output held until the stage closes / this pass's byte budget
+                        detail1 = "out " + fmt_bytes(p.bytes_emitted);
+                        if (p.byte_budget != NO_BYTE_BUDGET) detail1 += "/" + fmt_bytes(p.byte_budget);
+                        if (p.stop_reason != STOP_NONE) detail2 = string("stop: ") + stop_reason_name(p.stop_reason);
                     }
                 }
                 put(w, 2, 2, blk_w_-3, line);
@@ -749,7 +766,12 @@ static string describe_event(const StageEvent& e) {
     if (e.kind == EVENT_PASS_END) {
         s += "pass " + to_string(e.summary.pass) + " (" + pass_kind_name(e.summary.kind) + ") done in " +
             fmt_duration_ms(e.summary.duration_ms);
-        if (e.summary.stopped_early) s += ", stopped early at the run limit";
+        if (e.summary.stopped_early || e.summary.stop_reason != STOP_NONE)
+            s += string(", stopped") + (e.summary.stopped_early ? " early" : "") + ": " + stop_reason_name(e.summary.stop_reason);
+        if (e.summary.bytes_emitted > 0 || e.summary.byte_budget != NO_BYTE_BUDGET) {
+            s += ", out " + fmt_bytes(e.summary.bytes_emitted);
+            if (e.summary.byte_budget != NO_BYTE_BUDGET) s += "/" + fmt_bytes(e.summary.byte_budget);
+        }
         string ran;
         for (auto& [name, c] : e.summary.filters)
             if (c.ran > 0) ran += " " + name + "=" + fmt_count(c.ran);

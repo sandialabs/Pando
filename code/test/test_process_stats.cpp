@@ -50,10 +50,29 @@ TEST(pass_lifecycle) {
     s.filters["A"].pass.ran = 2;
     EQ(s.filters["A"].total().ran, 5);
 
+    // The stop fields are summarized with the pass and reset by the next one
+    s.stopped_early = true;
+    s.stop_reason = STOP_MEM_BUDGET;
+    s.bytes_emitted = 4096;
+    s.byte_budget = 4000;
+    s.begin_pass(PASS_SINGLE);
+    EQ(s.history.size(), 2);
+    EQ(s.history[1].stopped_early, true);
+    EQ(s.history[1].stop_reason, STOP_MEM_BUDGET);
+    EQ(s.history[1].bytes_emitted, 4096);
+    EQ(s.history[1].byte_budget, 4000);
+    EQ(s.stopped_early, false);
+    EQ(s.stop_reason, STOP_NONE);
+    EQ(s.bytes_emitted, 0);
+    EQ(s.byte_budget, NO_BYTE_BUDGET);
+    // ... and pass 1 had no budget
+    EQ(s.history[0].stop_reason, STOP_NONE);
+    EQ(s.history[0].byte_budget, NO_BYTE_BUDGET);
+
     // end_pass is idempotent
     s.end_pass();
     s.end_pass();
-    EQ(s.history.size(), 2);
+    EQ(s.history.size(), 3);
     EQ(s.filters["A"].prior.ran, 5);
 
     TEST_PASS
@@ -76,6 +95,9 @@ TEST(progress_round_trip) {
     s.keys_total = 100;
     s.keys_scanned = 42;
     s.stopped_early = true;
+    s.stop_reason = STOP_REMOTE;
+    s.bytes_emitted = 0x1122334455ull;
+    s.byte_budget = 0x66778899aaull;
     s.group_iter = 7;
     s.filter("BTC_block_to_tx", PASS_SINGLE).pass = make_counters(10);
     s.filter("BTC_block_to_tx", PASS_SINGLE).prior = make_counters(100);
@@ -113,6 +135,9 @@ TEST(progress_round_trip) {
     EQ(q.keys_total, 100);
     EQ(q.keys_scanned, 42);
     EQ(q.stopped_early, true);
+    EQ(q.stop_reason, STOP_REMOTE);
+    EQ(q.bytes_emitted, 0x1122334455ull);
+    EQ(q.byte_budget, 0x66778899aaull);
     EQ(q.group_iter, 7);
     EQ(q.filters.size(), 2);
     EQ(q.filters["BTC_block_to_tx"].kind, PASS_SINGLE);
@@ -124,6 +149,16 @@ TEST(progress_round_trip) {
     EQ(q.close.start_ms > 0, true);
     EQ(q.close.tags_removed_total, 40);
     EQ(q.close.tags_removed_done, 4);
+
+    // A default snapshot carries "no budget" through unchanged
+    ProgressSnapshot d;
+    StatsWriter wd { PROGRESS };
+    d.serialize(wd);
+    ProgressSnapshot dq;
+    EQ(dq.deserialize(wd.data()+1, wd.data()+wd.size()), true);
+    EQ(dq.stop_reason, STOP_NONE);
+    EQ(dq.bytes_emitted, 0);
+    EQ(dq.byte_budget, NO_BYTE_BUDGET);
 
     TEST_PASS
 }
@@ -204,6 +239,9 @@ TEST(stage_event_round_trip) {
     e.summary.duration_ms = 2500;
     e.summary.keys_total = 50;
     e.summary.stopped_early = true;
+    e.summary.stop_reason = STOP_MEM_PRESSURE;
+    e.summary.bytes_emitted = 0xabcdef012ull;
+    e.summary.byte_budget = 0x123ull;
     e.summary.filters["f1"] = make_counters(1);
     e.summary.filters["f2"] = make_counters(2);
 
@@ -223,6 +261,9 @@ TEST(stage_event_round_trip) {
     EQ(d.summary.duration_ms, 2500);
     EQ(d.summary.keys_total, 50);
     EQ(d.summary.stopped_early, true);
+    EQ(d.summary.stop_reason, STOP_MEM_PRESSURE);
+    EQ(d.summary.bytes_emitted, 0xabcdef012ull);
+    EQ(d.summary.byte_budget, 0x123ull);
     EQ(d.summary.filters.size(), 2);
     NOPRINT_EQ(d.summary.filters["f1"], make_counters(1));
     NOPRINT_EQ(d.summary.filters["f2"], make_counters(2));

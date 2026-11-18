@@ -10,6 +10,7 @@
  * Please see the LICENSE.md file for license information.
  */
 
+#include <cerrno>
 #include <iostream>
 
 #include <chrono>
@@ -94,13 +95,15 @@ void disconnect_(zmq_socket_t socket, const ZMQAddress remote_addr, const ZMQAdd
 }
 
 ZMQChatterbox::ZMQChatterbox(const ZMQAddress &addr) :
-        sock_rep_(NULL), sock_pub_(NULL), sock_sub_(NULL), sock_pull_(NULL), last_heartbeat_(), addr_(addr) {
+        sock_rep_(NULL), sock_pub_(NULL), sock_sub_(NULL), sock_pull_(NULL), sock_ctrl_sub_(NULL), last_heartbeat_(), addr_(addr) {
 
     // Create our sockets
     sock_rep_ = socket_(ZMQ_REP);
     sock_pub_ = socket_(ZMQ_PUB);
     sock_sub_ = socket_(ZMQ_SUB);
     sock_pull_ = socket_(ZMQ_PULL);
+    // Has no subscriptions until ctrl_sub(), so it receives nothing by default
+    sock_ctrl_sub_ = socket_(ZMQ_SUB);
 
     // Open and connect all of our sockets
     if (!addr_.is_zero()) {
@@ -121,6 +124,7 @@ ZMQChatterbox::~ZMQChatterbox() {
     if (sock_pub_) zmq_close(sock_pub_);
     if (sock_sub_) zmq_close(sock_sub_);
     if (sock_pull_) zmq_close(sock_pull_);
+    if (sock_ctrl_sub_) zmq_close(sock_ctrl_sub_);
 }
 
 std::vector<zmq_socket_t> ZMQChatterbox::poll(long timeout) {
@@ -191,6 +195,7 @@ void ZMQChatterbox::sub_connect(const ZMQAddress &addr) {
     #endif
 
     connect_(sock_sub_, addr, addr_, PUBLISH);
+    connect_(sock_ctrl_sub_, addr, addr_, PUBLISH);
 }
 
 void ZMQChatterbox::sub_disconnect(const ZMQAddress &addr) {
@@ -199,6 +204,7 @@ void ZMQChatterbox::sub_disconnect(const ZMQAddress &addr) {
     #endif
 
     disconnect_(sock_sub_, addr, addr_, PUBLISH);
+    disconnect_(sock_ctrl_sub_, addr, addr_, PUBLISH);
 }
 
 void ZMQChatterbox::sub(msg_type_t type) {
@@ -221,6 +227,36 @@ void ZMQChatterbox::unsub(const char *data, size_t size) {
 
     if (zmq_setsockopt(sock_sub_, ZMQ_UNSUBSCRIBE, data, size) != 0)
         throw std::runtime_error("Unable to unsubscribe");
+}
+
+void ZMQChatterbox::ctrl_sub(msg_type_t type) {
+    if (zmq_setsockopt(sock_ctrl_sub_, ZMQ_SUBSCRIBE, &type, sizeof(type)) != 0)
+        throw std::runtime_error("Unable to subscribe control socket");
+}
+
+size_t ZMQChatterbox::drain_ctrl(const std::function<void(const char*, const char*)>& fn) {
+    size_t n = 0;
+    while (true) {
+        zmq_msg_t msg;
+        if (zmq_msg_init(&msg) != 0) throw std::runtime_error("Unable to init msg");
+        int size = zmq_msg_recv(&msg, sock_ctrl_sub_, ZMQ_DONTWAIT);
+        if (size < 0) {
+            int err = errno;
+            zmq_msg_close(&msg);
+            // Nothing (more) waiting, or interrupted: try again next time
+            if (err == EAGAIN || err == EINTR) return n;
+            throw std::runtime_error("Unable to read control message");
+        }
+        const char* data = (const char*)zmq_msg_data(&msg);
+        try {
+            fn(data, data + size);
+        } catch (...) {
+            zmq_msg_close(&msg);
+            throw;
+        }
+        zmq_msg_close(&msg);
+        ++n;
+    }
 }
 
 void ZMQChatterbox::ack(zmq_socket_t sock) {
