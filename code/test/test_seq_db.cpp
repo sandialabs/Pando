@@ -1817,6 +1817,92 @@ TEST(get_entries_by_keys_local) {
     TEST_PASS
 }
 
+// Filter for the scan block tests: runs once on entries tagged "A" and
+// checks that the value it is given is the one stored for its key
+static size_t g_TEST_block_runs, g_TEST_block_bad_values;
+bool g_TEST_block_should_run(const DBAccess* acc) {
+    bool found_a = false;
+    for (auto tags = acc->tags; *tags[0] != '\0'; ++tags) {
+        if (string(*tags) == "A:done") return false;
+        if (string(*tags) == "A") found_a = true;
+    }
+    return found_a;
+}
+void g_TEST_block_run(void* access) {
+    const DBAccess* acc = (const DBAccess*)access;
+    ++g_TEST_block_runs;
+    if (acc->value == nullptr || string(acc->value) != "v" + to_string(acc->key.b)) ++g_TEST_block_bad_values;
+    acc->add_tag.run(&acc->add_tag, "A:done");
+}
+
+// The scan fetches entries in blocks (SeqDB::scan_block_keys() keys per
+// request). Over several blocks, and with the filter limit stopping passes
+// part way through a block, every eligible entry still runs exactly once with
+// its own value, whatever the block size
+TEST(scan_in_blocks) {
+    FilterInterface f { filter_name: "TEST_block", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_block_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_block_run };
+    const size_t n = 10000;   // more than two blocks
+    size_t eligible = 0;
+    auto fill = [&](SeqDB& d) {
+        eligible = 0;
+        for (size_t k = 0; k < n; ++k) {
+            DBEntry<> e;
+            e.set_key({30, (vtx_t)k, 0});
+            e.add_tag(k % 3 == 0 ? "A" : "B");
+            e.value() = "v" + to_string(k);
+            if (k % 3 == 0) ++eligible;
+            d.add_entry(move(e));
+        }
+        d.install_filter(make_shared<Filter>(&f));
+    };
+
+    // No limit: one pass runs everything, a second finds nothing
+    {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        fill(d);
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+        EQ(d.entries_examined(), 2*n);
+    }
+    // 7 runs per pass: passes stop part way through blocks
+    {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        fill(d);
+        d.set_max_filters_per_stage(7);
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+    }
+    // Other block sizes, including one key per request and blocks that do
+    // not divide the entries evenly, give the same result
+    for (size_t block : {(size_t)1, (size_t)7, (size_t)333, (size_t)100000}) {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        d.set_scan_block_keys(block);
+        EQ(d.scan_block_keys(), block);
+        fill(d);
+        d.set_max_filters_per_stage(7);
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+    }
+    // A block of zero keys is rejected
+    {
+        SeqDB d;
+        EQ(d.scan_block_keys(), SeqDB::DEFAULT_SCAN_BLOCK_KEYS);
+        bool threw = false;
+        try { d.set_scan_block_keys(0); } catch (invalid_argument&) { threw = true; }
+        EQ(threw, true);
+        EQ(d.scan_block_keys(), SeqDB::DEFAULT_SCAN_BLOCK_KEYS);
+    }
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1870,6 +1956,7 @@ TESTS_BEGIN
     RUN_TEST(mem_bytes_count_each_output)
     RUN_TEST(mem_budget_same_result)
     RUN_TEST(get_entries_by_keys_local)
+    RUN_TEST(scan_in_blocks)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END

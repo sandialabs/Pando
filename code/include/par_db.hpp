@@ -234,6 +234,7 @@ class ParDB : public PandoParticipant {
 
             if (skip_group_filters_) db_.disable_group_filters();
             if (opts.max_filters_per_stage != 0) db_.set_max_filters_per_stage(opts.max_filters_per_stage);
+            if (opts.scan_block_keys != 0) db_.set_scan_block_keys(opts.scan_block_keys);
             db_.set_memory_policy(opts.mem_policy);
             slurm_tasks_per_node_ = slurm_tasks_per_node();
             db_.set_agents_per_node_source([this]() { return agents_on_node_(); });
@@ -451,6 +452,9 @@ class ParDB : public PandoParticipant {
 
         /** @brief Returns the size of the sequential DB */
         size_t db_size() { return db_.size(); }
+
+        /** @brief Keys the filter scan fetches from the map per request */
+        size_t scan_block_keys() const { return db_.scan_block_keys(); }
 
         /** @brief Processing passes this agent has started (for tests) */
         uint64_t passes_started() const { return db_.stats().pass; }

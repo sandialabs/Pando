@@ -1086,16 +1086,19 @@ TEST(process_request_ends_after_one_empty_pass) {
 }
 
 // An agent built from ParDBOptions uses its settings: with one filter run
-// per pass, each "A" entry takes a pass of its own
+// per pass, each "A" entry takes a pass of its own, and the scan reads the
+// map two keys at a time
 TEST(pardb_from_options) {
     g_idx = 0;
     const size_t n = 4;
     ParDBOptions opts;
     opts.max_filters_per_stage = 1;
     opts.mem_policy = MemoryPolicy::disabled();
+    opts.scan_block_keys = 2;
 
     elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
     ParDBThread db1 { db1_addr, 2ull*(1ull<<29), opts };
+    EQ(db1.db().scan_block_keys(), 2);
     ParDBClient c1 { db1_addr };
     vector<ZMQAddress> addrs { db1_addr };
     this_thread::sleep_for(chrono::milliseconds(50));

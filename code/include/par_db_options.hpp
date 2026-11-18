@@ -32,6 +32,10 @@ struct ParDBOptions {
 
     /** @brief Flush size for write batches; 0 turns batching off */
     size_t write_batch_bytes = DEFAULT_WRITE_BATCH_BYTES;
+
+    /** @brief Keys the filter scan fetches from the map per request (see
+     * SeqDB::set_scan_block_keys); 0 = SeqDB's default */
+    size_t scan_block_keys = 0;
 };
 
 }
