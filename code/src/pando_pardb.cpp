@@ -56,7 +56,7 @@ int main_(int argc, char **argv) {
     if (argc < 2) {
         cerr << "Usage: pando_pardb bind-addr [seed-addr] [-M<mem in GB>] [--skip-group-filters] [--max-filters-per-stage=N]\n"
             "                   [--mem-limit-pct=P] [--mem-pass-budget-mb=N] [--mem-budget-fraction=F]\n"
-            "                   [--mem-min-filters=N] [--agents-per-node=N]\n"
+            "                   [--agents-per-node=N]\n"
             "\n"
             "Parameters:\n"
             "  bind-addr : the address to bind this specific DB agent to\n"
@@ -78,8 +78,7 @@ int main_(int argc, char **argv) {
             "                           smaller budget applies; default none)\n"
             "  --mem-budget-fraction=F : share of the headroom the agents on a node may emit\n"
             "                            per pass together (0 < F <= 1, default 0.25)\n"
-            "  --mem-min-filters=N : filter runs a pass always does before it can stop for\n"
-            "                        memory or for another agent (N >= 1, default 1000)\n"
+
             "  --agents-per-node=N : agents sharing this node's memory (default: Slurm's tasks\n"
             "                        per node, else the agents in the mesh with this agent's\n"
             "                        IP address)\n"
@@ -102,7 +101,6 @@ int main_(int argc, char **argv) {
     const string mem_limit_flag = "--mem-limit-pct=";
     const string mem_budget_flag = "--mem-pass-budget-mb=";
     const string mem_fraction_flag = "--mem-budget-fraction=";
-    const string mem_min_flag = "--mem-min-filters=";
     const string agents_flag = "--agents-per-node=";
     auto flag_val = [](const string& arg, const string& flag) -> const char* {
         return arg.rfind(flag, 0) == 0 ? arg.c_str() + flag.size() : nullptr;
@@ -130,9 +128,6 @@ int main_(int argc, char **argv) {
             mem_policy.pass_budget_bytes = n * (1ull<<20);
         } else if ((val = flag_val(arg, mem_fraction_flag))) {
             if (!parse_double_in(val, 0, 1, mem_policy.budget_fraction)) return bad(mem_fraction_flag, val, "a number in (0, 1]");
-        } else if ((val = flag_val(arg, mem_min_flag))) {
-            if (!parse_positive_u64(val, n)) return bad(mem_min_flag, val, "a positive integer");
-            mem_policy.min_filter_runs = n;
         } else if ((val = flag_val(arg, agents_flag))) {
             if (!parse_positive_u64(val, n)) return bad(agents_flag, val, "a positive integer");
             mem_policy.agents_per_node = n;
@@ -151,7 +146,6 @@ int main_(int argc, char **argv) {
         cerr << "[Pando] [DEBUG] Memory limits: limit_pct=" << (mem_policy.limit_pct > 0 ? to_string(mem_policy.limit_pct) : string("off"))
              << " pass_budget_bytes=" << (mem_policy.pass_budget_bytes ? to_string(mem_policy.pass_budget_bytes) : string("off"))
              << " budget_fraction=" << mem_policy.budget_fraction
-             << " min_filter_runs=" << mem_policy.min_filter_runs
              << " agents_per_node=" << (mem_policy.agents_per_node ? to_string(mem_policy.agents_per_node) : string("auto")) << endl;
     } else {
         cerr << "[Pando] [DEBUG] Memory limits: off" << endl;

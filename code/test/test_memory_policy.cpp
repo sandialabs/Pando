@@ -85,15 +85,11 @@ TEST(policy_defaults) {
     FEQ(p.limit_pct, 90);
     FEQ(p.budget_fraction, 0.25);
     EQ(p.pass_budget_bytes, 0);
-    EQ(p.min_filter_runs, 1000);
     EQ(p.agents_per_node, 0);
 
     MemoryPolicy off = MemoryPolicy::disabled();
     off.validate();
     EQ(off.enabled(), false);
-    // Only the limits are off; requests from other agents still wait for
-    // the same floor
-    EQ(off.min_filter_runs, p.min_filter_runs);
 
     // Either limit on its own enables it
     MemoryPolicy fixed = MemoryPolicy::disabled();
@@ -117,7 +113,6 @@ TEST(policy_validate) {
         }
         return false;
     };
-    EQ(invalid([](MemoryPolicy& p) { p.min_filter_runs = 0; }), true);
     EQ(invalid([](MemoryPolicy& p) { p.budget_fraction = 0; }), true);
     EQ(invalid([](MemoryPolicy& p) { p.budget_fraction = -0.5; }), true);
     EQ(invalid([](MemoryPolicy& p) { p.budget_fraction = 1.01; }), true);

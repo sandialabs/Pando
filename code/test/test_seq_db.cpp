@@ -1386,7 +1386,6 @@ TEST(memory_policy_rejects_invalid) {
         }
         return false;
     };
-    EQ(rejected([](MemoryPolicy& p) { p.min_filter_runs = 0; }), true);
     EQ(rejected([](MemoryPolicy& p) { p.budget_fraction = 0; }), true);
     EQ(rejected([](MemoryPolicy& p) { p.budget_fraction = 1.5; }), true);
     EQ(rejected([](MemoryPolicy& p) { p.limit_pct = -1; }), true);
@@ -1410,7 +1409,6 @@ TEST(mem_budget_stops_pass) {
     d.set_meminfo_source([&]() { ++meminfo_reads; return MemInfo{}; });
     MemoryPolicy p = MemoryPolicy::disabled();
     p.pass_budget_bytes = 3*g_A_DONE_BYTES;
-    p.min_filter_runs = 1;
     d.set_memory_policy(p);
     add_a_entries(d, 10);
     d.install_filter(make_shared<Filter>(&g_TEST_a_done_fi));
@@ -1443,7 +1441,8 @@ TEST(mem_budget_stops_pass) {
 
 // The case a plain "memory above X% => stop" rule gets wrong: memory is
 // already over the limit when processing starts. The budget is then 0, but
-// every pass still does min_filter_runs runs, so processing finishes.
+// every pass still runs one filter before it stops, so processing finishes,
+// one entry per pass.
 TEST(mem_high_at_start_still_progresses) {
     g_TEST_max_filters_runs = 0;
     SeqDB d;
@@ -1454,7 +1453,6 @@ TEST(mem_high_at_start_still_progresses) {
     d.set_meminfo_source([&]() { return mem; });
     MemoryPolicy p;
     p.limit_pct = 75;
-    p.min_filter_runs = 4;
     p.check_interval = chrono::milliseconds(0);
     d.set_memory_policy(p);
     add_a_entries(d, 10);
@@ -1465,16 +1463,24 @@ TEST(mem_high_at_start_still_progresses) {
         runs.push_back(g_TEST_max_filters_runs);
         if (runs.size() > 20) TEST_FAIL
     }
-    NOPRINT_EQ(runs, (vector<size_t>{4, 8, 10}));
+    NOPRINT_EQ(runs, (vector<size_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
     EQ(count_a_done(d), 10);
 
     auto& h = d.stats().history;
-    EQ(h[0].byte_budget, 0);
-    EQ(h[0].stop_reason, STOP_MEM_BUDGET);
-    EQ(h[0].stopped_early, true);
-    EQ(h[1].stop_reason, STOP_MEM_BUDGET);
-    // Fewer than min_filter_runs runs were left, so the pass ran them all
-    EQ(h[2].stop_reason, STOP_NONE);
+    EQ(h.size(), 11);
+    for (size_t i = 0; i < 9; ++i) {
+        EQ(h[i].byte_budget, 0);
+        EQ(h[i].stop_reason, STOP_MEM_BUDGET);
+        EQ(h[i].stopped_early, true);
+        EQ(h[i].bytes_emitted, g_A_DONE_BYTES);
+    }
+    // The 10th run was on the last key of the lap: the budget check still
+    // fired, but the pass was not cut short
+    EQ(h[9].stop_reason, STOP_MEM_BUDGET);
+    EQ(h[9].stopped_early, false);
+    // Nothing left to run, so the zero budget never stopped the last pass
+    EQ(h[10].stop_reason, STOP_NONE);
+    EQ(h[10].bytes_emitted, 0);
     EQ(d.under_memory_pressure(), true);
 
     TEST_PASS
@@ -1499,7 +1505,6 @@ TEST(mem_pressure_stops_pass) {
     MemoryPolicy p;
     p.limit_pct = 75;                   // reserve 25 GiB
     p.budget_fraction = 0.5;
-    p.min_filter_runs = 1;
     p.check_interval = chrono::milliseconds(0);
     d.set_memory_policy(p);
     add_a_entries(d, 10);
@@ -1608,25 +1613,27 @@ TEST(mem_budget_from_headroom) {
 }
 
 // A stop request (as ParDB uses for other agents' CLOSE_EARLY) is honored
-// even without a memory policy of our own, but only once min_filter_runs
-// filters have run in the pass
-TEST(stop_requested_after_floor) {
+// even without a memory policy of our own, but never before a filter has
+// run in the pass: entries the filter does not run on (the "B"s, which the
+// scan meets in hash order, often before any "A") must not end a pass that
+// has done nothing
+TEST(stop_requested_after_a_run) {
     g_TEST_max_filters_runs = 0;
     SeqDB d;
     MemoryPolicy p = MemoryPolicy::disabled();
-    p.min_filter_runs = 2;
     p.check_interval = chrono::milliseconds(0);
     d.set_memory_policy(p);
     EQ(d.memory_policy().enabled(), false);
 
     size_t runs_at_pass_start = 0, calls = 0;
-    bool called_before_floor = false;
+    bool called_before_a_run = false;
     d.set_stop_requested_callback([&]() {
         ++calls;
-        if (g_TEST_max_filters_runs - runs_at_pass_start < 2) called_before_floor = true;
+        if (g_TEST_max_filters_runs == runs_at_pass_start) called_before_a_run = true;
         return true;
     });
     add_a_entries(d, 10);
+    for (int k = 0; k < 10; ++k) { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
     d.install_filter(make_shared<Filter>(&g_TEST_a_done_fi));
 
     vector<size_t> runs;
@@ -1634,26 +1641,22 @@ TEST(stop_requested_after_floor) {
         runs_at_pass_start = g_TEST_max_filters_runs;
         if (!d.process_once()) break;
         runs.push_back(g_TEST_max_filters_runs);
-        if (runs.size() > 20) TEST_FAIL
+        if (runs.size() > 30) TEST_FAIL
     }
-    NOPRINT_EQ(runs, (vector<size_t>{2, 4, 6, 8, 10}));
+    // Every pass that ran stopped right after its one run
+    NOPRINT_EQ(runs, (vector<size_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
     EQ(count_a_done(d), 10);
-    EQ(called_before_floor, false);
-    // Once per stopped pass; the final lap never reaches the floor
-    EQ(calls, 5);
+    EQ(called_before_a_run, false);
+    // Once per pass that ran; the last pass ran nothing and never asked
+    EQ(calls, 10);
 
     auto& h = d.stats().history;
-    EQ(h.size(), 6);
-    for (size_t i = 0; i < 4; ++i) {
+    EQ(h.size(), 11);
+    for (size_t i = 0; i < 10; ++i) {
         EQ(h[i].stop_reason, STOP_REMOTE);
-        EQ(h[i].stopped_early, true);
         EQ(h[i].byte_budget, NO_BYTE_BUDGET);
     }
-    // The request fired on the last key of the lap: the reason is recorded,
-    // but the pass did not stop early
-    EQ(h[4].stop_reason, STOP_REMOTE);
-    EQ(h[4].stopped_early, false);
-    EQ(h[5].stop_reason, STOP_NONE);
+    EQ(h[10].stop_reason, STOP_NONE);
 
     TEST_PASS
 }
@@ -1752,7 +1755,6 @@ TEST(mem_budget_same_result) {
     SeqDB limited;
     MemoryPolicy p = MemoryPolicy::disabled();
     p.pass_budget_bytes = 1;
-    p.min_filter_runs = 1;
     limited.set_memory_policy(p);
     build(limited);
     g_TEST_on_tag_b_runs = 0;
@@ -1825,7 +1827,7 @@ TESTS_BEGIN
     RUN_TEST(mem_high_at_start_still_progresses)
     RUN_TEST(mem_pressure_stops_pass)
     RUN_TEST(mem_budget_from_headroom)
-    RUN_TEST(stop_requested_after_floor)
+    RUN_TEST(stop_requested_after_a_run)
     RUN_TEST(mem_bytes_count_each_output)
     RUN_TEST(mem_budget_same_result)
 

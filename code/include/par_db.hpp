@@ -111,7 +111,7 @@ class ParDB : public PandoParticipant {
          * @param mem_policy when to end a pass early to bound memory (see
          *        memory_policy.hpp); enabled by default, MemoryPolicy::disabled()
          *        turns it off. Requests from other agents to close early are
-         *        honored either way, after the policy's min_filter_runs. An
+         *        honored either way, once a filter has run in the pass. An
          *        agents_per_node of 0 uses Slurm's tasks per node, else the
          *        agents in the mesh with this agent's IP address.
          */

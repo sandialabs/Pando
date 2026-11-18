@@ -225,8 +225,8 @@ class SeqDB {
          * agents_per_node is 0 (auto); unset means 1 */
         function<uint64_t()> agents_per_node_source_;
 
-        /** @brief Asked (at most every check_interval, after
-         * min_filter_runs) whether another agent wants this pass to end */
+        /** @brief Asked (at most every check_interval, once a filter has run
+         * this pass) whether another agent wants this pass to end */
         function<bool()> stop_requested_cb_;
 
         /** @brief This pass checks MemAvailable against mem_reserve_bytes_ */
@@ -244,7 +244,7 @@ class SeqDB {
             stats_.byte_budget = NO_BYTE_BUDGET;
             mem_pressure_check_ = false;
             mem_reserve_bytes_ = 0;
-            // The first timed check happens as soon as the run floor is met
+            // The first timed check happens right after the pass's first run
             next_stop_check_ = steady_clock::now();
 
             if (!mem_policy_.enabled()) return;
@@ -269,9 +269,12 @@ class SeqDB {
         /** @brief Decide whether the pass should stop now
          *
          * Called after each entry. max_filters_per_stage_ applies as always.
-         * The memory checks and requests from other agents only apply once
-         * min_filter_runs filters have run this pass, which guarantees
-         * progress however high memory is when the pass starts. The byte
+         * The memory checks and requests from other agents only apply once at
+         * least one filter has run this pass. That is what guarantees
+         * progress however high memory is when the pass starts: a budget of 0
+         * would otherwise stop a pass before it did anything, and since an
+         * unfinished lap must report "process again", passes would repeat
+         * forever without doing any work. The byte
          * budget is checked every time (it is just a comparison); reading the
          * system memory and asking stop_requested_cb_ are rate limited by
          * check_interval.
@@ -280,7 +283,7 @@ class SeqDB {
          */
         uint8_t check_stop_(size_t num_filters_run) {
             if (num_filters_run >= max_filters_per_stage_) return STOP_MAX_FILTERS;
-            if (num_filters_run < mem_policy_.min_filter_runs) return STOP_NONE;
+            if (num_filters_run == 0) return STOP_NONE;
             if (stats_.bytes_emitted >= stats_.byte_budget) return STOP_MEM_BUDGET;
             if (!mem_pressure_check_ && !stop_requested_cb_) return STOP_NONE;
 
@@ -439,8 +442,9 @@ class SeqDB {
                         #endif
                         // Keep the cursor; the next pass continues from here.
                         // Every reason requires at least one filter run (the
-                        // run limit and min_filter_runs are both >= 1), so
-                        // returning true (process again) is correct.
+                        // run limit is >= 1, and check_stop_ checks nothing
+                        // else before a run), so returning true (process
+                        // again) is correct and the next pass makes progress.
                         stats_.stopped_early = scan_pos_ < scan_keys_.size();
                         stats_.stop_reason = reason;
                         return true;
@@ -973,8 +977,8 @@ class SeqDB {
 
         /** @brief Set a check for requests (e.g. from other agents) to end the
          * current pass early. It is called while filters run, at most every
-         * check_interval and only after min_filter_runs runs this pass (both
-         * from the memory policy, which need not be enabled for this). */
+         * check_interval (from the memory policy, which need not be enabled
+         * for this) and only once a filter has run this pass. */
         void set_stop_requested_callback(function<bool()> cb) {
             stop_requested_cb_ = move(cb);
         }

@@ -15,8 +15,10 @@
  *    pass stops once its filters have emitted that many bytes of output.
  *  - Pressure: the pass also stops if MemAvailable drops below the reserve
  *    while it runs (e.g. because of other agents or other processes).
- *  - Both apply only after min_filter_runs filter runs in the pass, so every
- *    pass makes progress even if memory is already high when it starts.
+ *  - Both apply only once at least one filter has run in the pass, so every
+ *    pass makes progress even if memory is already high when it starts: with
+ *    little headroom the budget is ~0 and each pass runs one entry's filters,
+ *    closes the stage (moving the output to the map), and the next continues.
  *
  * In ParDB, an agent that stops for either memory reason also asks every
  * agent to close early (CLOSE_EARLY), since the others' output fills its
@@ -98,10 +100,6 @@ struct MemoryPolicy {
      * receiver) and then as staged entries, which take a few times their
      * serialized size. A quarter keeps that within the headroom. */
     double budget_fraction = 0.25;
-    /** Filter runs a pass always does before a memory check (or a request
-     * from another agent) can stop it. At least 1, so processing always makes
-     * progress. */
-    uint64_t min_filter_runs = 1000;
     /** Agents sharing the node's memory; the headroom is split between them.
      * 0 (the default) works it out: see SeqDB::set_agents_per_node_source
      * (ParDB uses Slurm's tasks per node, else the agents in the mesh with
@@ -112,7 +110,7 @@ struct MemoryPolicy {
     std::chrono::steady_clock::duration check_interval = std::chrono::milliseconds(10);
 
     /** @brief A policy that never stops a pass for memory (requests from
-     * other agents are still honored after min_filter_runs) */
+     * other agents are still honored) */
     static MemoryPolicy disabled() {
         MemoryPolicy p;
         p.limit_pct = 0;
@@ -129,8 +127,6 @@ struct MemoryPolicy {
             throw std::invalid_argument("memory limit_pct must be in [0, 100]");
         if (!(budget_fraction > 0 && budget_fraction <= 1))
             throw std::invalid_argument("memory budget_fraction must be in (0, 1]");
-        if (min_filter_runs == 0)
-            throw std::invalid_argument("memory min_filter_runs must be at least 1");
         if (check_interval < std::chrono::steady_clock::duration::zero())
             throw std::invalid_argument("memory check_interval must not be negative");
     }
@@ -150,7 +146,7 @@ struct PassBudget {
  * budget  = budget_fraction * max(0, MemAvailable - reserve) / agents
  *
  * The budget is 0 when memory is already above the limit; the pass then
- * stops after policy.min_filter_runs runs.
+ * stops after its first filter run.
  *
  * @param agents the agents sharing the node's memory (resolved from
  *        policy.agents_per_node by the caller; 0 is treated as 1)

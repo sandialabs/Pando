@@ -383,11 +383,9 @@ TEST(par_db_publishes_stats) {
 TEST(par_db_close_early) {
     MemoryPolicy tiny = MemoryPolicy::disabled();
     tiny.pass_budget_bytes = 1;
-    tiny.min_filter_runs = 1;
     tiny.check_interval = chrono::milliseconds(0);
-    // No limits of its own, but honors requests after 1 run
+    // No limits of its own, but honors requests (after its first run)
     MemoryPolicy follower = MemoryPolicy::disabled();
-    follower.min_filter_runs = 1;
     follower.check_interval = chrono::milliseconds(0);
     EQ(follower.enabled(), false);
 
