@@ -13,6 +13,7 @@
 #include "par_db_client.hpp"
 #include "par_db_proxy.hpp"
 #include "par_db_access.hpp"
+#include "par_db_options.hpp"
 #include "par_db_thread.hpp"
 #include "par_db_responder.hpp"
 #include "process_stats.hpp"
@@ -102,6 +103,15 @@ class ParDB : public PandoParticipant {
             return n;
         }
 
+        static ParDBOptions make_options_(bool skip_group_filters, size_t max_filters_per_stage,
+                                          const MemoryPolicy& mem_policy) {
+            ParDBOptions opts;
+            opts.skip_group_filters = skip_group_filters;
+            opts.max_filters_per_stage = max_filters_per_stage;
+            opts.mem_policy = mem_policy;
+            return opts;
+        }
+
     public:
         /** @brief Initialize the parallel DB
          *
@@ -117,6 +127,10 @@ class ParDB : public PandoParticipant {
          */
         ParDB(ZMQAddress addr, size_t sz, bool skip_group_filters=false, size_t max_filters_per_stage=0,
                 const MemoryPolicy& mem_policy=MemoryPolicy{}) :
+                ParDB(addr, sz, make_options_(skip_group_filters, max_filters_per_stage, mem_policy)) { }
+
+        /** @brief Initialize the parallel DB with the given settings (see ParDBOptions) */
+        ParDB(ZMQAddress addr, size_t sz, const ParDBOptions& opts) :
                 PandoParticipant(addr, true),
                 db_refs_(this,
                     s_ref_add_entry,
@@ -133,7 +147,7 @@ class ParDB : public PandoParticipant {
                 local_sent_dist_(0),
                 local_recv_dist_(0),
                 responder_(addr + RESPONDER_LOCALNUM_OFFSET),
-                skip_group_filters_(skip_group_filters) {
+                skip_group_filters_(opts.skip_group_filters) {
             sub(PROCESS);
             sub(ALGPROCESS);
             sub(END_BARRIER);
@@ -144,8 +158,8 @@ class ParDB : public PandoParticipant {
             sub(EXPORT_DB_WITH_TAG);
 
             if (skip_group_filters_) db_.disable_group_filters();
-            if (max_filters_per_stage != 0) db_.set_max_filters_per_stage(max_filters_per_stage);
-            db_.set_memory_policy(mem_policy);
+            if (opts.max_filters_per_stage != 0) db_.set_max_filters_per_stage(opts.max_filters_per_stage);
+            db_.set_memory_policy(opts.mem_policy);
             slurm_tasks_per_node_ = slurm_tasks_per_node();
             db_.set_agents_per_node_source([this]() { return agents_on_node_(); });
 

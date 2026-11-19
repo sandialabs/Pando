@@ -150,7 +150,11 @@ int main_(int argc, char **argv) {
     } else {
         cerr << "[Pando] [DEBUG] Memory limits: off" << endl;
     }
-    ParDBThread db { bind_addr, sz, skip_group_filters, max_filters_per_stage, mem_policy };
+    ParDBOptions opts;
+    opts.skip_group_filters = skip_group_filters;
+    opts.max_filters_per_stage = max_filters_per_stage;
+    opts.mem_policy = mem_policy;
+    ParDBThread db { bind_addr, sz, opts };
 
     if (seed_addr.size() != 0) {
         elga::ZMQAddress seed = get_zmq_addr(seed_addr);
