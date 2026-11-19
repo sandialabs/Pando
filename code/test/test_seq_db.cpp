@@ -1081,6 +1081,211 @@ TEST(import_export_with_tag) {
     TEST_PASS
 }
 
+/** @brief Write entries to fn in the export_db file format, in order and
+ * without merging, so tests can build files export_db would never write */
+static void write_import_file(const string& fn, vector<DBEntry<>>& entries) {
+    size_t size = sizeof(size_t);
+    for (auto& e : entries) size += sizeof(size_t) + e.serialize_size();
+
+    vector<char> buf(size);
+    char* p = buf.data();
+    *(size_t*)p = entries.size(); p += sizeof(size_t);
+    for (auto& e : entries) {
+        *(size_t*)p = e.serialize_size(); p += sizeof(size_t);
+        e.serialize(p);
+    }
+
+    ofstream out {fn, ios::binary};
+    out.write(buf.data(), buf.size());
+}
+
+static DBEntry<> make_entry(dbkey_t key, string value, vector<string> tags) {
+    DBEntry<> e;
+    e.set_key(key);
+    e.value() = value;
+    for (auto& t : tags) e.add_tag(t);
+    return e;
+}
+
+TEST(import_large_values) {
+    const string fn = "exported_large";
+    const string big_a(3*(1<<20), 'a');
+    const string big_b = string(1<<20, 'b') + string("\0tail", 5);
+    dbkey_t ka {1,1,1}, kb {2,2,2}, kc {3,3,3};
+
+    {
+        SeqDB db;
+        db.add_entry(make_entry(ka, big_a, {"t1", "t2"}));
+        db.add_entry(make_entry(kb, big_b, {"t2"}));
+        db.add_entry(make_entry(kc, "", {}));
+        db.export_db(fn);
+    }
+
+    SeqDB db2;
+    db2.import_db(fn);
+    remove(fn.c_str());
+
+    EQ(db2.size(), 3);
+    auto entries = db2.entries();
+    EQ(entries.size(), 3);
+    EQ(entries[ka].value() == big_a, true);
+    EQ(entries[kb].value() == big_b, true);
+    EQ(entries[kc].value().size(), 0);
+    EQ(entries[ka].tags().size(), 2);
+    EQ(entries[ka].has_tag("t1"), true);
+    EQ(entries[ka].has_tag("t2"), true);
+    EQ(entries[kb].tags().size(), 1);
+    EQ(entries[kb].has_tag("t2"), true);
+    EQ(entries[kc].tags().size(), 0);
+
+    // The tag index covers the imported entries
+    EQ((db2.get_entry_by_tags(set<string>{"t1"}) == (set<dbkey_t>{ka})), true);
+    EQ((db2.get_entry_by_tags(set<string>{"t2"}) == (set<dbkey_t>{ka, kb})), true);
+    EQ((db2.get_entry_by_tags(set<string>{"t1", "t2"}) == (set<dbkey_t>{ka})), true);
+
+    TEST_PASS
+}
+
+TEST(import_merges_like_add_entry) {
+    // Keys that already exist, keys repeated within the file and entries
+    // without a key must end up just as if each entry had been added with
+    // add_entry, in file order
+    const string fn = "exported_merge";
+    dbkey_t k1 {1,1,1}, k2 {2,2,2}, k3 {3,3,3};
+
+    auto file_entries = [&]() {
+        vector<DBEntry<>> v;
+        v.push_back(make_entry(k1, "foo", {"x"}));
+        v.push_back(make_entry(k2, "file k2", {"y"}));
+        v.push_back(make_entry(k1, "bar", {"z"}));
+        v.push_back(make_entry(k3, "new", {"w"}));
+        v.push_back(make_entry(INITIAL_KEY, "no key", {"nk"}));
+        v.push_back(make_entry(k1, "baz", {}));
+        return v;
+    };
+
+    auto entries = file_entries();
+    write_import_file(fn, entries);
+
+    SeqDB db;
+    db.add_entry(make_entry(k2, "pre k2", {"p"}));
+    db.import_db(fn);
+    remove(fn.c_str());
+
+    SeqDB expected;
+    expected.add_entry(make_entry(k2, "pre k2", {"p"}));
+    for (auto& e : file_entries()) expected.add_entry(move(e));
+
+    EQ(db.size(), expected.size());
+    EQ(db.size(), 4);
+
+    auto got = db.entries();
+    auto want = expected.entries();
+    for (dbkey_t k : {k1, k2, k3}) {
+        EQ(got.count(k), 1);
+        EQ(got[k].value(), want[k].value());
+        EQ(got[k].tags() == want[k].tags(), true);
+        for (auto& tag : want[k].tags())
+            EQ(db.get_entry_by_tags(set<string>{tag}).count(k), 1);
+    }
+    // Sanity check that the merges really happened
+    EQ(got[k1].value(), "foo\nbar\nbaz");
+    EQ(got[k2].value(), "pre k2\nfile k2");
+
+    // The entry without a key was given a new one
+    size_t no_key_found = 0;
+    for (auto& [key, e] : got) {
+        if (e.value() == "no key") {
+            ++no_key_found;
+            EQ(key != INITIAL_KEY, true);
+            EQ((db.get_entry_by_tags(set<string>{"nk"}) == (set<dbkey_t>{key})), true);
+        }
+    }
+    EQ(no_key_found, 1);
+
+    TEST_PASS
+}
+
+TEST(import_handles_subscriptions) {
+    const string fn = "exported_subscription";
+    dbkey_t my_key {5,5,5}, wait_key {6,6,6};
+
+    vector<DBEntry<>> entries;
+    entries.push_back(make_entry(wait_key, "", {}));
+    write_import_file(fn, entries);
+
+    SeqDB db;
+    db.add_entry(make_entry(my_key, "testing", {"foo:inactive"}));
+    db.subscribe_to_entry(my_key, wait_key, "foo:inactive");
+
+    db.import_db(fn);
+    remove(fn.c_str());
+    db.stage_close();
+
+    EQ(db.size(), 2);
+    EQ(db.entries()[my_key].has_tag("foo:inactive"), false);
+
+    TEST_PASS
+}
+
+TEST(import_malformed_file) {
+    const string fn = "exported_malformed";
+    vector<DBEntry<>> entries;
+    entries.push_back(make_entry({1,1,1}, "first", {"a"}));
+    entries.push_back(make_entry({2,2,2}, "second", {"b"}));
+    write_import_file(fn, entries);
+
+    // Read the good file back, then write broken versions of it
+    vector<char> good;
+    {
+        ifstream in {fn, ios::binary};
+        good.assign(istreambuf_iterator<char>(in), istreambuf_iterator<char>());
+    }
+    auto import_bytes = [&](const vector<char>& bytes) {
+        {
+            ofstream out {fn, ios::binary};
+            out.write(bytes.data(), bytes.size());
+        }
+        SeqDB db;
+        bool threw = false;
+        try {
+            db.import_db(fn);
+        } catch (runtime_error&) {
+            threw = true;
+        }
+        // Nothing is inserted from a file that fails the check
+        return threw && db.size() == 0;
+    };
+
+    // Truncated in the middle of the last entry
+    EQ(import_bytes(vector<char>(good.begin(), good.end() - 3)), true);
+
+    // Entry count larger than the file
+    {
+        vector<char> bad = good;
+        *(size_t*)bad.data() = (size_t)1 << 40;
+        EQ(import_bytes(bad), true);
+    }
+
+    // An entry size that does not match the entry
+    {
+        vector<char> bad = good;
+        *(size_t*)(bad.data() + sizeof(size_t)) -= 1;
+        EQ(import_bytes(bad), true);
+    }
+
+    // A value length running past the entry
+    {
+        vector<char> bad = good;
+        *(size_t*)(bad.data() + 2*sizeof(size_t) + sizeof(dbkey_t)) = (size_t)1 << 40;
+        EQ(import_bytes(bad), true);
+    }
+
+    remove(fn.c_str());
+
+    TEST_PASS
+}
+
 // Filter for the max_filters_per_stage tests: runs on entries tagged "A" that
 // it hasn't tagged "A:done" yet, so each entry is filtered exactly once
 static size_t g_TEST_max_filters_runs;
@@ -2321,6 +2526,10 @@ TESTS_BEGIN
     RUN_TEST(serialize_entries)
     RUN_TEST(import_export)
     RUN_TEST(import_export_with_tag)
+    RUN_TEST(import_large_values)
+    RUN_TEST(import_merges_like_add_entry)
+    RUN_TEST(import_handles_subscriptions)
+    RUN_TEST(import_malformed_file)
     RUN_TEST(max_filters_per_stage)
     RUN_TEST(max_filters_per_stage_rejects_zero)
     RUN_TEST(max_filters_per_stage_default_unlimited)

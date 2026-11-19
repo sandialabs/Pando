@@ -121,6 +121,9 @@ using it_t = int32_t;
  * subscriptions) to one agent in one message; see ParDB::recv_write_batch */
 #define WRITE_BATCH                   0xda
 #define MAP_GET_ENTRIES_BY_KEYS       0xdb
+/* Insert serialized entries the PandoMap reads straight out of the sender's
+ * memory (same process only); see PandoMap::recv_map_insert_from_buffer */
+#define MAP_INSERT_FROM_BUFFER        0xdc
 #define WANT_HEARTBEAT                0xfe
 #define HEARTBEAT                     0xff
 
