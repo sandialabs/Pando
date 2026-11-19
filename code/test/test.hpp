@@ -1,9 +1,13 @@
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <exception>
 
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
 
 /**
  * @file tests.hpp
@@ -112,6 +116,15 @@
         std::cout << "Usage: " << argv[0] << " build-dir test-src-dir" <<   \
                 std::endl;                                                  \
         return EXIT_FAILURE;                                                \
+    }                                                                       \
+    {                                                                       \
+        std::string _probe = "/scratch/_pando_test_probe";                  \
+        if (mkdir(_probe.c_str(), 0700) != 0) {                             \
+            std::cerr << "FATAL: /scratch not writable: "                   \
+                << std::strerror(errno) << std::endl;                       \
+            return EXIT_FAILURE;                                            \
+        }                                                                   \
+        rmdir(_probe.c_str());                                              \
     }                                                                       \
     string build_dir {argv[1]};                                             \
     string src_dir {argv[2]};                                               \
