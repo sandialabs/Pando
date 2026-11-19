@@ -215,6 +215,16 @@ class SeqDB {
         /** @brief Total entries offered to the filters (for tests/diagnostics) */
         size_t entries_examined_ = 0;
 
+        /** @brief Continuous processing (see set_continuous_processing): when
+         * set (the default), a process request keeps sweeping over the
+         * entries until a whole sweep runs no filter; when not, it makes one
+         * sweep and stops */
+        bool continuous_processing_ = true;
+
+        /** @brief With continuous processing off, the current request's sweep
+         * is finished: later passes of the same request do nothing */
+        bool sweep_done_ = false;
+
         /** @brief When to end a pass early to bound memory; enabled by
          * default (see memory_policy.hpp and set_memory_policy) */
         MemoryPolicy mem_policy_;
@@ -385,6 +395,13 @@ class SeqDB {
             size_t i = 0;   // entries this pass
             #endif
 
+            // With continuous processing off, an agent whose sweep is finished
+            // does nothing while the rest of the mesh finishes theirs
+            if (!continuous_processing_ && sweep_done_) {
+                stats_.stopped_early = false;
+                return false;
+            }
+
             // Start a new lap on a fresh snapshot if the last one finished
             if (scan_pos_ == 0 || scan_pos_ >= scan_keys_.size()) {
                 scan_keys_ = db_.keys();
@@ -459,6 +476,15 @@ class SeqDB {
 
                     uint8_t reason = check_stop_(num_filters_run);
                     if (reason != STOP_NONE) {
+                        if (!continuous_processing_ && scan_pos_ >= scan_keys_.size()) {
+                            // Stopped on the last entry of the snapshot: the
+                            // sweep is done, as below. The reason is kept, so
+                            // a stop for memory still asks the others to stop.
+                            stats_.stop_reason = reason;
+                            sweep_done_ = true;
+                            reset_scan_();
+                            return false;
+                        }
                         #ifdef VERBOSE
                         cerr << "breaking early: " << stop_reason_name(reason) << " (cursor at " << scan_pos_ << "/"
                              << scan_keys_.size() << ", " << num_filters_run << " filters run, "
@@ -478,6 +504,15 @@ class SeqDB {
                 }
 
                 // Reached the end of the snapshot
+                if (!continuous_processing_) {
+                    // Every entry in the snapshot has been offered to the
+                    // filters once: the sweep is done, even if filters ran.
+                    // Nothing is rechecked, so entries created or made
+                    // eligible during the sweep wait for the next request.
+                    sweep_done_ = true;
+                    reset_scan_();
+                    return false;
+                }
                 if (filter_ran) {
                     // Next pass starts a new lap, which will see this pass's changes
                     reset_scan_();
@@ -1105,8 +1140,37 @@ class SeqDB {
 
         /** @brief Process the database, applying filters as appropriate */
         virtual bool process() {
+            start_new_sweep();
             while (process_once()) {}
             return false;
+        }
+
+        /** @brief Choose how a process request ends
+         *
+         * On (the default), "continuous processing": sweep over the entries,
+         * and keep sweeping until a whole sweep runs no filter. A filter that
+         * makes another entry eligible (by creating or tagging it) is
+         * therefore always followed up, at the cost of one more sweep after
+         * the last one that ran anything.
+         *
+         * Off: process each entry once per request. One sweep is made: every
+         * entry that existed when it started is offered to the filters once
+         * (over as many passes as max_filters_per_stage or the memory policy
+         * need), and nothing is rechecked. Use this only when no filter's
+         * writes can make an entry eligible for a filter in the same request:
+         * entries created or made eligible during the sweep are left for the
+         * next request.
+         */
+        void set_continuous_processing(bool on) { continuous_processing_ = on; }
+
+        /** @brief Whether a process request keeps sweeping until nothing runs */
+        bool continuous_processing() const { return continuous_processing_; }
+
+        /** @brief Begin a new process request: its sweep starts from the first
+         * entry of a fresh snapshot */
+        void start_new_sweep() {
+            sweep_done_ = false;
+            reset_scan_();
         }
 
         /** @brief Return the current size of the database */

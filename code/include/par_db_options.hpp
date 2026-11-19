@@ -36,6 +36,11 @@ struct ParDBOptions {
     /** @brief Keys the filter scan fetches from the map per request (see
      * SeqDB::set_scan_block_keys); 0 = SeqDB's default */
     size_t scan_block_keys = 0;
+
+    /** @brief Keep sweeping over the entries until a whole sweep runs no
+     * filter (the default); false processes each entry once per request
+     * (see SeqDB::set_continuous_processing) */
+    bool continuous_processing = true;
 };
 
 }

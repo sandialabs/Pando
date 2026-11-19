@@ -55,7 +55,7 @@ int main_(int argc, char **argv) {
 
     if (argc < 2) {
         cerr << "Usage: pando_pardb bind-addr [seed-addr] [-M<mem in GB>] [--skip-group-filters] [--max-filters-per-stage=N]\n"
-            "                   [--write-batch-bytes=N] [--scan-block-keys=N]\n"
+            "                   [--write-batch-bytes=N] [--scan-block-keys=N] [--continuous-processing=on|off]\n"
             "                   [--mem-limit-pct=P] [--mem-pass-budget-mb=N] [--mem-budget-fraction=F]\n"
             "                   [--agents-per-node=N]\n"
             "\n"
@@ -71,6 +71,14 @@ int main_(int argc, char **argv) {
             "                          (default 262144; 0 = one message per write)\n"
             "  --scan-block-keys=N : keys the filter scan fetches from the map per request\n"
             "                          (default 4096; each reply is also capped at ~16 MB)\n"
+            "  --continuous-processing=on|off : how a process request ends. on (default): keep\n"
+            "                          sweeping over the entries until a whole sweep runs no\n"
+            "                          filter, so filters that make other entries eligible are\n"
+            "                          followed up. off: process each entry once per request,\n"
+            "                          then stop (a sweep can still span several passes);\n"
+            "                          entries created or made eligible during it are left for\n"
+            "                          the next request. Use off only if no filter's writes can\n"
+            "                          make an entry eligible for a filter in the same request.\n"
             "\n"
             "Memory limits:\n"
             "  Filter output is held in memory until the stage closes. A processing pass ends\n"
@@ -108,6 +116,8 @@ int main_(int argc, char **argv) {
     const string write_batch_flag = "--write-batch-bytes=";
     size_t scan_block_keys = 0;  // 0 = SeqDB default
     const string scan_block_flag = "--scan-block-keys=";
+    bool continuous_processing = true;
+    const string continuous_flag = "--continuous-processing=";
     const string mem_limit_flag = "--mem-limit-pct=";
     const string mem_budget_flag = "--mem-pass-budget-mb=";
     const string mem_fraction_flag = "--mem-budget-fraction=";
@@ -139,6 +149,10 @@ int main_(int argc, char **argv) {
         } else if ((val = flag_val(arg, scan_block_flag))) {
             if (!parse_positive_u64(val, n)) return bad(scan_block_flag, val, "a positive integer");
             scan_block_keys = n;
+        } else if ((val = flag_val(arg, continuous_flag))) {
+            if (string(val) == "on") continuous_processing = true;
+            else if (string(val) == "off") continuous_processing = false;
+            else return bad(continuous_flag, val, "on or off");
         } else if ((val = flag_val(arg, mem_limit_flag))) {
             if (!parse_double_in(val, 0, 100, mem_policy.limit_pct, true)) return bad(mem_limit_flag, val, "a percent in [0, 100]");
         } else if ((val = flag_val(arg, mem_budget_flag))) {
@@ -161,7 +175,8 @@ int main_(int argc, char **argv) {
     cerr << "[Pando] [DEBUG] Bind addr=" << bind_addr.get_conn_str(bind_addr, REQUEST) << " memory=" << sz
          << " max_filters_per_stage=" << (max_filters_per_stage ? to_string(max_filters_per_stage) : string("unlimited"))
          << " write_batch_bytes=" << (write_batch_bytes ? to_string(write_batch_bytes) : string("off"))
-         << " scan_block_keys=" << (scan_block_keys ? to_string(scan_block_keys) : string("default")) << endl;
+         << " scan_block_keys=" << (scan_block_keys ? to_string(scan_block_keys) : string("default"))
+         << " continuous_processing=" << (continuous_processing ? "on" : "off") << endl;
     if (mem_policy.enabled()) {
         cerr << "[Pando] [DEBUG] Memory limits: limit_pct=" << (mem_policy.limit_pct > 0 ? to_string(mem_policy.limit_pct) : string("off"))
              << " pass_budget_bytes=" << (mem_policy.pass_budget_bytes ? to_string(mem_policy.pass_budget_bytes) : string("off"))
@@ -176,6 +191,7 @@ int main_(int argc, char **argv) {
     opts.mem_policy = mem_policy;
     opts.write_batch_bytes = write_batch_bytes;
     opts.scan_block_keys = scan_block_keys;
+    opts.continuous_processing = continuous_processing;
     ParDBThread db { bind_addr, sz, opts };
 
     if (seed_addr.size() != 0) {
