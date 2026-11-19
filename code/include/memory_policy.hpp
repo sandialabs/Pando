@@ -87,9 +87,11 @@ struct CgroupMemory {
     /** false if no limit was found (no cgroup, files not readable, or unlimited) */
     bool ok = false;
     uint64_t limit_bytes = 0;
-    /** Memory charged to the cgroup with the limit, minus its inactive file
-     * pages (which the kernel reclaims first), so it compares with
-     * MemAvailable, which also counts reclaimable page cache as available */
+    /** Memory charged to the cgroup with the limit, minus its file page cache
+     * (active and inactive), which the kernel reclaims before the cgroup
+     * reaches its limit, so it compares with MemAvailable, which also counts
+     * page cache as available. Shared memory (tmpfs, such as a /scratch in
+     * RAM) is not on these lists, and stays counted as used. */
     uint64_t used_bytes = 0;
 };
 
@@ -108,14 +110,29 @@ inline bool read_cgroup_value_(const std::string& path, uint64_t& value, bool& u
     return true;
 }
 
-/** @brief A "key value" entry of a memory.stat file; 0 if absent */
-inline uint64_t read_cgroup_stat_(const std::string& path, const std::string& key) {
+/** @brief The file page cache (active plus inactive file pages) in a
+ * memory.stat file; 0 if absent
+ *
+ * Both lists count: pages a process reads twice (or that reclaim finds
+ * recently used) move to the active list, but they stay clean page cache
+ * that the kernel drops when the cgroup nears its limit, and MemAvailable
+ * counts both lists as available. Counting only the inactive list made the
+ * job look far fuller than it was once its files had been read more than
+ * once. cgroup v1 gives each key also as total_* (this cgroup and its
+ * descendants), which is preferred. */
+inline uint64_t read_cgroup_file_pages_(const std::string& path) {
     std::ifstream in { path };
     std::string k;
     uint64_t v;
-    while (in >> k >> v)
-        if (k == key) return v;
-    return 0;
+    uint64_t active = 0, inactive = 0, total_active = 0, total_inactive = 0;
+    bool have_total = false;
+    while (in >> k >> v) {
+        if (k == "active_file") active = v;
+        else if (k == "inactive_file") inactive = v;
+        else if (k == "total_active_file") { total_active = v; have_total = true; }
+        else if (k == "total_inactive_file") { total_inactive = v; have_total = true; }
+    }
+    return have_total ? total_active + total_inactive : active + inactive;
 }
 
 /** @brief Find the tightest memory limit on the path from a cgroup up to the
@@ -149,8 +166,7 @@ inline CgroupMemory find_cgroup_memory(const std::string& proc_cgroup, const std
         }
     }
 
-    auto walk = [](std::string base, std::string path, const char* limit_file, const char* usage_file,
-                   const char* inactive_key, const char* inactive_key_alt) {
+    auto walk = [](std::string base, std::string path, const char* limit_file, const char* usage_file) {
         CgroupMemory best;
         while (true) {
             std::string dir = base + (path == "/" ? "" : path);
@@ -161,12 +177,10 @@ inline CgroupMemory find_cgroup_memory(const std::string& proc_cgroup, const std
                 uint64_t usage = 0;
                 bool usage_unlimited = false;
                 if (read_cgroup_value_(dir + "/" + usage_file, usage, usage_unlimited)) {
-                    uint64_t inactive = read_cgroup_stat_(dir + "/memory.stat", inactive_key);
-                    if (inactive == 0 && inactive_key_alt != nullptr)
-                        inactive = read_cgroup_stat_(dir + "/memory.stat", inactive_key_alt);
+                    uint64_t file_pages = read_cgroup_file_pages_(dir + "/memory.stat");
                     best.ok = true;
                     best.limit_bytes = limit;
-                    best.used_bytes = usage > inactive ? usage - inactive : 0;
+                    best.used_bytes = usage > file_pages ? usage - file_pages : 0;
                 }
             }
             if (path.empty() || path == "/") break;
@@ -177,12 +191,11 @@ inline CgroupMemory find_cgroup_memory(const std::string& proc_cgroup, const std
     };
 
     if (have_v2) {
-        CgroupMemory m = walk(root, v2_path, "memory.max", "memory.current", "inactive_file", nullptr);
+        CgroupMemory m = walk(root, v2_path, "memory.max", "memory.current");
         if (m.ok) return m;
     }
     if (have_v1)
-        return walk(root + "/memory", v1_path, "memory.limit_in_bytes", "memory.usage_in_bytes",
-                    "total_inactive_file", "inactive_file");
+        return walk(root + "/memory", v1_path, "memory.limit_in_bytes", "memory.usage_in_bytes");
     return CgroupMemory{};
 }
 

@@ -288,25 +288,25 @@ struct FakeCgroupRoot {
 };
 
 // cgroup v2: the limit is on an ancestor (the job), not the process's own
-// cgroup (the task); usage leaves out inactive file pages
+// cgroup (the task); usage leaves out file page cache
 TEST(cgroup_v2_limit_on_ancestor) {
     FakeCgroupRoot r;
     r.write("memory.max", "max\n");
     r.write("slurm/job_1/memory.max", std::to_string(1024*MiB_) + "\n");
     r.write("slurm/job_1/memory.current", std::to_string(512*MiB_) + "\n");
-    r.write("slurm/job_1/memory.stat", "anon 1\ninactive_file " + std::to_string(128*MiB_) + "\nactive_file 5\n");
+    r.write("slurm/job_1/memory.stat", "anon 1\ninactive_file " + std::to_string(128*MiB_) + "\nactive_file " + std::to_string(64*MiB_) + "\n");
     r.write("slurm/job_1/step_0/memory.max", "max\n");
     r.write("slurm/job_1/step_0/memory.current", "1\n");
     CgroupMemory cg = find_cgroup_memory("0::/slurm/job_1/step_0\n", r.dir);
     EQ(cg.ok, true);
     EQ(cg.limit_bytes, 1024*MiB_);
-    EQ(cg.used_bytes, 384*MiB_);
+    EQ(cg.used_bytes, 320*MiB_);
 
     MemInfo node; node.ok = true; node.total_bytes = 400*1024*MiB_; node.available_bytes = 300*1024*MiB_;
     MemInfo m = apply_cgroup_limit(node, cg);
     EQ(m.ok, true);
     EQ(m.total_bytes, 1024*MiB_);
-    EQ(m.available_bytes, 640*MiB_);
+    EQ(m.available_bytes, 704*MiB_);
 
     TEST_PASS
 }
@@ -332,11 +332,38 @@ TEST(cgroup_v1_limit) {
     r.write("memory/memory.limit_in_bytes", "9223372036854771712\n");
     r.write("memory/slurm/job_2/memory.limit_in_bytes", std::to_string(2048*MiB_));
     r.write("memory/slurm/job_2/memory.usage_in_bytes", std::to_string(1024*MiB_));
-    r.write("memory/slurm/job_2/memory.stat", "cache 9\ntotal_inactive_file " + std::to_string(24*MiB_) + "\n");
+    r.write("memory/slurm/job_2/memory.stat", "cache 9\nactive_file 1\ninactive_file 2\n"
+            "total_active_file " + std::to_string(8*MiB_) + "\ntotal_inactive_file " + std::to_string(24*MiB_) + "\n");
     CgroupMemory cg = find_cgroup_memory("12:pids:/x\n4:cpuset,memory:/slurm/job_2\n", r.dir);
     EQ(cg.ok, true);
     EQ(cg.limit_bytes, 2048*MiB_);
-    EQ(cg.used_bytes, 1000*MiB_);
+    // The hierarchical total_* counts win over this cgroup's own
+    EQ(cg.used_bytes, 992*MiB_);
+
+    TEST_PASS
+}
+
+// File page cache counts as available on both lists. Measured on a real
+// cgroup: reading a 1 GiB file a second time moved its clean pages from
+// inactive_file to active_file, and memory.current - inactive_file went up
+// by 1 GiB while nothing more was in use. Shared memory (tmpfs, e.g. a
+// /scratch in RAM) is on neither list and stays counted as used.
+TEST(cgroup_active_file_pages_are_available) {
+    FakeCgroupRoot r;
+    r.write("job/memory.max", std::to_string(4096*MiB_));
+    r.write("job/memory.current", std::to_string(2640*MiB_));
+    r.write("job/memory.stat", "anon " + std::to_string(290*MiB_) + "\nfile " + std::to_string(2282*MiB_) +
+            "\nactive_file " + std::to_string(1109*MiB_) + "\ninactive_file " + std::to_string(149*MiB_) +
+            "\nshmem " + std::to_string(1024*MiB_) + "\n");
+    CgroupMemory cg = find_cgroup_memory("0::/job\n", r.dir);
+    EQ(cg.ok, true);
+    // 2640 - 1109 - 149: anon, shmem and kernel memory, not the page cache
+    EQ(cg.used_bytes, 1382*MiB_);
+
+    // No memory.stat: all of memory.current counts as used
+    r.write("job2/memory.max", std::to_string(4096*MiB_));
+    r.write("job2/memory.current", std::to_string(100*MiB_));
+    EQ(find_cgroup_memory("0::/job2\n", r.dir).used_bytes, 100*MiB_);
 
     TEST_PASS
 }
@@ -415,6 +442,7 @@ TESTS_BEGIN
     RUN_TEST(cgroup_v2_limit_on_ancestor)
     RUN_TEST(cgroup_v2_tightest_limit)
     RUN_TEST(cgroup_v1_limit)
+    RUN_TEST(cgroup_active_file_pages_are_available)
     RUN_TEST(cgroup_without_limit)
     RUN_TEST(cgroup_limit_edges)
     RUN_TEST(effective_meminfo_from_files)
