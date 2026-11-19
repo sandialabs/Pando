@@ -215,6 +215,11 @@ class SeqDB {
         /** @brief Total entries offered to the filters (for tests/diagnostics) */
         size_t entries_examined_ = 0;
 
+        /** @brief Entries whose values the scan fetched, and the requests it
+         * took (for tests/diagnostics) */
+        size_t scan_values_fetched_ = 0;
+        size_t scan_value_requests_ = 0;
+
         /** @brief Continuous processing (see set_continuous_processing): when
          * set (the default), a process request keeps sweeping over the
          * entries until a whole sweep runs no filter; when not, it makes one
@@ -323,14 +328,88 @@ class SeqDB {
             return STOP_NONE;
         }
 
-        /** @brief The scan fetches entries from the map in blocks of this many
-         * keys, one request per block (see set_scan_block_keys) */
+        /** @brief The scan fetches the keys and tags (not values) of the
+         * entries from the map in blocks of this many keys, one request per
+         * block (see set_scan_block_keys) */
         size_t scan_block_keys_ = DEFAULT_SCAN_BLOCK_KEYS;
-        /** @brief ...and a block's reply stops growing past about this many
-         * bytes, so databases with large values (e.g. whole blocks of a
-         * blockchain) do not get huge replies; the rest of the block is
-         * fetched with the next request */
-        static constexpr size_t SCAN_BLOCK_BYTES = 16u << 20;
+        /** @brief The scan's state for the current window of a block: which
+         * filters should run on each entry of the window, and the values
+         * fetched for the entries that need them
+         *
+         * should_run only sees an entry's tags (its value is nullptr), so
+         * nothing is fetched for an entry no filter runs on. In a pass that
+         * runs little, that skips copying nearly every value out of the map.
+         * Asking should_run ahead of earlier entries' runs gives the same
+         * answers as asking in order: the runs only stage their changes,
+         * which are not visible until the stage closes.
+         */
+        struct ScanLookahead {
+            size_t begin = 0, end = 0;      // block indices of the window
+            vector<uint8_t> wants;          // [(i - begin) * filters + f]: filter f should run on entry i
+            vector<dbkey_t> need_keys;      // keys of the window's entries some filter runs on, in order
+            size_t need_used = 0;           // need_keys handed out so far
+            size_t fetched_end = 0;         // need_keys [.., fetched_end) are covered by vals
+            vector<DBEntry<>> vals;         // the whole entries for the latest fetch, in key order
+            size_t vals_next = 0;           // next of vals to hand out
+        };
+
+        /** @brief Ask should_run of every filter about the entries of block
+         * from index from on (up to SCAN_LOOKAHEAD_ENTRIES of them), starting
+         * a new window in la */
+        void scan_decide_window_(vector<DBEntry<>>& block, size_t from,
+                                 const vector<pair<Filter*, FilterCounters*>>& filters, ScanLookahead& la) {
+            size_t nf = filters.size();
+            la.begin = from;
+            la.end = min(from + SCAN_LOOKAHEAD_ENTRIES, block.size());
+            la.wants.assign((la.end - la.begin) * nf, 0);
+            la.need_keys.clear();
+            la.need_used = 0;
+            la.fetched_end = 0;
+            la.vals.clear();
+            la.vals_next = 0;
+
+            if (nf == 0) return;
+            for (size_t i = la.begin; i < la.end; ++i) {
+                // One access serves every filter's should_run: should_run
+                // cannot change the entry (any change it makes is staged)
+                unique_ptr<DBAccess> access { block[i].access() };
+                access->value = nullptr;
+                add_db_access(access.get());
+                bool any = false;
+                for (size_t f = 0; f < nf; ++f) {
+                    if (filters[f].first->should_run(access.get())) {
+                        la.wants[(i - la.begin) * nf + f] = 1;
+                        any = true;
+                    }
+                }
+                if (any) la.need_keys.push_back(block[i].get_key());
+            }
+        }
+
+        /** @brief The whole entry (with its value) for the next entry of the
+         * window that a filter runs on, fetching the values for it and the
+         * window's later such entries if they are not here yet
+         * @return nullptr if the entry no longer exists */
+        DBEntry<>* scan_next_value_(ScanLookahead& la) {
+            size_t i = la.need_used++;
+            if (i >= la.need_keys.size()) throw runtime_error("scan: more entries need values than were asked about");
+            dbkey_t key = la.need_keys[i];
+            if (i >= la.fetched_end) {
+                // The reply is capped at about SCAN_BLOCK_BYTES, so it may
+                // cover only some of the rest (always at least this one)
+                size_t covered = 0;
+                la.vals = db_.retrieve_entries_by_keys(la.need_keys, i, la.need_keys.size() - i,
+                                                       SCAN_BLOCK_BYTES, covered);
+                la.vals_next = 0;
+                la.fetched_end = i + covered;
+                scan_values_fetched_ += la.vals.size();
+                ++scan_value_requests_;
+            }
+            // The reply skips keys that no longer exist
+            if (la.vals_next < la.vals.size() && la.vals[la.vals_next].get_key() == key)
+                return &la.vals[la.vals_next++];
+            return nullptr;
+        }
 
         /** @brief Start the next pass on a fresh snapshot, freeing the old one */
         void reset_scan_() {
@@ -432,14 +511,16 @@ class SeqDB {
                 stats_.keys_scanned = scan_pos_;
 
                 while (scan_pos_ < scan_keys_.size()) {
-                  // Fetch the next block of entries with one request to the
-                  // map, instead of one request per key. The block is not kept
-                  // past this pass: a stage close can change any entry.
+                  // Fetch the keys and tags of the next block of entries with
+                  // one request to the map, instead of one request per key.
+                  // Values are fetched only for entries a filter will run on
+                  // (see ScanLookahead). The block is not kept past this pass:
+                  // a stage close can change any entry.
                   size_t block_begin = scan_pos_;
-                  size_t block_keys = 0;
-                  vector<DBEntry<>> block = db_.retrieve_entries_by_keys(scan_keys_, block_begin,
-                      scan_block_keys_, SCAN_BLOCK_BYTES, block_keys);
+                  size_t block_keys = min(scan_block_keys_, scan_keys_.size() - block_begin);
+                  vector<DBEntry<>> block = db_.retrieve_tags_by_keys(scan_keys_, block_begin, block_keys);
                   size_t next_in_block = 0;
+                  ScanLookahead la;
 
                   for (size_t p = block_begin; p < block_begin + block_keys; ++p) {
                     dbkey_t key = scan_keys_[p];
@@ -450,37 +531,44 @@ class SeqDB {
                     bool exists = next_in_block < block.size() && block[next_in_block].get_key() == key;
                     ++entries_examined_;
                     if (exists) {
-                        DBEntry<>& entry = block[next_in_block++];
+                        size_t b = next_in_block++;
                         #ifdef VERBOSE
                         if (++i % 10000 == 0) {
                             cerr << "I have processed " << i << " entries this pass (cursor at " << scan_pos_ << "/"
                                  << scan_keys_.size() << ") and run " << num_filters_run << " filters" << endl;
                         }
                         #endif
-                        // @TODO profile to determine if this needs to be optimized out.
-                        //       this costs (|F|*|E|)
-                        for (auto & [filter, counters] : filters) {
-                            // @TODO move back out; make a test for add tags and then
-                            // get tags inside of a filter
-                            // Get the DB access -- need to redo this for each filter,
-                            // can't be pulled out of the loop because things can
-                            // change between filter runs
-                            DBAccess* access = entry.access();
+                        // Ask should_run about this entry and the next few
+                        // (tags only), unless that was done already
+                        if (b >= la.end) scan_decide_window_(block, b, filters, la);
+                        const uint8_t* wants = la.wants.data() + (b - la.begin) * filters.size();
+
+                        bool any = false;
+                        for (size_t f = 0; f < filters.size(); ++f) {
+                            ++filters[f].second->checked;
+                            any |= wants[f] != 0;
+                        }
+
+                        // Only now is the value needed; nullptr if the entry
+                        // is gone since its tags were read
+                        DBEntry<>* entry = any ? scan_next_value_(la) : nullptr;
+                        for (size_t f = 0; entry != nullptr && f < filters.size(); ++f) {
+                            if (!wants[f]) continue;
+                            auto & [filter, counters] = filters[f];
+                            // A fresh access for each run, with the value
+                            DBAccess* access = entry->access();
                             add_db_access(access);
 
-                            ++counters->checked;
-                            if (filter->should_run(access)) {
-                                filter_ran = true;
-                                auto start = steady_clock::now();
-                                {
-                                    CurrentFilter current { cur_filter_, counters };
-                                    filter->run(access);
-                                }
-                                counters->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
-                                ++counters->ran;
-                                ++num_filters_run;
-                                ++filters_run_last_pass_;
+                            filter_ran = true;
+                            auto start = steady_clock::now();
+                            {
+                                CurrentFilter current { cur_filter_, counters };
+                                filter->run(access);
                             }
+                            counters->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
+                            ++counters->ran;
+                            ++num_filters_run;
+                            ++filters_run_last_pass_;
 
                             delete access;
                         }
@@ -1097,13 +1185,36 @@ class SeqDB {
          */
         size_t entries_examined() const { return entries_examined_; }
 
+        /** @brief Return how many entries' values the filter scan has fetched
+         * in total (only entries some filter ran on, or was about to run on
+         * when the pass stopped, have their values fetched) */
+        size_t scan_values_fetched() const { return scan_values_fetched_; }
+
+        /** @brief Return how many requests the filter scan has made for values */
+        size_t scan_value_requests() const { return scan_value_requests_; }
+
         /** @brief Default number of keys the scan fetches per request */
         static constexpr size_t DEFAULT_SCAN_BLOCK_KEYS = 4096;
 
+        /** @brief Values are fetched only for entries a filter will run on
+         * (see ScanLookahead), and each such reply stops growing past about
+         * this many bytes, so databases with large values (e.g. whole blocks
+         * of a blockchain) do not get huge replies; the rest is fetched with
+         * the next request */
+        static constexpr size_t SCAN_BLOCK_BYTES = 16u << 20;
+
+        /** @brief should_run is asked about this many entries of a block at a
+         * time, before any of them run, so the values those entries need can
+         * be fetched with one request. Asking ahead does work for entries a
+         * pass that stops early will not reach (they are asked again next
+         * pass), so this bounds that waste. */
+        static constexpr size_t SCAN_LOOKAHEAD_ENTRIES = 256;
+
         /** @brief Set how many keys the filter scan fetches from the map per
-         * request. Larger blocks mean fewer requests; each block's entries are
-         * held in memory while it is scanned (its reply is capped at about
-         * SCAN_BLOCK_BYTES whatever the block size). */
+         * request. Larger blocks mean fewer requests; each block's keys and
+         * tags are held in memory while it is scanned. Values are not part of
+         * the block: they are fetched only for the entries a filter runs on,
+         * in replies capped at about SCAN_BLOCK_BYTES. */
         void set_scan_block_keys(size_t n) {
             if (n == 0) throw invalid_argument("scan_block_keys must be at least 1");
             scan_block_keys_ = n;

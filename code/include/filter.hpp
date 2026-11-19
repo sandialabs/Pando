@@ -40,7 +40,11 @@ typedef struct DBAccess {
     fn add_tag;
     fn remove_tag;
     const char* const* tags;
-    /** NOTE: for the edge accesses of a GROUP_ENTRIES filter
+    /** NOTE: should_run is given nullptr here: the scan reads only tags
+     * until a filter is known to run on an entry, so that entries no filter
+     * runs on never have their values copied. Decide from the tags (and key)
+     * alone; run gets the value.
+     * NOTE: for the edge accesses of a GROUP_ENTRIES filter
      * (group->entry.out[i].acc) this is nullptr: edge values are not loaded,
      * to avoid copying the whole DB into memory. Use get_entry_by_key with
      * the edge's key to read an edge's value. */
