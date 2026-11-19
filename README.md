@@ -120,7 +120,7 @@ To build a new filter, the easiest way is to use another filter as a template an
 
 ### should_run
 
-This tells Pando whether a filter should run on a specific entry or not. Typically, we will use this function to check for the presence of tags and return a value based on these tags.
+This tells Pando whether a filter should run on a specific entry or not. Typically, we will use this function to check for the presence of tags and return a value based on these tags. `should_run` sees only the entry's key and tags: its value is `NULL` (`access->value`), since Pando does not fetch an entry's value until some filter is going to run on it. Use the value in the run function instead.
 
 ### run function
 

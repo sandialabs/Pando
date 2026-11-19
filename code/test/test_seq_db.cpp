@@ -2136,6 +2136,154 @@ TEST(scan_in_blocks_continuous_processing_off) {
     TEST_PASS
 }
 
+// A filter that never runs, and counts the times should_run was given a value
+static size_t g_TEST_tags_only_saw_value;
+bool g_TEST_tags_only_should_run(const DBAccess* acc) {
+    if (acc->value != nullptr) ++g_TEST_tags_only_saw_value;
+    return false;
+}
+void g_TEST_tags_only_run([[maybe_unused]] void* access) { }
+
+// should_run sees only tags: values are fetched only for the entries a filter
+// runs on, in a few requests (one per window of SCAN_LOOKAHEAD_ENTRIES
+// entries), and once per entry however many filters run on it
+TEST(scan_fetches_values_only_for_running_entries) {
+    FilterInterface a { filter_name: "TEST_block", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_block_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_block_run };
+    FilterInterface a2 { filter_name: "TEST_block_2", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_block_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_block_run };
+    FilterInterface tags_only { filter_name: "TEST_tags_only", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_tags_only_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_tags_only_run };
+    const size_t n = 1000;
+    size_t eligible = 0;
+    auto fill = [&](SeqDB& d) {
+        eligible = 0;
+        for (size_t k = 0; k < n; ++k) {
+            DBEntry<> e;
+            e.set_key({30, (vtx_t)k, 0});
+            e.add_tag(k % 10 == 0 ? "A" : "B");
+            e.value() = "v" + to_string(k);
+            if (k % 10 == 0) ++eligible;
+            d.add_entry(move(e));
+        }
+    };
+
+    // One filter that runs on a tenth of the entries, one that never runs
+    {
+        g_TEST_block_runs = g_TEST_block_bad_values = g_TEST_tags_only_saw_value = 0;
+        SeqDB d;
+        fill(d);
+        d.install_filter(make_shared<Filter>(&a));
+        d.install_filter(make_shared<Filter>(&tags_only));
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+        EQ(g_TEST_tags_only_saw_value, 0);
+        // The second pass ran nothing and fetched nothing
+        EQ(d.entries_examined(), 2*n);
+        EQ(d.scan_values_fetched(), eligible);
+        // One request per window (each window of a lap holds eligible entries)
+        size_t windows = (n + SeqDB::SCAN_LOOKAHEAD_ENTRIES - 1) / SeqDB::SCAN_LOOKAHEAD_ENTRIES;
+        EQ(d.scan_value_requests(), windows);
+        // Every entry was still checked by every filter, in each pass
+        EQ(d.stats().filter("TEST_tags_only", PASS_SINGLE).total().checked, 2*n);
+        EQ(d.stats().filter("TEST_block", PASS_SINGLE).total().checked, 2*n);
+    }
+    // Two filters running on the same entries: each value is fetched once
+    {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        fill(d);
+        d.install_filter(make_shared<Filter>(&a));
+        d.install_filter(make_shared<Filter>(&a2));
+        d.process();
+        EQ(g_TEST_block_runs, 2*eligible);
+        EQ(g_TEST_block_bad_values, 0);
+        EQ(d.scan_values_fetched(), eligible);
+    }
+    // Nothing eligible: a full lap fetches no values at all
+    {
+        g_TEST_tags_only_saw_value = 0;
+        SeqDB d;
+        fill(d);
+        d.install_filter(make_shared<Filter>(&tags_only));
+        d.process();
+        EQ(d.entries_examined(), n);
+        EQ(d.scan_values_fetched(), 0);
+        EQ(d.scan_value_requests(), 0);
+        EQ(g_TEST_tags_only_saw_value, 0);
+    }
+
+    TEST_PASS
+}
+
+// Filter for the large value test: runs once on entries tagged "L" and checks
+// that it is given the whole value stored for its key
+static size_t g_TEST_large_runs, g_TEST_large_bad_values;
+static const size_t g_TEST_large_value_bytes = 1u << 20;
+static string g_TEST_large_value(vtx_t k) {
+    string v = to_string(k) + ":";
+    v.resize(g_TEST_large_value_bytes, (char)('a' + k % 26));
+    return v;
+}
+bool g_TEST_large_should_run(const DBAccess* acc) {
+    bool found = false;
+    for (auto tags = acc->tags; *tags[0] != '\0'; ++tags) {
+        if (string(*tags) == "L:done") return false;
+        if (string(*tags) == "L") found = true;
+    }
+    return found;
+}
+void g_TEST_large_run(void* access) {
+    const DBAccess* acc = (const DBAccess*)access;
+    ++g_TEST_large_runs;
+    if (acc->value == nullptr || string(acc->value) != g_TEST_large_value(acc->key.b)) ++g_TEST_large_bad_values;
+    acc->add_tag.run(&acc->add_tag, "L:done");
+}
+
+// Values too large for one reply (SCAN_BLOCK_BYTES) are fetched over several
+// requests within a window, each entry still getting its own whole value,
+// also when the filter limit stops passes part way through a fetch
+TEST(scan_value_fetch_split_by_bytes) {
+    FilterInterface f { filter_name: "TEST_large", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_large_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_large_run };
+    const size_t n = 40;    // 40 MiB of values: several replies' worth
+    auto fill = [&](SeqDB& d) {
+        for (size_t k = 0; k < n; ++k) {
+            DBEntry<> e;
+            e.set_key({31, (vtx_t)k, 0});
+            e.add_tag("L");
+            e.value() = g_TEST_large_value(k);
+            d.add_entry(move(e));
+        }
+        d.install_filter(make_shared<Filter>(&f));
+    };
+    size_t min_requests = (n * g_TEST_large_value_bytes) / SeqDB::SCAN_BLOCK_BYTES;
+
+    {
+        g_TEST_large_runs = g_TEST_large_bad_values = 0;
+        SeqDB d;
+        fill(d);
+        d.process();
+        EQ(g_TEST_large_runs, n);
+        EQ(g_TEST_large_bad_values, 0);
+        EQ(d.scan_values_fetched(), n);
+        EQ(d.scan_value_requests() >= min_requests, true);
+        EQ(d.scan_value_requests() < n, true);
+    }
+    {
+        g_TEST_large_runs = g_TEST_large_bad_values = 0;
+        SeqDB d;
+        fill(d);
+        d.set_max_filters_per_stage(3);
+        d.process();
+        EQ(g_TEST_large_runs, n);
+        EQ(g_TEST_large_bad_values, 0);
+    }
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -2196,6 +2344,8 @@ TESTS_BEGIN
     RUN_TEST(continuous_processing_off_offers_each_entry_once)
     RUN_TEST(continuous_processing_off_with_memory_stops)
     RUN_TEST(scan_in_blocks_continuous_processing_off)
+    RUN_TEST(scan_fetches_values_only_for_running_entries)
+    RUN_TEST(scan_value_fetch_split_by_bytes)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END
