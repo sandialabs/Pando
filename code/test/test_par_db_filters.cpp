@@ -1309,7 +1309,8 @@ static int run_mixed_writes(const string& build_dir, size_t batch_bytes, size_t 
     size_t done = 0, made = 0, released = 0, updated = 0;
     for (auto & entry : entries) {
         dbkey_t k = entry.get_key();
-        vector<string> tags(entry.tags().begin(), entry.tags().end());
+        auto tag_set = entry.tags();    // a copy: take begin() and end() from the same one
+        vector<string> tags(tag_set.begin(), tag_set.end());
         sort(tags.begin(), tags.end());
         string value = entry.value();
         if (k == dbkey_t{52, 0, 0}) {
@@ -1464,7 +1465,8 @@ static int run_edge_writes(const string& build_dir, size_t batch_bytes,
     size_t checked = 0;
     for (auto & entry : entries) {
         dbkey_t k = entry.get_key();
-        vector<string> tags(entry.tags().begin(), entry.tags().end());
+        auto tag_set = entry.tags();    // a copy: take begin() and end() from the same one
+        vector<string> tags(tag_set.begin(), tag_set.end());
         sort(tags.begin(), tags.end());
         string tag_list;
         for (auto & t : tags) tag_list += t + ",";

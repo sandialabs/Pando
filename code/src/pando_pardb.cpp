@@ -57,7 +57,7 @@ int main_(int argc, char **argv) {
         cerr << "Usage: pando_pardb bind-addr [seed-addr] [-M<mem in GB>] [--skip-group-filters] [--max-filters-per-stage=N]\n"
             "                   [--write-batch-bytes=N] [--scan-block-keys=N] [--continuous-processing=on|off]\n"
             "                   [--mem-limit-pct=P] [--mem-pass-budget-mb=N] [--mem-budget-fraction=F]\n"
-            "                   [--agents-per-node=N]\n"
+            "                   [--agents-per-node=N] [--intern-tags=on|off]\n"
             "\n"
             "Parameters:\n"
             "  bind-addr : the address to bind this specific DB agent to\n"
@@ -79,6 +79,10 @@ int main_(int argc, char **argv) {
             "                          entries created or made eligible during it are left for\n"
             "                          the next request. Use off only if no filter's writes can\n"
             "                          make an entry eligible for a filter in the same request.\n"
+            "  --intern-tags=on|off : store each distinct tag once per process and have entries\n"
+            "                          refer to it by id (default on). Turn off only if entries\n"
+            "                          get unique tags, which would make the tag table grow\n"
+            "                          with every entry.\n"
             "\n"
             "Memory limits:\n"
             "  Filter output is held in memory until the stage closes. A processing pass ends\n"
@@ -121,6 +125,8 @@ int main_(int argc, char **argv) {
     const string mem_limit_flag = "--mem-limit-pct=";
     const string mem_budget_flag = "--mem-pass-budget-mb=";
     const string mem_fraction_flag = "--mem-budget-fraction=";
+    bool intern_tags = true;
+    const string intern_flag = "--intern-tags=";
     const string agents_flag = "--agents-per-node=";
     auto flag_val = [](const string& arg, const string& flag) -> const char* {
         return arg.rfind(flag, 0) == 0 ? arg.c_str() + flag.size() : nullptr;
@@ -163,6 +169,10 @@ int main_(int argc, char **argv) {
         } else if ((val = flag_val(arg, agents_flag))) {
             if (!parse_positive_u64(val, n)) return bad(agents_flag, val, "a positive integer");
             mem_policy.agents_per_node = n;
+        } else if ((val = flag_val(arg, intern_flag))) {
+            if (string(val) == "on") intern_tags = true;
+            else if (string(val) == "off") intern_tags = false;
+            else return bad(intern_flag, val, "on or off");
         } else if (arg.rfind("--", 0) == 0) {
             cerr << "[Pando] [ERROR] unknown option '" << arg << "'" << endl;
             return 1;
@@ -176,7 +186,8 @@ int main_(int argc, char **argv) {
          << " max_filters_per_stage=" << (max_filters_per_stage ? to_string(max_filters_per_stage) : string("unlimited"))
          << " write_batch_bytes=" << (write_batch_bytes ? to_string(write_batch_bytes) : string("off"))
          << " scan_block_keys=" << (scan_block_keys ? to_string(scan_block_keys) : string("default"))
-         << " continuous_processing=" << (continuous_processing ? "on" : "off") << endl;
+         << " continuous_processing=" << (continuous_processing ? "on" : "off")
+         << " intern_tags=" << (intern_tags ? "on" : "off") << endl;
     if (mem_policy.enabled()) {
         cerr << "[Pando] [DEBUG] Memory limits: limit_pct=" << (mem_policy.limit_pct > 0 ? to_string(mem_policy.limit_pct) : string("off"))
              << " pass_budget_bytes=" << (mem_policy.pass_budget_bytes ? to_string(mem_policy.pass_budget_bytes) : string("off"))
@@ -185,6 +196,8 @@ int main_(int argc, char **argv) {
     } else {
         cerr << "[Pando] [DEBUG] Memory limits: off" << endl;
     }
+    // Process-wide, and must be set before any entry is created
+    TagTable::set_interning(intern_tags);
     ParDBOptions opts;
     opts.skip_group_filters = skip_group_filters;
     opts.max_filters_per_stage = max_filters_per_stage;

@@ -686,9 +686,9 @@ class SeqDB {
 
             // Index the tags after merging, so tags the merge added (MERGED,
             // MERGED_SUM, MERGED_SUM_FAILED) are indexed too
-            for (auto &tag : entry->tags()) {
+            entry->tag_store().for_each([&](const string& tag) {
                 add_to_tag_index_(key, tag);
-            }
+            });
         }
 
         /** @brief Add a specific DB entry */
@@ -804,8 +804,8 @@ class SeqDB {
 
             DBEntry<> new_entry;
             new_entry.set_key(e1->get_key());
-            for (auto &tag : e1->tags()) new_entry.add_tag(tag);
-            for (auto &tag : e2->tags()) new_entry.add_tag(tag);
+            new_entry.copy_tags_from(*e1);
+            e2->tag_store().for_each([&](const string& tag) { new_entry.add_tag(tag); });
             new_entry.add_tag(MERGED_SUM);
 
             __int128 isum = 0;
@@ -828,20 +828,12 @@ class SeqDB {
             dbkey_t new_key = e1->get_key();
             new_entry.set_key(new_key);
 
-            vector<string> tag_union;
-            if (force_merge) {
-                // if we are force merging, assume they have the same tags TODO is this okay? It might be an optimization
-                auto & e1_tags = e1->tags();
-                tag_union.assign(e1_tags.begin(), e1_tags.end());
-            } else {
-                auto e1_tags = e1->tags();
-                auto e2_tags = e2->tags();
-                set_union(e1_tags.begin(), e1_tags.end(), e2_tags.begin(), e2_tags.end(), inserter(tag_union, tag_union.begin()));
-            }
-            tag_union.push_back("MERGED");
-            for (auto &tag : tag_union) {
-                new_entry.add_tag(tag);
-            }
+            // The union of both entries' tags (with force_merge, assume they
+            // have the same tags and take e1's), plus MERGED
+            new_entry.copy_tags_from(*e1);
+            if (!force_merge)
+                e2->tag_store().for_each([&](const string& tag) { new_entry.add_tag(tag); });
+            new_entry.add_tag("MERGED");
 
             return new_entry;
         }
