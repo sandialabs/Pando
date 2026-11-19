@@ -1635,12 +1635,107 @@ class SeqDB {
             serialize_entries(data_ptr, keys);
         }
 
+        /** @brief Walk one serialized DBEntry occupying exactly [p, p + size)
+         *
+         * Calls f(string_view) for each tag. Checks every length against the
+         * bounds, so it is safe on untrusted data.
+         *
+         * @return false if the bytes are not exactly one well-formed entry
+         */
+        template<typename F>
+        static bool walk_serialized_entry_(const char* p, size_t size, F&& f) {
+            const char* end = p + size;
+            auto read_len = [&](size_t& len) {
+                if ((size_t)(end - p) < sizeof(size_t)) return false;
+                len = *(const size_t*)p; p += sizeof(size_t);
+                return true;
+            };
+
+            if (size < sizeof(dbkey_t)) return false;
+            p += sizeof(dbkey_t);
+
+            size_t val_size;
+            if (!read_len(val_size) || (size_t)(end - p) < val_size) return false;
+            p += val_size;
+
+            size_t ntags;
+            if (!read_len(ntags)) return false;
+            for (; ntags > 0; --ntags) {
+                size_t tag_size;
+                if (!read_len(tag_size) || (size_t)(end - p) < tag_size) return false;
+                f(string_view {p, tag_size});
+                p += tag_size;
+            }
+            return p == end;
+        }
+
+        /** @brief Import entries from a file written by export_db
+         *
+         * Entries are inserted by the PandoMap straight from the mapped file
+         * (see PandoMapClient::insert_from_buffer), so each value is copied
+         * only once. Entries whose key already exists (or repeats within the
+         * file), or that have no key, go through add_entry as before, so they
+         * are merged the same way.
+         *
+         * The new entries skip the virtual add_entry: an override of it is
+         * not called for them.
+         */
         void import_db(string import_fn) {
             pigo::ROFile in_f {import_fn};
-            const char* data_ptr = in_f.fp();
+            const char* ser = in_f.fp();
+            const char* end = ser + in_f.size();
 
-            deserialize_and_add_entries(data_ptr);
+            auto bad_file = [&](const string& why) {
+                return runtime_error("import_db: " + import_fn + " is malformed (" + why + ")");
+            };
 
+            if ((size_t)(end - ser) < sizeof(size_t)) throw bad_file("no entry count");
+            size_t num_entries = *(const size_t*)ser; ser += sizeof(size_t);
+            // Each entry takes at least its size prefix, so this bounds the
+            // reserve below against a garbage count
+            if (num_entries > (size_t)(end - ser) / sizeof(size_t)) throw bad_file("entry count too large");
+
+            // Check every entry before the map reads any of them
+            vector<const char*> entries;
+            entries.reserve(num_entries);
+            for (size_t i = 0; i < num_entries; ++i) {
+                if ((size_t)(end - ser) < sizeof(size_t)) throw bad_file("truncated entry size");
+                size_t entry_size = *(const size_t*)ser; ser += sizeof(size_t);
+                if ((size_t)(end - ser) < entry_size ||
+                        !walk_serialized_entry_(ser, entry_size, [](string_view) {}))
+                    throw bad_file("bad entry " + to_string(i));
+                entries.push_back(ser);
+                ser += entry_size;
+            }
+
+            if (entries.empty()) return;
+
+            vector<size_t> skipped = db_.insert_from_buffer(entries.data(), entries.size());
+
+            // In file order, so repeated keys merge in the same order as
+            // adding the entries one at a time would
+            size_t next_skipped = 0;
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const char* p = entries[i];
+                if (next_skipped < skipped.size() && skipped[next_skipped] == i) {
+                    ++next_skipped;
+                    DBEntry<> e(p);
+                    add_entry(move(e));
+                    continue;
+                }
+
+                // Inserted by the map: do the rest of what prepare_to_add_entry
+                // does for a new key
+                dbkey_t key = *(const dbkey_t*)p;
+                handle_subscriptions(key);
+                size_t entry_size = *(const size_t*)(p - sizeof(size_t));
+                walk_serialized_entry_(p, entry_size, [&](string_view tag) {
+                    auto it = entries_by_tag_.find(tag);
+                    if (it == entries_by_tag_.end())
+                        it = entries_by_tag_.emplace(string{tag}, set<dbkey_t>{}).first;
+                    it->second.insert(key);
+                });
+            }
         }
 
         void deserialize_and_add_entries(const char* ser) {

@@ -102,6 +102,38 @@ class PandoMapClient : public ZMQRequester {
             wait_ack();
         }
 
+        /** @brief Have the PandoMap insert n serialized entries straight from
+         * this process's memory (see PandoMap::recv_map_insert_from_buffer)
+         *
+         * @param entries n pointers, each to a well-formed serialized DBEntry;
+         *        the array and the entries must stay valid until this returns
+         * @return indices (increasing) of the entries that were not inserted
+         *         because their key is INITIAL_KEY or already exists
+         */
+        vector<size_t> insert_from_buffer(const char* const* entries, size_t n) {
+            size_t msg_size = sizeof(msg_type_t) + sizeof(entries) + sizeof(size_t);
+            char msg[msg_size];
+            char* msg_ptr = msg;
+
+            pack_msg(msg_ptr, MAP_INSERT_FROM_BUFFER);
+            pack_single(msg_ptr, entries);
+            pack_single(msg_ptr, n);
+
+            send(msg, msg_size);
+
+            ZMQMessage resp = read();
+            const char* resp_data = resp.data();
+            if (resp.size() < sizeof(size_t)) throw runtime_error("insert from buffer: reply too short");
+            size_t count;
+            unpack_single(resp_data, count);
+            if (count > n || resp.size() != sizeof(size_t) + count*sizeof(size_t))
+                throw runtime_error("insert from buffer: malformed reply");
+
+            vector<size_t> skipped(count);
+            if (count) memcpy(skipped.data(), resp_data, count*sizeof(size_t));
+            return skipped;
+        }
+
         tuple<DBEntry<>, bool> retrieve_if_exists(dbkey_t key) {
             // Serialize the key and tag
             size_t msg_size = sizeof(msg_type_t)+sizeof(dbkey_t);

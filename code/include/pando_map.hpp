@@ -75,6 +75,49 @@ class PandoMap : public PandoParticipant {
 
         }
 
+        /** @brief Insert serialized entries read directly from the sender's memory
+         *
+         * The message holds a pointer to an array of n pointers, each to one
+         * serialized DBEntry, rather than the entries themselves, so large
+         * values are copied once (from the sender's buffer into the map)
+         * instead of through a socket. This only works because the PandoMap
+         * runs on a thread in the same process as its SeqDB. The sender must
+         * keep the array and the entries alive, and must have checked that
+         * every entry is well formed, until this replies.
+         *
+         * Entries whose key is INITIAL_KEY or already in the map are not
+         * inserted (they need merging or a new key, which the SeqDB does).
+         * The reply is <size_t count> followed by count size_t indices of
+         * those entries, in increasing order.
+         */
+        void recv_map_insert_from_buffer(zmq_socket_t sock, const char* data, const char* end) {
+            if ((size_t)(end - data) != sizeof(const char* const*) + sizeof(size_t))
+                throw runtime_error("insert from buffer: bad request");
+            const char* const* entries;
+            size_t n;
+            unpack_single(data, entries);
+            unpack_single(data, n);
+
+            vector<size_t> skipped;
+            for (size_t i = 0; i < n; ++i) {
+                const char* p = entries[i];
+                dbkey_t key = *(const dbkey_t*)p;
+                if (key == INITIAL_KEY || map_.contains(key)) {
+                    skipped.push_back(i);
+                    continue;
+                }
+                map_.emplace(key, DBEntry<Alloc>{alloc_, p});
+            }
+
+            size_t msg_size = sizeof(size_t) + skipped.size()*sizeof(size_t);
+            unique_ptr<char[]> msg(new char[msg_size]);
+            char* msg_ptr = msg.get();
+            pack_single(msg_ptr, skipped.size());
+            if (!skipped.empty()) memcpy(msg_ptr, skipped.data(), skipped.size()*sizeof(size_t));
+
+            ZMQChatterbox::send(sock, msg.get(), msg_size);
+        }
+
         void recv_map_retrieve(zmq_socket_t sock, const char* data, [[maybe_unused]] const char* end) {
             dbkey_t key;
             unpack_single(data, key);
@@ -337,6 +380,8 @@ class PandoMap : public PandoParticipant {
                 recv_map_insert(sock, data, end);
             else if (type == MAP_INSERT_MULTIPLE)
                 recv_map_insert_multiple(sock, data, end);
+            else if (type == MAP_INSERT_FROM_BUFFER)
+                recv_map_insert_from_buffer(sock, data, end);
             else if (type == MAP_RETRIEVE)
                 recv_map_retrieve(sock, data, end);
             else if (type == MAP_RETRIEVE_IF_EXISTS)
