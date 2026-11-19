@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_set>
+#include <string_view>
 #include <string>
 #include <cstdarg>
 
@@ -9,12 +10,18 @@
 #include "types.h"
 #include "filter.hpp"
 #include "dbkey.h"
+#include "tag_table.hpp"
 
 using namespace std;
 
 namespace pando {
 
-/** @brief Hold the database entries */
+/** @brief Hold the database entries
+ *
+ * Tags are kept in a TagStore: by default as ids into the process's
+ * TagTable (see tag_table.hpp), so entries with the same tags share one copy
+ * of each tag string.
+ */
 template<typename Alloc=allocator<char>>
 class DBEntry {
     private:
@@ -26,71 +33,52 @@ class DBEntry {
         Alloc& alloc_;
 
         /** @brief Hold the tags for the entry */
-        unordered_set<string> tags_;
+        TagStore tags_;
 
-        /** @brief Hold the tags again as a c-string array */
-        const char** c_tags_;
+        /** @brief The tags as a C-string array ending in "", built when first
+         * asked for (c_tags()) and dropped whenever the tags change */
+        mutable const char** c_tags_ = nullptr;
 
         /** @brief Holds the value for the entry */
         Str value_;
 
-        /** @brief Holds a special empty string for terminating tag lists */
-        const string empty_string_;
-
         /** @brief Holds the key for the entry */
         dbkey_t key_;
 
-        /** @brief Update the internal c_tags
-         *
-         * @param f if true, delete but do not re-create tags
-         */
-        void update_c_tags_(bool f=false) {
-            // First, delete all prior c_tags
-            if (c_tags_ != nullptr) {
-                // Do not worry about freeing any internal strings, those are
-                // handled by tags_
-                // Remove the full tags container
-                delete [] c_tags_;
-                c_tags_ = nullptr;
-            }
-            if (f) return;
+        /** @brief False once the entry has been moved from or destroyed */
+        bool valid_ = true;
 
-            // Second, allocate new tags
-            size_t num_tags = tags_.size();
-            // Allocate space for the number of tags + 1
-            c_tags_ = new const char*[num_tags+1];
-            c_tags_[num_tags] = empty_string_.c_str();
-
-            // Assign the c strings for each tag
-            size_t tag_ctr = 0;
-            for (const string & tag : tags_)
-                    c_tags_[tag_ctr++] = tag.c_str();
+        void check_valid_() const {
+            if (!valid_) throw runtime_error("Invalid DBEntry");
         }
 
+        /** @brief Drop the C tags (they are rebuilt when next asked for) */
+        void drop_c_tags_() const {
+            delete [] c_tags_;
+            c_tags_ = nullptr;
+        }
 
     public:
         /** @brief Construct a DB entry from C tags and values */
         DBEntry(Alloc& alloc, const char* const* tags, const char* value) :
-                alloc_(alloc), c_tags_(nullptr), value_(alloc_), key_(INITIAL_KEY) {
+                alloc_(alloc), value_(alloc_), key_(INITIAL_KEY) {
             clear();
             while (*tags[0] != '\0')
                 tags_.insert(*tags++);
             value_.assign(value);
-            update_c_tags_();
         }
         DBEntry(const char* const* tags, const char* value) : DBEntry(def_alloc_, tags, value) { }
 
         /** @brief Construct a DB entry from C tags, value, and key */
         DBEntry(Alloc& alloc, const char* const* tags, const char* value, dbkey_t key) :
-                alloc_(alloc), c_tags_(nullptr), value_(alloc_), key_(key) {
+                alloc_(alloc), value_(alloc_), key_(key) {
             while (*tags[0] != '\0')
                 tags_.insert(*tags++);
             value_.assign(value);
-            update_c_tags_();
         }
         DBEntry(const char* const* tags, const char* value, dbkey_t key) : DBEntry(def_alloc_, tags, value, key) { }
 
-        DBEntry(Alloc& alloc) : alloc_(alloc), c_tags_(nullptr), value_(alloc_), key_(INITIAL_KEY) { clear(); };
+        DBEntry(Alloc& alloc) : alloc_(alloc), value_(alloc_), key_(INITIAL_KEY) { clear(); };
         DBEntry() : DBEntry(def_alloc_) { }
 
         ~DBEntry() { clear(true); }
@@ -99,18 +87,13 @@ class DBEntry {
         DBEntry(DBEntry&& other) noexcept :
                 alloc_(other.alloc_),
                 tags_(move(other.tags_)),
-                c_tags_(other.c_tags_),
                 value_(alloc_),
                 key_(move(other.key_)) {
             value_ = Str{alloc_};
             value_.assign(other.value_);        // FIXME can we avoid copying?
 
             // Invalidate the other
-            other.c_tags_ = nullptr;
             other.clear(true);
-
-            // Fix C tags if necessary
-            update_c_tags_();
         }
         /** @brief Move a DB entry */
         DBEntry& operator=(DBEntry&& other) noexcept {
@@ -120,15 +103,12 @@ class DBEntry {
 
                 alloc_ = move(other.alloc_);
                 tags_ = move(other.tags_);
-                c_tags_ = other.c_tags_;
                 value_ = Str{alloc_};
                 value_.assign(other.value_);        // FIXME can we avoid copying?
                 key_ = move(other.key_);
+                valid_ = true;
 
-                other.c_tags_ = nullptr;
                 other.clear(true);
-
-                update_c_tags_();
             }
 
             return *this;
@@ -138,12 +118,8 @@ class DBEntry {
         DBEntry(const DBEntry& other) :
                 alloc_(other.alloc_),
                 tags_(other.tags_),
-                c_tags_(nullptr),
                 value_(other.value_),
-                key_(INITIAL_KEY) {
-            // Build the C tags
-            update_c_tags_();
-        }
+                key_(INITIAL_KEY) { }
         /** @brief Copy a DB entry */
         DBEntry& operator=(const DBEntry& other) {
             if (&other != this) {
@@ -152,9 +128,8 @@ class DBEntry {
                 value_ = other.value_;
 
                 key_ = INITIAL_KEY;
-
-                // Build the C tags
-                update_c_tags_();
+                valid_ = true;
+                drop_c_tags_();
             }
 
             return *this;
@@ -164,7 +139,7 @@ class DBEntry {
         bool operator!=(const DBEntry& other) {
             if (other.get_key() != get_key())
                 return true;
-            if (other.tags() != tags())
+            if (!other.tags_.equals(tags_))
                 return true;
             if (other.value() != value())
                 return true;
@@ -199,11 +174,9 @@ class DBEntry {
             ser_size += value_size;
 
             ser_size += sizeof(size_t);
-            for (const string& tag : tags_) {
-                ser_size += sizeof(size_t);
-                size_t tag_size = tag.size();
-                ser_size += tag_size;
-            }
+            tags_.for_each([&](const string& tag) {
+                ser_size += sizeof(size_t) + tag.size();
+            });
 
             return ser_size;
         }
@@ -223,16 +196,16 @@ class DBEntry {
             memcpy(ser_ptr, value_.c_str(), value_size); ser_ptr += value_size;
 
             *(size_t*)ser_ptr = tags_.size(); ser_ptr += sizeof(size_t);
-            for (const string& tag : tags_) {
+            tags_.for_each([&](const string& tag) {
                 size_t tag_size = tag.size();
                 *(size_t*)ser_ptr = tag_size; ser_ptr += sizeof(size_t);
                 memcpy(ser_ptr, tag.c_str(), tag_size); ser_ptr += tag_size;
-            }
+            });
         }
 
         /** @brief Initialize from serialized data */
         DBEntry(Alloc& alloc, const char*& ser) :
-                alloc_(alloc), c_tags_(nullptr), value_(alloc), key_(INITIAL_KEY) {
+                alloc_(alloc), value_(alloc), key_(INITIAL_KEY) {
             clear();
 
             // Copy out the key
@@ -244,13 +217,9 @@ class DBEntry {
 
             size_t ntags = *(const size_t*)ser; ser += sizeof(size_t);
             for (; ntags > 0; --ntags) {
-                string tag;
                 size_t tag_size = *(const size_t*)ser; ser += sizeof(size_t);
-                tag.assign(ser, ser+tag_size); ser += tag_size;
-                tags_.insert(tag);
+                tags_.insert(string_view {ser, tag_size}); ser += tag_size;
             }
-
-            update_c_tags_();
         }
         DBEntry(const char*& ser) : DBEntry(def_alloc_, ser) { }
 
@@ -259,18 +228,17 @@ class DBEntry {
          * This resets the tags and values, returning the entry to an original
          * state
          *
-         * This will also set the key to a new, random key
-         *
-         * @param f if true, remove all memory from the c_tags_, invaliding it
+         * @param f if true, also reset the key and mark the entry invalid (as
+         * after a move or when destroyed)
          */
         DBEntry& clear(bool f=false) {
             tags_.clear();
             value_.assign("");
+            drop_c_tags_();
 
             if (f)
                 key_ = INITIAL_KEY;
-
-            update_c_tags_(f);
+            valid_ = !f;
             return *this;
         }
 
@@ -284,9 +252,9 @@ class DBEntry {
 
         /** @brief Add a (potentially) new tag */
         DBEntry& add_tag(string tag) {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
+            check_valid_();
             tags_.insert(tag);
-            update_c_tags_();
+            drop_c_tags_();
             return *this;
         }
 
@@ -300,7 +268,7 @@ class DBEntry {
         /** @brief Remove a tag */
         DBEntry& remove_tag(string tag) {
             tags_.erase(tag);
-            update_c_tags_();
+            drop_c_tags_();
             return *this;
         }
 
@@ -313,46 +281,67 @@ class DBEntry {
 
         /** @brief Add more to the value string */
         DBEntry& add_to_value(const string& more) {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
+            check_valid_();
             value_ += more + '\n';
             return *this;
         }
 
         /** @brief Return the number of tags */
         size_t tag_size() const {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
+            check_valid_();
             return tags_.size();
         }
 
         /** @brief Check whether a tag exists */
         bool has_tag(string check) const {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
-            return tags_.count(check) > 0;
+            check_valid_();
+            return tags_.contains(check);
         }
 
         /** @brief Return the C-style tags
          *
-         * This contains a C-string for each tag, followed by an empty C-string
+         * This contains a C-string for each tag, followed by an empty C-string.
+         * It stays valid until the entry's tags change or the entry goes away.
          */
         const char* const* c_tags() const {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
+            check_valid_();
+            if (c_tags_ == nullptr) {
+                size_t n = tags_.size();
+                const char** arr = new const char*[n+1];
+                size_t i = 0;
+                tags_.for_each([&](const string& tag) { arr[i++] = tag.c_str(); });
+                arr[n] = "";
+                c_tags_ = arr;
+            }
             return c_tags_;
         }
 
-        /** @brief Return the tags */
-        const unordered_set<string> & tags() const {return tags_;}
+        /** @brief Return the tags (a copy, as a set of strings) */
+        unordered_set<string> tags() const { return tags_.to_set(); }
 
-        /** @brief Return whether C-tags is valid */
-        bool valid_c_tags() const { return c_tags_ != nullptr; }
+        /** @brief The tags as stored */
+        const TagStore& tag_store() const { return tags_; }
+
+        /** @brief Replace this entry's tags with another entry's (of any
+         * allocator), without going through strings when both are interned */
+        template<typename OAlloc>
+        DBEntry& copy_tags_from(const DBEntry<OAlloc>& other) {
+            tags_ = other.tag_store();
+            drop_c_tags_();
+            return *this;
+        }
+
+        /** @brief Return whether the entry is valid (not moved from or destroyed) */
+        bool valid_c_tags() const { return valid_; }
 
         /** @brief Return the value as a const string ref */
         const Str& value() const {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
+            check_valid_();
             return value_;
         }
         /** @brief Return a mutable value */
         Str& value() {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
+            check_valid_();
             return value_;
         }
 
@@ -363,7 +352,7 @@ class DBEntry {
 
         /** @brief Return access function pointers to this entry */
         DBAccess* access() {
-            if (c_tags_ == nullptr) throw runtime_error("Invalid DBEntry");
+            check_valid_();
             DBAccess* ret = new DBAccess;
 
             // Set the value, c_tags, and key
@@ -401,8 +390,7 @@ ostream &operator<<(ostream &os, DBEntry<Alloc> const &entry) {
     else
         os << entry.key_ << endl;
     os << "TAGS:" << endl;
-    for (auto & t : entry.tags_)
-        os << t << endl;
+    entry.tags_.for_each([&](const string& t) { os << t << endl; });
     os << "VALUE:" << endl;
     os << entry.value();
     return os;

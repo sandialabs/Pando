@@ -46,6 +46,7 @@ extern "C" {
 static void s_SeqDB_new_entry(const fn* s_this, ...);
 static void s_SeqDB_get_entry_by_tags(const fn* s_this, ...);
 static void s_SeqDB_get_entry_by_key(const fn* s_this, ...);
+static void s_SeqDB_get_entries_by_keys(const fn* s_this, ...);
 static void s_SeqDB_get_entries_by_tags(const fn* s_this, ...);
 static void s_SeqDB_add_tag(const fn* s_this, ...);
 static void s_SeqDB_remove_tag(const fn* s_this, ...);
@@ -214,6 +215,16 @@ class SeqDB {
         /** @brief Total entries offered to the filters (for tests/diagnostics) */
         size_t entries_examined_ = 0;
 
+        /** @brief Continuous processing (see set_continuous_processing): when
+         * set (the default), a process request keeps sweeping over the
+         * entries until a whole sweep runs no filter; when not, it makes one
+         * sweep and stops */
+        bool continuous_processing_ = true;
+
+        /** @brief With continuous processing off, the current request's sweep
+         * is finished: later passes of the same request do nothing */
+        bool sweep_done_ = false;
+
         /** @brief When to end a pass early to bound memory; enabled by
          * default (see memory_policy.hpp and set_memory_policy) */
         MemoryPolicy mem_policy_;
@@ -312,6 +323,15 @@ class SeqDB {
             return STOP_NONE;
         }
 
+        /** @brief The scan fetches entries from the map in blocks of this many
+         * keys, one request per block (see set_scan_block_keys) */
+        size_t scan_block_keys_ = DEFAULT_SCAN_BLOCK_KEYS;
+        /** @brief ...and a block's reply stops growing past about this many
+         * bytes, so databases with large values (e.g. whole blocks of a
+         * blockchain) do not get huge replies; the rest of the block is
+         * fetched with the next request */
+        static constexpr size_t SCAN_BLOCK_BYTES = 16u << 20;
+
         /** @brief Start the next pass on a fresh snapshot, freeing the old one */
         void reset_scan_() {
             vector<dbkey_t>().swap(scan_keys_);
@@ -389,6 +409,13 @@ class SeqDB {
             size_t i = 0;   // entries this pass
             #endif
 
+            // With continuous processing off, an agent whose sweep is finished
+            // does nothing while the rest of the mesh finishes theirs
+            if (!continuous_processing_ && sweep_done_) {
+                stats_.stopped_early = false;
+                return false;
+            }
+
             // Start a new lap on a fresh snapshot if the last one finished
             if (scan_pos_ == 0 || scan_pos_ >= scan_keys_.size()) {
                 scan_keys_ = db_.keys();
@@ -405,11 +432,25 @@ class SeqDB {
                 stats_.keys_scanned = scan_pos_;
 
                 while (scan_pos_ < scan_keys_.size()) {
-                    dbkey_t key = scan_keys_[scan_pos_++];
-                    // The snapshot can be older than this pass; skip anything gone
-                    auto [entry, exists] = db_.retrieve_if_exists(key); //TODO also batch retrievals
+                  // Fetch the next block of entries with one request to the
+                  // map, instead of one request per key. The block is not kept
+                  // past this pass: a stage close can change any entry.
+                  size_t block_begin = scan_pos_;
+                  size_t block_keys = 0;
+                  vector<DBEntry<>> block = db_.retrieve_entries_by_keys(scan_keys_, block_begin,
+                      scan_block_keys_, SCAN_BLOCK_BYTES, block_keys);
+                  size_t next_in_block = 0;
+
+                  for (size_t p = block_begin; p < block_begin + block_keys; ++p) {
+                    dbkey_t key = scan_keys_[p];
+                    scan_pos_ = p + 1;
+                    // The snapshot can be older than this pass; skip anything
+                    // gone (the block holds only the keys that still exist,
+                    // in key order)
+                    bool exists = next_in_block < block.size() && block[next_in_block].get_key() == key;
                     ++entries_examined_;
                     if (exists) {
+                        DBEntry<>& entry = block[next_in_block++];
                         #ifdef VERBOSE
                         if (++i % 10000 == 0) {
                             cerr << "I have processed " << i << " entries this pass (cursor at " << scan_pos_ << "/"
@@ -458,26 +499,46 @@ class SeqDB {
                             && scan_pos_ >= scan_keys_.size())
                         reason = STOP_NONE;
                     if (reason != STOP_NONE) {
+                        if (!continuous_processing_ && scan_pos_ >= scan_keys_.size()) {
+                            // Stopped on the last entry of the snapshot: the
+                            // sweep is done, as below. The reason is kept, so
+                            // a stop for memory still asks the others to stop.
+                            stats_.stop_reason = reason;
+                            sweep_done_ = true;
+                            reset_scan_();
+                            return false;
+                        }
                         #ifdef VERBOSE
                         cerr << "breaking early: " << stop_reason_name(reason) << " (cursor at " << scan_pos_ << "/"
                              << scan_keys_.size() << ", " << num_filters_run << " filters run, "
                              << stats_.bytes_emitted << " bytes emitted)" << endl;
                         #endif
-                        // Keep the cursor; the next pass continues from here.
-                        // The lap is unfinished, so returning true (process
-                        // again) is correct. Passes still make progress: the
-                        // run limit and memory checks need a run here (the
-                        // limit is >= 1), and a remote stop before any run
-                        // is only honored if the pass ran a filter elsewhere
-                        // (see check_stop_). Either way at least one entry
-                        // was scanned, so the cursor has moved.
+                        // Keep the cursor; the next pass continues from here
+                        // (fetching the rest of this block again). The lap is
+                        // unfinished, so returning true (process again) is
+                        // correct. Passes still make progress: the run limit
+                        // and memory checks need a run here (the limit is
+                        // >= 1), and a remote stop before any run is only
+                        // honored if the pass ran a filter elsewhere (see
+                        // check_stop_). Either way at least one entry was
+                        // scanned, so the cursor has moved.
                         stats_.stopped_early = scan_pos_ < scan_keys_.size();
                         stats_.stop_reason = reason;
                         return true;
                     }
+                  }
                 }
 
                 // Reached the end of the snapshot
+                if (!continuous_processing_) {
+                    // Every entry in the snapshot has been offered to the
+                    // filters once: the sweep is done, even if filters ran.
+                    // Nothing is rechecked, so entries created or made
+                    // eligible during the sweep wait for the next request.
+                    sweep_done_ = true;
+                    reset_scan_();
+                    return false;
+                }
                 if (filter_ran) {
                     // Next pass starts a new lap, which will see this pass's changes
                     reset_scan_();
@@ -651,9 +712,9 @@ class SeqDB {
 
             // Index the tags after merging, so tags the merge added (MERGED,
             // MERGED_SUM, MERGED_SUM_FAILED) are indexed too
-            for (auto &tag : entry->tags()) {
+            entry->tag_store().for_each([&](const string& tag) {
                 add_to_tag_index_(key, tag);
-            }
+            });
         }
 
         /** @brief Add a specific DB entry */
@@ -769,8 +830,8 @@ class SeqDB {
 
             DBEntry<> new_entry;
             new_entry.set_key(e1->get_key());
-            for (auto &tag : e1->tags()) new_entry.add_tag(tag);
-            for (auto &tag : e2->tags()) new_entry.add_tag(tag);
+            new_entry.copy_tags_from(*e1);
+            e2->tag_store().for_each([&](const string& tag) { new_entry.add_tag(tag); });
             new_entry.add_tag(MERGED_SUM);
 
             __int128 isum = 0;
@@ -793,20 +854,12 @@ class SeqDB {
             dbkey_t new_key = e1->get_key();
             new_entry.set_key(new_key);
 
-            vector<string> tag_union;
-            if (force_merge) {
-                // if we are force merging, assume they have the same tags TODO is this okay? It might be an optimization
-                auto & e1_tags = e1->tags();
-                tag_union.assign(e1_tags.begin(), e1_tags.end());
-            } else {
-                auto e1_tags = e1->tags();
-                auto e2_tags = e2->tags();
-                set_union(e1_tags.begin(), e1_tags.end(), e2_tags.begin(), e2_tags.end(), inserter(tag_union, tag_union.begin()));
-            }
-            tag_union.push_back("MERGED");
-            for (auto &tag : tag_union) {
-                new_entry.add_tag(tag);
-            }
+            // The union of both entries' tags (with force_merge, assume they
+            // have the same tags and take e1's), plus MERGED
+            new_entry.copy_tags_from(*e1);
+            if (!force_merge)
+                e2->tag_store().for_each([&](const string& tag) { new_entry.add_tag(tag); });
+            new_entry.add_tag("MERGED");
 
             return new_entry;
         }
@@ -1044,6 +1097,21 @@ class SeqDB {
          */
         size_t entries_examined() const { return entries_examined_; }
 
+        /** @brief Default number of keys the scan fetches per request */
+        static constexpr size_t DEFAULT_SCAN_BLOCK_KEYS = 4096;
+
+        /** @brief Set how many keys the filter scan fetches from the map per
+         * request. Larger blocks mean fewer requests; each block's entries are
+         * held in memory while it is scanned (its reply is capped at about
+         * SCAN_BLOCK_BYTES whatever the block size). */
+        void set_scan_block_keys(size_t n) {
+            if (n == 0) throw invalid_argument("scan_block_keys must be at least 1");
+            scan_block_keys_ = n;
+        }
+
+        /** @brief Return how many keys the filter scan fetches per request */
+        size_t scan_block_keys() const { return scan_block_keys_; }
+
         /** @brief Whether changes are staged, waiting for a stage close */
         bool has_staged_changes() const {
             return !new_entries_.empty() || !val_updates_.empty() ||
@@ -1102,8 +1170,37 @@ class SeqDB {
 
         /** @brief Process the database, applying filters as appropriate */
         virtual bool process() {
+            start_new_sweep();
             while (process_once()) {}
             return false;
+        }
+
+        /** @brief Choose how a process request ends
+         *
+         * On (the default), "continuous processing": sweep over the entries,
+         * and keep sweeping until a whole sweep runs no filter. A filter that
+         * makes another entry eligible (by creating or tagging it) is
+         * therefore always followed up, at the cost of one more sweep after
+         * the last one that ran anything.
+         *
+         * Off: process each entry once per request. One sweep is made: every
+         * entry that existed when it started is offered to the filters once
+         * (over as many passes as max_filters_per_stage or the memory policy
+         * need), and nothing is rechecked. Use this only when no filter's
+         * writes can make an entry eligible for a filter in the same request:
+         * entries created or made eligible during the sweep are left for the
+         * next request.
+         */
+        void set_continuous_processing(bool on) { continuous_processing_ = on; }
+
+        /** @brief Whether a process request keeps sweeping until nothing runs */
+        bool continuous_processing() const { return continuous_processing_; }
+
+        /** @brief Begin a new process request: its sweep starts from the first
+         * entry of a fresh snapshot */
+        void start_new_sweep() {
+            sweep_done_ = false;
+            reset_scan_();
         }
 
         /** @brief Return the current size of the database */
@@ -1147,6 +1244,9 @@ class SeqDB {
 
             access->get_entry_by_key.state = this;
             access->get_entry_by_key.run = &s_SeqDB_get_entry_by_key;
+
+            access->get_entries_by_keys.state = this;
+            access->get_entries_by_keys.run = &s_SeqDB_get_entries_by_keys;
 
             access->get_entries_by_tags.state = this;
             access->get_entries_by_tags.run = &s_SeqDB_get_entries_by_tags;
@@ -1248,6 +1348,52 @@ class SeqDB {
         /** @brief Get the value of the entry that has key search_key */
         virtual void get_entry_value_by_key(dbkey_t search_key, char **res) {
             get_entry_value_by_key_worker(search_key, res);
+        }
+
+        /** @brief Read one value from this DB's own map, with its exact
+         * length (values may contain NUL bytes)
+         * @return false if the key does not exist
+         */
+        bool get_value_if_exists(dbkey_t key, string& value) {
+            ZMQMessage resp = db_.retrieve_values_raw(1, &key);
+            const char* data = resp.data();
+            const char* end = data + resp.size();
+            if ((size_t)(end - data) < 2*sizeof(size_t) + sizeof(bool)) throw runtime_error("values reply: too short");
+            size_t count;
+            bool exists;
+            size_t len;
+            unpack_single(data, count);
+            unpack_single(data, exists);
+            unpack_single(data, len);
+            if (count != 1 || (size_t)(end - data) < len) throw runtime_error("values reply: malformed");
+            value.assign(data, len);
+            return exists;
+        }
+
+        /** @brief Get the values for n keys with one request to the map
+         *
+         * values[i] receives a malloc'd, NUL-terminated copy of the value for
+         * keys[i] (the caller frees it), or nullptr if the key does not exist.
+         * An empty value gives an empty string, not nullptr. Keys may repeat.
+         */
+        void get_entry_values_by_keys_worker(size_t n, const dbkey_t* keys, char** values) {
+            for (size_t i = 0; i < n; ++i) values[i] = nullptr;
+            if (n == 0) return;
+
+            ZMQMessage resp = db_.retrieve_values_raw(n, keys);
+            const char* data = resp.data();
+            try {
+                unpack_values_reply(data, data + resp.size(), n, nullptr, values);
+            } catch (...) {
+                for (size_t i = 0; i < n; ++i) { free(values[i]); values[i] = nullptr; }
+                throw;
+            }
+        }
+
+        /** @brief Get the values for n keys (see get_entry_values_by_keys_worker);
+         * ParDB's version asks every owning agent at once */
+        virtual void get_entry_values_by_keys(size_t n, const dbkey_t* keys, char** values) {
+            get_entry_values_by_keys_worker(n, keys, values);
         }
 
 
@@ -1445,6 +1591,19 @@ static void s_SeqDB_get_entry_by_tags(const fn* s_this, ...) {
 
     pando::SeqDB* db = (pando::SeqDB*)s_this->state;
     db->get_entry_value_by_tags(search_tags, res);
+}
+
+static void s_SeqDB_get_entries_by_keys(const fn* s_this, ...) {
+    // Arguments: size_t n, const dbkey_t* keys, char** values
+    va_list args;
+    va_start(args, s_this);
+    size_t n = va_arg(args, size_t);
+    const dbkey_t* keys = va_arg(args, const dbkey_t*);
+    char** values = va_arg(args, char**);
+    va_end(args);
+
+    pando::SeqDB* db = (pando::SeqDB*)s_this->state;
+    db->get_entry_values_by_keys(n, keys, values);
 }
 
 static void s_SeqDB_get_entry_by_key(const fn* s_this, ...) {

@@ -72,6 +72,48 @@ pub extern "C" fn should_run(acc: *const DBAccess) -> i32 {
     return 1;
 }
 
+/// Look up the values for many keys with one blocking request. The keys are
+/// sent to all of the agents that own them at once (see
+/// ParDB::get_entries_by_keys), instead of one request per key as with
+/// get_entry_by_key.
+///
+/// Returns one result per key, in the same order (keys may repeat):
+/// `Some(bytes)` with the value, cut at its first NUL byte (an empty value
+/// gives `Some` of an empty vector), or `None` if the key does not exist.
+/// An empty `keys` returns an empty vector without calling into the DB.
+#[allow(dead_code)]
+pub fn get_entries_by_keys(data: &DBAccess, keys: &[dbkey_t]) -> Vec<Option<Vec<u8>>> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+
+    // One slot per key; the DB sets each to a malloc'd copy or leaves NULL
+    let mut values: Vec<*mut c_char> = vec![ptr::null_mut(); keys.len()];
+    unsafe {
+        data.get_entries_by_keys.run.expect("get_entries_by_keys is not set")(
+            ptr::addr_of!(data.get_entries_by_keys),
+            keys.len(),
+            keys.as_ptr(),
+            values.as_mut_ptr(),
+        );
+    };
+
+    values
+        .into_iter()
+        .map(|v| {
+            if v.is_null() {
+                None
+            } else {
+                let bytes = unsafe { CStr::from_ptr(v) }.to_bytes().to_vec();
+                unsafe {
+                    libc::free(v as *mut c_void);
+                };
+                Some(bytes)
+            }
+        })
+        .collect()
+}
+
 fn get_entry_by_key(data: &mut DBAccess, key: dbkey_t) -> Option<String> {
     // Grab the search query string
     let mut query_cstr_ptr: *const c_char = ptr::null();

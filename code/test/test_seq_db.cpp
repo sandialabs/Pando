@@ -1878,6 +1878,264 @@ TEST(mem_budget_same_result) {
     TEST_PASS
 }
 
+// Batched lookups on a single SeqDB, directly and through a filter's DBAccess
+TEST(get_entries_by_keys_local) {
+    SeqDB d;
+    dbkey_t k1 {40, 1, 0}, k2 {40, 2, 0}, k3 {40, 3, 0}, missing {40, 9, 0};
+    { DBEntry<> e; e.clear().add_tag("a").value() = "v1"; e.set_key(k1); d.add_entry(move(e)); }
+    { DBEntry<> e; e.clear().add_tag("a").value() = "";   e.set_key(k2); d.add_entry(move(e)); }
+    { DBEntry<> e; e.clear().add_tag("a").value() = "x\ny"; e.set_key(k3); d.add_entry(move(e)); }
+
+    dbkey_t keys[] = {k1, missing, k2, k1, k3};
+    const size_t n = sizeof(keys)/sizeof(keys[0]);
+
+    // Directly
+    char* values[n];
+    d.get_entry_values_by_keys(n, keys, values);
+    NOPRINT_NOTEQ(values[0], nullptr); EQ(string{values[0]}, "v1");
+    NOPRINT_EQ(values[1], nullptr);                           // missing
+    NOPRINT_NOTEQ(values[2], nullptr); EQ(string{values[2]}, "");    // empty, not missing
+    NOPRINT_NOTEQ(values[3], nullptr); EQ(string{values[3]}, "v1");  // repeated key
+    NOPRINT_NOTEQ(values[4], nullptr); EQ(string{values[4]}, "x\ny");
+    for (char* v : values) free(v);
+
+    // Through a filter's DBAccess (the C entry point filters use)
+    DBEntry<> any; any.clear().add_tag("a");
+    DBAccess* access = any.access();
+    d.add_db_access(access);
+    char* values2[n];
+    access->get_entries_by_keys.run(&access->get_entries_by_keys, n, (const dbkey_t*)keys, (char**)values2);
+    NOPRINT_NOTEQ(values2[0], nullptr); EQ(string{values2[0]}, "v1");
+    NOPRINT_EQ(values2[1], nullptr);
+    NOPRINT_NOTEQ(values2[2], nullptr); EQ(string{values2[2]}, "");
+    for (char* v : values2) free(v);
+    delete access;
+
+    // An empty batch is fine
+    d.get_entry_values_by_keys(0, keys, values);
+
+    TEST_PASS
+}
+
+// Filter for the scan block tests: runs once on entries tagged "A" and
+// checks that the value it is given is the one stored for its key
+static size_t g_TEST_block_runs, g_TEST_block_bad_values;
+bool g_TEST_block_should_run(const DBAccess* acc) {
+    bool found_a = false;
+    for (auto tags = acc->tags; *tags[0] != '\0'; ++tags) {
+        if (string(*tags) == "A:done") return false;
+        if (string(*tags) == "A") found_a = true;
+    }
+    return found_a;
+}
+void g_TEST_block_run(void* access) {
+    const DBAccess* acc = (const DBAccess*)access;
+    ++g_TEST_block_runs;
+    if (acc->value == nullptr || string(acc->value) != "v" + to_string(acc->key.b)) ++g_TEST_block_bad_values;
+    acc->add_tag.run(&acc->add_tag, "A:done");
+}
+
+// The scan fetches entries in blocks (SeqDB::scan_block_keys() keys per
+// request). Over several blocks, and with the filter limit stopping passes
+// part way through a block, every eligible entry still runs exactly once with
+// its own value, whatever the block size
+TEST(scan_in_blocks) {
+    FilterInterface f { filter_name: "TEST_block", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_block_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_block_run };
+    const size_t n = 10000;   // more than two blocks
+    size_t eligible = 0;
+    auto fill = [&](SeqDB& d) {
+        eligible = 0;
+        for (size_t k = 0; k < n; ++k) {
+            DBEntry<> e;
+            e.set_key({30, (vtx_t)k, 0});
+            e.add_tag(k % 3 == 0 ? "A" : "B");
+            e.value() = "v" + to_string(k);
+            if (k % 3 == 0) ++eligible;
+            d.add_entry(move(e));
+        }
+        d.install_filter(make_shared<Filter>(&f));
+    };
+
+    // No limit: one pass runs everything, a second finds nothing
+    {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        fill(d);
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+        EQ(d.entries_examined(), 2*n);
+    }
+    // 7 runs per pass: passes stop part way through blocks
+    {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        fill(d);
+        d.set_max_filters_per_stage(7);
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+    }
+    // Other block sizes, including one key per request and blocks that do
+    // not divide the entries evenly, give the same result
+    for (size_t block : {(size_t)1, (size_t)7, (size_t)333, (size_t)100000}) {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        d.set_scan_block_keys(block);
+        EQ(d.scan_block_keys(), block);
+        fill(d);
+        d.set_max_filters_per_stage(7);
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+    }
+    // A block of zero keys is rejected
+    {
+        SeqDB d;
+        EQ(d.scan_block_keys(), SeqDB::DEFAULT_SCAN_BLOCK_KEYS);
+        bool threw = false;
+        try { d.set_scan_block_keys(0); } catch (invalid_argument&) { threw = true; }
+        EQ(threw, true);
+        EQ(d.scan_block_keys(), SeqDB::DEFAULT_SCAN_BLOCK_KEYS);
+    }
+
+    TEST_PASS
+}
+
+// Pairs Y_i at {20, i, 0} and X_i at {21, i, 0} with tag_other and on_tag_b
+// installed (tag_other on Y_i tags X_i with "TagB", which on_tag_b then runs on)
+static void make_chain_db(SeqDB& d, size_t pairs, FilterInterface* tag_other, FilterInterface* on_tag_b) {
+    for (size_t k = 0; k < pairs; ++k) {
+        { DBEntry<> e; e.clear().add_tag("X").value() = "x"; e.set_key({21, (vtx_t)k, 0}); d.add_entry(move(e)); }
+        { DBEntry<> e; e.clear().add_tag("Y").value() = "y"; e.set_key({20, (vtx_t)k, 0}); d.add_entry(move(e)); }
+    }
+    d.install_filter(make_shared<Filter>(tag_other));
+    d.install_filter(make_shared<Filter>(on_tag_b));
+}
+
+// With continuous processing off, a process request sweeps over the entries once:
+// entries made eligible during the sweep (here by another filter tagging
+// them) are left for the next request. Continuous processing follows them up in the
+// same request.
+TEST(continuous_processing_off_leaves_follow_ups_for_next_request) {
+    FilterInterface tag_other { filter_name: "TEST_tag_other", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_tag_other_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_tag_other_run };
+    FilterInterface on_tag_b { filter_name: "TEST_on_tag_b", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_on_tag_b_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_on_tag_b_run };
+    size_t pairs = 20;
+
+    {
+        g_TEST_on_tag_b_runs = 0;
+        SeqDB d;
+        make_chain_db(d, pairs, &tag_other, &on_tag_b);
+        d.process();
+        EQ(g_TEST_on_tag_b_runs, pairs);
+    }
+    {
+        g_TEST_on_tag_b_runs = 0;
+        SeqDB d;
+        d.set_continuous_processing(false);
+        make_chain_db(d, pairs, &tag_other, &on_tag_b);
+        d.process();
+        // TagB was only applied when the stage closed, after the sweep
+        EQ(g_TEST_on_tag_b_runs, 0);
+        size_t tagged = 0;
+        for (auto & [key, entry] : d.entries())
+            if (entry.has_tag("X") && entry.has_tag("TagB")) ++tagged;
+        EQ(tagged, pairs);
+        // The next request is a new sweep, which picks them up
+        d.process();
+        EQ(g_TEST_on_tag_b_runs, pairs);
+    }
+
+    TEST_PASS
+}
+
+// With continuous processing off, every entry is offered to the filters exactly once, even when
+// max_filters_per_stage splits it over many passes
+TEST(continuous_processing_off_offers_each_entry_once) {
+    FilterInterface tag_other { filter_name: "TEST_tag_other", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_tag_other_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_tag_other_run };
+    FilterInterface on_tag_b { filter_name: "TEST_on_tag_b", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_on_tag_b_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_on_tag_b_run };
+    size_t pairs = 20;
+    SeqDB d;
+    d.set_continuous_processing(false);
+    d.set_max_filters_per_stage(1);
+    make_chain_db(d, pairs, &tag_other, &on_tag_b);
+    d.process();
+
+    EQ(d.entries_examined(), 2*pairs);
+    size_t y_done = 0;
+    for (auto & [key, entry] : d.entries())
+        if (entry.has_tag("Y") && entry.has_tag("tag_other:done")) ++y_done;
+    EQ(y_done, pairs);
+
+    TEST_PASS
+}
+
+// Memory stops with continuous processing off: a byte budget that ends every
+// pass after 3 writes, with small scan blocks so passes stop inside blocks.
+// The sweep still offers each entry exactly once, and every eligible entry
+// still runs.
+TEST(continuous_processing_off_with_memory_stops) {
+    g_TEST_max_filters_runs = 0;
+    SeqDB d;
+    d.set_meminfo_source([]() { return MemInfo{}; });
+    MemoryPolicy p = MemoryPolicy::disabled();
+    p.pass_budget_bytes = 3*g_A_DONE_BYTES;
+    d.set_memory_policy(p);
+    d.set_continuous_processing(false);
+    d.set_scan_block_keys(3);
+    add_a_entries(d, 10);
+    for (int k = 0; k < 10; ++k) { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
+    d.install_filter(make_shared<Filter>(&g_TEST_a_done_fi));
+
+    d.process();
+    EQ(g_TEST_max_filters_runs, 10);
+    EQ(count_a_done(d), 10);
+    EQ(d.entries_examined(), 20);
+    // Passes stopped for the budget along the way
+    size_t budget_stops = 0;
+    for (auto & h : d.stats().history)
+        if (h.stop_reason == STOP_MEM_BUDGET) ++budget_stops;
+    EQ(budget_stops >= 3, true);
+
+    TEST_PASS
+}
+
+// With continuous processing off, the batched scan still offers each entry
+// exactly once, whatever the block size, with passes stopping inside blocks
+TEST(scan_in_blocks_continuous_processing_off) {
+    FilterInterface f { filter_name: "TEST_block", filter_type: SINGLE_ENTRY,
+        should_run: &g_TEST_block_should_run, init: nullptr, destroy: nullptr, run: &g_TEST_block_run };
+    const size_t n = 10000;
+    for (size_t block : {(size_t)1, (size_t)7, (size_t)333, SeqDB::DEFAULT_SCAN_BLOCK_KEYS, (size_t)100000}) {
+        g_TEST_block_runs = g_TEST_block_bad_values = 0;
+        SeqDB d;
+        d.set_continuous_processing(false);
+        d.set_scan_block_keys(block);
+        size_t eligible = 0;
+        for (size_t k = 0; k < n; ++k) {
+            DBEntry<> e;
+            e.set_key({30, (vtx_t)k, 0});
+            e.add_tag(k % 3 == 0 ? "A" : "B");
+            e.value() = "v" + to_string(k);
+            if (k % 3 == 0) ++eligible;
+            d.add_entry(move(e));
+        }
+        d.install_filter(make_shared<Filter>(&f));
+        d.set_max_filters_per_stage(7);
+        d.process();
+        EQ(g_TEST_block_runs, eligible);
+        EQ(g_TEST_block_bad_values, 0);
+        EQ(d.entries_examined(), n);
+    }
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1932,6 +2190,12 @@ TESTS_BEGIN
     RUN_TEST(stop_requested_on_last_entry_reports_done)
     RUN_TEST(mem_bytes_count_each_output)
     RUN_TEST(mem_budget_same_result)
+    RUN_TEST(get_entries_by_keys_local)
+    RUN_TEST(scan_in_blocks)
+    RUN_TEST(continuous_processing_off_leaves_follow_ups_for_next_request)
+    RUN_TEST(continuous_processing_off_offers_each_entry_once)
+    RUN_TEST(continuous_processing_off_with_memory_stops)
+    RUN_TEST(scan_in_blocks_continuous_processing_off)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END

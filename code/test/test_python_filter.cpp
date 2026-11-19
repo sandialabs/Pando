@@ -197,6 +197,55 @@ TEST(get_entry_by_key_not_found) {
     TEST_PASS
 }
 
+TEST(get_entries_by_keys) {
+    SeqDB db;
+
+    {
+        DBEntry e; e.add_tag("A"); e.value() = "test1";
+        dbkey_t key {1,1,1};
+        e.set_key(key);
+        db.add_entry(move(e));
+    }
+    {
+        DBEntry e; e.add_tag("B"); e.value() = "test2";
+        dbkey_t key {2,2,2};
+        e.set_key(key);
+        db.add_entry(move(e));
+    }
+    {
+        DBEntry e; e.add_tag("B"); e.value() = "test3";
+        dbkey_t key {3,3,3};
+        e.set_key(key);
+        db.add_entry(move(e));
+    }
+    {
+        DBEntry e; e.add_tag("B");     // empty value
+        dbkey_t key {4,4,4};
+        e.set_key(key);
+        db.add_entry(move(e));
+    }
+
+    db.add_filter_dir(build_dir + "/test/filters");
+    db.install_filter("test_python_filter_get_entries_by_keys");
+
+    db.process();
+
+    EQ(db.size(), 4)
+
+    bool found = false;
+    dbkey_t match_key {1,1,1};
+    for (auto & [key, entry] : db.entries()) {
+        if (key == match_key) {
+            found = true;
+            EQ(entry.has_tag("SUCCESS"), true)
+            EQ(entry.has_tag("FAILURE"), false)
+        }
+    }
+    EQ(found, true)
+
+    TEST_PASS
+}
+
 TEST(make_new_entry) {
     SeqDB db;
 
@@ -377,6 +426,7 @@ TESTS_BEGIN
     RUN_TEST(subscribe_to_entry)
     RUN_TEST(get_entry_by_key)
     RUN_TEST(get_entry_by_key_not_found)
+    RUN_TEST(get_entries_by_keys)
     RUN_TEST(make_new_entry)
     RUN_TEST(update_entry_val_self)
     RUN_TEST(update_entry_val_other)

@@ -313,19 +313,24 @@ ZMQMessage::ZMQMessage(zmq_socket_t sock, bool block) : msg_part_(), sock_(sock)
     // Initialize the message
     if (zmq_msg_init(&msg_part_) != 0) throw std::runtime_error("Unable to init msg");
 
-    // Read out the message
-    size_ = zmq_msg_recv(&msg_part_, sock_, (block) ? 0 : ZMQ_DONTWAIT);
+    // Read out the message. The return value is only used to detect errors:
+    // for messages over INT_MAX bytes it is clamped, so the real size comes
+    // from zmq_msg_size().
+    int ret = zmq_msg_recv(&msg_part_, sock_, (block) ? 0 : ZMQ_DONTWAIT);
 
-    if (size_ == -1 && !block && errno == EAGAIN) {
+    if (ret == -1 && !block && errno == EAGAIN) {
         // We are not blocking, and there are no messages
         zmq_msg_close(&msg_part_);
         closed_ = true;
+        size_ = 0;
+        data_ = nullptr;
         return;
     }
 
-    if (size_ < 0) throw std::runtime_error("Unable to read message");
+    if (ret < 0) throw std::runtime_error("Unable to read message");
 
     // The message is now held up in the internal zmq_msg
+    size_ = zmq_msg_size(&msg_part_);
     data_ = (char*)zmq_msg_data(&msg_part_);
 }
 
@@ -334,7 +339,7 @@ ZMQMessage::ZMQMessage(zmq_socket_t sock, size_t size) : msg_part_(), sock_(sock
     if (zmq_msg_init_size(&msg_part_, size) != 0) throw std::runtime_error("Unable to init alloc msg");
 
     // Set the size
-    size_ = (int)size;
+    size_ = size;
 
     // The output buffer is now held up in the internal zmq_msg
     data_ = (char*)zmq_msg_data(&msg_part_);
@@ -346,26 +351,62 @@ ZMQMessage::~ZMQMessage() {
     zmq_msg_close(&msg_part_);
 }
 
-ZMQMessage::ZMQMessage(ZMQMessage&& that) {
-    std::swap(msg_part_, that.msg_part_);
-    std::swap(sock_, that.sock_);
-    std::swap(size_, that.size_);
-    std::swap(data_, that.data_);
+/* Moving a message: the zmq_msg_t is moved with zmq_msg_move, and data_ is
+ * looked up again afterwards. Small messages (up to ~33 bytes) are stored
+ * inside the zmq_msg_t itself, so a data_ pointer taken from the old object
+ * would point into the moved-from message. */
+void ZMQMessage::take_(ZMQMessage& that) {
+    sock_ = that.sock_;
+    size_ = 0;
+    data_ = nullptr;
+    // Stay closed until the message has really been taken over, so that if
+    // zmq_msg_init or zmq_msg_move fails the destructor does not close an
+    // invalid message
+    closed_ = true;
+    if (!that.closed_) {
+        if (zmq_msg_init(&msg_part_) != 0) throw std::runtime_error("Unable to init msg");
+        if (zmq_msg_move(&msg_part_, &that.msg_part_) != 0) {
+            zmq_msg_close(&msg_part_);
+            throw std::runtime_error("Unable to move msg");
+        }
+        closed_ = false;
+        size_ = that.size_;
+        data_ = (char*)zmq_msg_data(&msg_part_);
+    }
+    // The moved-from message no longer owns anything
     that.closed_ = true;
+    that.data_ = nullptr;
+    that.size_ = 0;
+}
+
+ZMQMessage::ZMQMessage(ZMQMessage&& that) : msg_part_(), sock_(nullptr), size_(0), data_(nullptr), closed_(true) {
+    take_(that);
 }
 
 ZMQMessage& ZMQMessage::operator=(ZMQMessage&& that) {
     if (this != &that) {
-        std::swap(msg_part_, that.msg_part_);
-        std::swap(sock_, that.sock_);
-        std::swap(size_, that.size_);
-        std::swap(data_, that.data_);
-        that.closed_ = true;
+        // Release the message this one held before taking over the other
+        if (!closed_) zmq_msg_close(&msg_part_);
+        closed_ = true;
+        take_(that);
     }
     return *this;
 }
 
 void ZMQMessage::send() {
-    int ret_size = zmq_msg_send(&msg_part_, sock_, 0);
-    if (ret_size != size_) throw std::runtime_error("Error while sending");
+    send(sock_);
+}
+
+void ZMQMessage::send(zmq_socket_t sock) {
+    if (closed_) throw std::runtime_error("Cannot send a closed message");
+    // zmq_msg_send returns the size clamped to INT_MAX, or -1 on error
+    int ret = zmq_msg_send(&msg_part_, sock, 0);
+    if (ret < 0) throw std::runtime_error("Error while sending");
+    // On success ZeroMQ owns the buffer and msg_part_ is now empty. Close the
+    // empty message and mark this one closed, so sending it again throws
+    // rather than sending an empty message.
+    zmq_msg_close(&msg_part_);
+    closed_ = true;
+    data_ = nullptr;
+    size_ = 0;
 }

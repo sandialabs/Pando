@@ -3,6 +3,9 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <set>
+#include <thread>
+#include <unordered_set>
 
 #include "dbentry.hpp"
 
@@ -628,6 +631,178 @@ TEST(serialize) {
     TEST_PASS
 }
 
+// --- Tag interning (tag_table.hpp) ---
+
+// Restores interning to its default when a test ends
+struct InterningScope {
+    explicit InterningScope(bool on) { TagTable::set_interning(on); }
+    ~InterningScope() { TagTable::set_interning(true); }
+};
+
+static set<string> c_tag_set(const DBEntry<>& e) {
+    set<string> res;
+    const char* const* t = e.c_tags();
+    for (; *t[0] != '\0'; ++t) res.insert(*t);
+    return res;
+}
+
+// Each distinct tag is stored once and keeps its id
+TEST(tag_table_interns_each_tag_once) {
+    TagTable& table = TagTable::global();
+    size_t before = table.size();
+    uint32_t a = table.intern("tag_table_test_a");
+    uint32_t b = table.intern("tag_table_test_b");
+    EQ(table.intern("tag_table_test_a"), a);
+    EQ(string(table.intern(string("tag_table_test_") + "b") == b ? "same" : "different"), "same");
+    EQ(a != b, true);
+    EQ(table.size(), before + 2);
+    EQ(table.str(a), "tag_table_test_a");
+    uint32_t id = 0;
+    EQ(table.find("tag_table_test_b", id), true);
+    EQ(id, b);
+    EQ(table.find("tag_table_test_never_added", id), false);
+    EQ(table.size(), before + 2);
+
+    TEST_PASS
+}
+
+// Every tag operation gives the same results with interning on and off,
+// including past the 4 tags an interned entry keeps inline
+TEST(tags_same_with_and_without_interning) {
+    for (bool on : {true, false}) {
+        InterningScope scope {on};
+        DBEntry<> e;
+        EQ(e.tag_store().interned(), on);
+        vector<string> names {"t0", "a longer tag than fifteen characters", "t2", "t3", "t4", "t5", "t6"};
+        for (auto & n : names) e.add_tag(n);
+        e.add_tag("t2");    // already there
+        EQ(e.tag_size(), names.size());
+        for (auto & n : names) EQ(e.has_tag(n), true);
+        EQ(e.has_tag("missing"), false);
+        EQ(c_tag_set(e) == set<string>(names.begin(), names.end()), true);
+        EQ(e.tags() == unordered_set<string>(names.begin(), names.end()), true);
+
+        // Shrink back below the inline size, then grow again
+        for (size_t i = 2; i < names.size(); ++i) e.remove_tag(names[i]);
+        e.remove_tag("missing");
+        EQ(e.tag_size(), 2);
+        EQ(c_tag_set(e) == set<string>({"t0", "a longer tag than fifteen characters"}), true);
+        e.add_tag("t9");
+        EQ(e.tag_size(), 3);
+        EQ(e.has_tag("t3"), false);
+
+        // Copies and moves keep the tags (and the mode)
+        e.value() = "val";
+        e.set_key({5, 6, 7});
+        DBEntry<> copy {e};
+        EQ(copy.tags() == e.tags(), true);
+        EQ(copy.tag_store().interned(), on);
+        DBEntry<> moved {move(copy)};
+        EQ(moved.tags() == e.tags(), true);
+        bool threw = false;
+        try { copy.has_tag("t0"); } catch (runtime_error&) { threw = true; }
+        EQ(threw, true);    // a moved-from entry is invalid, as before
+
+        // Serialization round trip
+        vector<char> buf(e.serialize_size());
+        char* w = buf.data();
+        e.serialize(w);
+        EQ((size_t)(w - buf.data()), buf.size());
+        const char* r = buf.data();
+        DBEntry<> back {r};
+        EQ(back == e, true);
+        EQ(back.value(), "val");
+
+        e.clear();
+        EQ(e.tag_size(), 0);
+        EQ(e.c_tags()[0][0], '\0');
+    }
+
+    TEST_PASS
+}
+
+// Entries made with interning on and off compare, copy and serialize into
+// each other correctly
+TEST(interned_and_plain_entries_mix) {
+    DBEntry<> interned;
+    {
+        InterningScope scope {true};
+        DBEntry<> e; e.add_tag("x").add_tag("y").add_tag("zzzzzzzzzzzzzzzzzzzz");
+        interned = e;
+    }
+    DBEntry<> plain;
+    {
+        InterningScope scope {false};
+        DBEntry<> e; e.add_tag("y").add_tag("zzzzzzzzzzzzzzzzzzzz").add_tag("x");
+        plain = move(e);
+    }
+    EQ(interned.tag_store().interned(), true);
+    EQ(plain.tag_store().interned(), false);
+    EQ(interned == plain, true);
+    EQ(plain == interned, true);
+    plain.add_tag("w");
+    EQ(interned == plain, false);
+
+    DBEntry<> copied;
+    copied.copy_tags_from(plain);
+    EQ(copied.tags() == plain.tags(), true);
+
+    // Serialized by one mode, read by the other
+    {
+        InterningScope scope {false};
+        vector<char> buf(interned.serialize_size());
+        char* w = buf.data();
+        interned.serialize(w);
+        const char* r = buf.data();
+        DBEntry<> back {r};
+        EQ(back.tag_store().interned(), false);
+        EQ(back.tags() == interned.tags(), true);
+    }
+
+    TEST_PASS
+}
+
+// The strings an entry's C tags point to stay valid while the table grows
+TEST(c_tags_survive_table_growth) {
+    DBEntry<> e;
+    e.add_tag("survivor_one").add_tag("survivor_two");
+    const char* const* t = e.c_tags();
+    vector<const char*> ptrs;
+    for (; *t[0] != '\0'; ++t) ptrs.push_back(*t);
+    for (size_t i = 0; i < 100000; ++i)
+        TagTable::global().intern("growth_" + to_string(i));
+    set<string> seen;
+    for (auto p : ptrs) seen.insert(p);
+    EQ(seen == set<string>({"survivor_one", "survivor_two"}), true);
+    EQ(e.c_tags() == t - ptrs.size(), true);    // unchanged entry, same array
+
+    TEST_PASS
+}
+
+// Interning from several threads at once gives each tag exactly one id
+TEST(tag_table_threads) {
+    const size_t threads = 8, tags = 2000;
+    vector<vector<uint32_t>> ids(threads, vector<uint32_t>(tags));
+    vector<thread> ts;
+    for (size_t t = 0; t < threads; ++t)
+        ts.emplace_back([&, t]() {
+            for (size_t i = 0; i < tags; ++i) {
+                size_t k = (i * 7 + t * 13) % tags;    // each thread in its own order
+                ids[t][k] = TagTable::global().intern("thread_tag_" + to_string(k));
+            }
+        });
+    for (auto & th : ts) th.join();
+    set<uint32_t> distinct;
+    for (size_t k = 0; k < tags; ++k) {
+        for (size_t t = 1; t < threads; ++t) EQ(ids[t][k], ids[0][k]);
+        EQ(TagTable::global().str(ids[0][k]), "thread_tag_" + to_string(k));
+        distinct.insert(ids[0][k]);
+    }
+    EQ(distinct.size(), tags);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     RUN_TEST(add_tags)
     RUN_TEST(remove_tag)
@@ -653,4 +828,9 @@ TESTS_BEGIN
     RUN_TEST(build_with_key)
     RUN_TEST(not_equal)
     RUN_TEST(serialize)
+    RUN_TEST(tag_table_interns_each_tag_once)
+    RUN_TEST(tags_same_with_and_without_interning)
+    RUN_TEST(interned_and_plain_entries_mix)
+    RUN_TEST(c_tags_survive_table_growth)
+    RUN_TEST(tag_table_threads)
 TESTS_END

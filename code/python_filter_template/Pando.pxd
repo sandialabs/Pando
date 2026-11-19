@@ -307,7 +307,83 @@ cdef inline object get_entry_by_key(const DBAccess* access, dbkey_t search_key):
         py_ret = PyBytes_FromString(ret)
         free(ret)
         return py_ret
-        
+
+
+cdef inline list get_entries_by_keys(const DBAccess* access, keys):
+    """
+      Function:
+          get_entries_by_keys
+
+      Description:
+          Looks up the values for many keys with one blocking request. The
+          keys are sent to all of the agents that own them at once, instead
+          of one request per key as with get_entry_by_key.
+
+          Unlike get_entry_by_key, an empty value is returned as b"" and only
+          a key that does not exist gives None. As with get_entry_by_key,
+          a value is cut at its first NUL byte.
+
+      Parameters:
+          access (const DBAccess*)            : A pointer to the DBAccess object
+          keys (list[dbkey_t | tuple] | tuple) : The keys to look up, each a
+                                                 dbkey_t or an (a, b, c) tuple.
+                                                 Keys may repeat.
+
+      Calls:
+          access.get_entries_by_keys.run()
+
+      Modifies:
+          None
+
+      Returns:
+          list[bytes | None], in the same order as keys
+    """
+    cdef size_t n = len(keys)
+    cdef size_t i
+    cdef dbkey_t k
+    cdef dbkey_t* c_keys = NULL
+    cdef char** c_values = NULL
+
+    if n == 0:
+        return []
+
+    c_keys = <dbkey_t*>malloc(n * sizeof(dbkey_t))
+    c_values = <char**>malloc(n * sizeof(char*))
+    if c_keys == NULL or c_values == NULL:
+        free(c_keys)
+        free(c_values)
+        raise MemoryError()
+
+    # Every slot starts as NULL, so cleanup is safe however far we get
+    for i in range(n):
+        c_values[i] = NULL
+
+    try:
+        for i in range(n):
+            key = keys[i]
+            if isinstance(key, tuple):
+                k.a = key[0]
+                k.b = key[1]
+                k.c = key[2]
+            else:
+                k = key
+            c_keys[i] = k
+
+        access.get_entries_by_keys.run(&access.get_entries_by_keys, n, <const dbkey_t*>c_keys, c_values)
+
+        result = []
+        for i in range(n):
+            if c_values[i] == NULL:
+                result.append(None)
+            else:
+                result.append(PyBytes_FromString(c_values[i]))
+        return result
+    finally:
+        for i in range(n):
+            free(c_values[i])
+        free(c_keys)
+        free(c_values)
+
 
 cdef inline bytes make_tag(tag_name):
     """

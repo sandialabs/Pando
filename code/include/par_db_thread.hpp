@@ -36,6 +36,21 @@ class ParDBThread {
             t_ = thread(&ParDBThread::launch, this);
         }
 
+        /** @brief As above, also setting the write batch flush size in bytes
+         * (0 = send every write as its own message; see ParDB::set_write_batch_bytes) */
+        ParDBThread(ZMQAddress addr, size_t sz, bool skip_group_filters, size_t max_filters_per_stage, size_t write_batch_bytes) :
+                db_(addr, sz, skip_group_filters, max_filters_per_stage, write_batch_bytes), shutdown_(false) {
+            t_ = thread(&ParDBThread::launch, this);
+        }
+
+        /** @brief As above, also choosing whether processing is continuous
+         * (see SeqDB::set_continuous_processing) */
+        ParDBThread(ZMQAddress addr, size_t sz, bool skip_group_filters, size_t max_filters_per_stage, size_t write_batch_bytes,
+                    bool continuous_processing) :
+                db_(addr, sz, skip_group_filters, max_filters_per_stage, write_batch_bytes, continuous_processing), shutdown_(false) {
+            t_ = thread(&ParDBThread::launch, this);
+        }
+
         /** @brief As above, also ending passes early to bound memory (see memory_policy.hpp) */
         ParDBThread(ZMQAddress addr, size_t sz, bool skip_group_filters, size_t max_filters_per_stage, const MemoryPolicy& mem_policy) :
                 db_(addr, sz, skip_group_filters, max_filters_per_stage, mem_policy), shutdown_(false) {
