@@ -5,7 +5,7 @@ COPY code/ /code
 WORKDIR /build
 
 RUN cmake /code \
-    && make -j32 \
+    && make -j"$(nproc)" \
     && make install
 
 FROM pando_base_os

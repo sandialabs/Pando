@@ -1,0 +1,6 @@
+# Keep the pando_build context (repo root) small and cache-stable.
+# Only code/ and env/requirements_build.txt are actually COPY'd.
+.git
+sifs
+code/build
+*.tar
