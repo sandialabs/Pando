@@ -26,6 +26,12 @@ struct ParDBOptions {
      * Slurm's tasks per node, else the agents in the mesh with this agent's
      * IP address. */
     MemoryPolicy mem_policy;
+
+    /** @brief Default flush size for write batches (see ParDB::set_write_batch_bytes) */
+    static constexpr size_t DEFAULT_WRITE_BATCH_BYTES = 256 * 1024;
+
+    /** @brief Flush size for write batches; 0 turns batching off */
+    size_t write_batch_bytes = DEFAULT_WRITE_BATCH_BYTES;
 };
 
 }

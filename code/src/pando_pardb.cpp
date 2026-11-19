@@ -55,6 +55,7 @@ int main_(int argc, char **argv) {
 
     if (argc < 2) {
         cerr << "Usage: pando_pardb bind-addr [seed-addr] [-M<mem in GB>] [--skip-group-filters] [--max-filters-per-stage=N]\n"
+            "                   [--write-batch-bytes=N]\n"
             "                   [--mem-limit-pct=P] [--mem-pass-budget-mb=N] [--mem-budget-fraction=F]\n"
             "                   [--agents-per-node=N]\n"
             "\n"
@@ -65,6 +66,9 @@ int main_(int argc, char **argv) {
             "  --skip-group-filters : skip processing of group filters\n"
             "  --max-filters-per-stage=N : run at most N filters per processing pass before\n"
             "                              closing the stage (bounds memory; default unlimited)\n"
+            "  --write-batch-bytes=N : while filters run, send each agent's writes in messages\n"
+            "                          of about N bytes instead of one message per write\n"
+            "                          (default 262144; 0 = one message per write)\n"
             "\n"
             "Memory limits:\n"
             "  Filter output is held in memory until the stage closes. A processing pass ends\n"
@@ -98,6 +102,8 @@ int main_(int argc, char **argv) {
     MemoryPolicy mem_policy;    // enabled by default (see memory_policy.hpp)
 
     const string max_filters_flag = "--max-filters-per-stage=";
+    size_t write_batch_bytes = ParDB::DEFAULT_WRITE_BATCH_BYTES;
+    const string write_batch_flag = "--write-batch-bytes=";
     const string mem_limit_flag = "--mem-limit-pct=";
     const string mem_budget_flag = "--mem-pass-budget-mb=";
     const string mem_fraction_flag = "--mem-budget-fraction=";
@@ -121,6 +127,11 @@ int main_(int argc, char **argv) {
         } else if ((val = flag_val(arg, max_filters_flag))) {
             if (!parse_positive_u64(val, n)) return bad(max_filters_flag, val, "a positive integer");
             max_filters_per_stage = n;
+        } else if ((val = flag_val(arg, write_batch_flag))) {
+            // 0 is allowed: it turns batching off
+            if (string(val) == "0") write_batch_bytes = 0;
+            else if (!parse_positive_u64(val, n)) return bad(write_batch_flag, val, "a non-negative integer");
+            else write_batch_bytes = n;
         } else if ((val = flag_val(arg, mem_limit_flag))) {
             if (!parse_double_in(val, 0, 100, mem_policy.limit_pct, true)) return bad(mem_limit_flag, val, "a percent in [0, 100]");
         } else if ((val = flag_val(arg, mem_budget_flag))) {
@@ -141,7 +152,8 @@ int main_(int argc, char **argv) {
     }
 
     cerr << "[Pando] [DEBUG] Bind addr=" << bind_addr.get_conn_str(bind_addr, REQUEST) << " memory=" << sz
-         << " max_filters_per_stage=" << (max_filters_per_stage ? to_string(max_filters_per_stage) : string("unlimited")) << endl;
+         << " max_filters_per_stage=" << (max_filters_per_stage ? to_string(max_filters_per_stage) : string("unlimited"))
+         << " write_batch_bytes=" << (write_batch_bytes ? to_string(write_batch_bytes) : string("off")) << endl;
     if (mem_policy.enabled()) {
         cerr << "[Pando] [DEBUG] Memory limits: limit_pct=" << (mem_policy.limit_pct > 0 ? to_string(mem_policy.limit_pct) : string("off"))
              << " pass_budget_bytes=" << (mem_policy.pass_budget_bytes ? to_string(mem_policy.pass_budget_bytes) : string("off"))
@@ -154,6 +166,7 @@ int main_(int argc, char **argv) {
     opts.skip_group_filters = skip_group_filters;
     opts.max_filters_per_stage = max_filters_per_stage;
     opts.mem_policy = mem_policy;
+    opts.write_batch_bytes = write_batch_bytes;
     ParDBThread db { bind_addr, sz, opts };
 
     if (seed_addr.size() != 0) {
