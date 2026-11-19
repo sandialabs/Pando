@@ -70,6 +70,9 @@ class ParDBThread {
             }
         }
 
+        /** @brief The agent this thread runs (for tests: settings and counters) */
+        T& db() { return db_; }
+
         volatile sig_atomic_t* get_shutdown_flag() {
             return &shutdown_;
         }

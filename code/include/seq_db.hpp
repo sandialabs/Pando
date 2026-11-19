@@ -1006,6 +1006,12 @@ class SeqDB {
          */
         size_t entries_examined() const { return entries_examined_; }
 
+        /** @brief Whether changes are staged, waiting for a stage close */
+        bool has_staged_changes() const {
+            return !new_entries_.empty() || !val_updates_.empty() ||
+                   !tags_to_add_.empty() || !tags_to_remove_.empty();
+        }
+
         /** @brief Return the number of installed filters*/
         size_t num_filters() {return installed_filters_.size();}
 

@@ -1023,6 +1023,64 @@ TEST(filter_cursor_cross_agent) {
     TEST_PASS
 }
 
+// A processing request ends with exactly one pass that runs no filter, to
+// check that nothing else became eligible. (The barrier before a pass's
+// filters ran used to repeat the previous pass's answer, so every request
+// ended with two such passes.) Every agent takes part in every pass.
+TEST(process_request_ends_after_one_empty_pass) {
+    g_idx = 0;
+    const size_t n = 12;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr };
+    elga::ZMQAddress db3_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db3 { db3_addr };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    ParDBClient c3 { db3_addr };
+    vector<ZMQAddress> addrs { db1_addr, db2_addr, db3_addr };
+
+    c2.add_neighbor(db1_addr);
+    c3.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 3 || c2.num_neighbors() != 3 || c3.num_neighbors() != 3); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 3);
+    EQ(c2.num_neighbors(), 3);
+    EQ(c3.num_neighbors(), 3);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_new_entry");
+
+    for (size_t k = 0; k < n; ++k) {
+        DBEntry<> e; e.set_key({1, (vtx_t)(10+k), 0});
+        e.add_tag("A").add_to_value("v"+to_string(k));
+        c1.add_entry(e);
+    }
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() + c3.db_size() != n; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size() + c3.db_size(), n);
+
+    c1.process();
+    wait(addrs);
+
+    // The pass that runs the filters, then one that finds nothing to run
+    EQ(db1.db().passes_started(), 2);
+    EQ(db2.db().passes_started(), 2);
+    EQ(db3.db().passes_started(), 2);
+
+    size_t done = 0;
+    for (auto* c : {&c1, &c2, &c3})
+        for (auto & entry : c->get_entries())
+            if (entry.has_tag("A") && entry.has_tag("test_pardb_filters_new_entry:done")) ++done;
+    EQ(done, n);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1045,6 +1103,7 @@ TESTS_BEGIN
 
     RUN_TEST(in_out_edges_bad_order)
     RUN_TEST(subscribing_consensus)
+    RUN_TEST(process_request_ends_after_one_empty_pass)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END
