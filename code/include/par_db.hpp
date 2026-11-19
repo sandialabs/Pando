@@ -69,11 +69,10 @@ class ParDB : public PandoParticipant {
 
         bool skip_group_filters_ = false;
 
-        /** @brief Highest pass any other agent asked to close early (see
-         * CLOSE_EARLY); 0 if none. Requests can arrive before this agent
-         * starts that pass, so they are remembered rather than matched as
-         * they are received. */
-        uint64_t close_early_pass_ = 0;
+        /** @brief The CLOSE_EARLY requests other agents have sent. Requests
+         * can arrive before this agent starts that pass, so they are
+         * remembered rather than matched as they are received. */
+        CloseEarlyState close_early_;
         /** @brief Last pass this agent asked everyone to close early, so it
          * asks at most once per pass */
         uint64_t close_early_sent_pass_ = 0;
@@ -121,7 +120,8 @@ class ParDB : public PandoParticipant {
          * @param mem_policy when to end a pass early to bound memory (see
          *        memory_policy.hpp); enabled by default, MemoryPolicy::disabled()
          *        turns it off. Requests from other agents to close early are
-         *        honored either way, once a filter has run in the pass. An
+         *        honored either way: right away if the asking agent ran a
+         *        filter in the pass, else once a filter has run here. An
          *        agents_per_node of 0 uses Slurm's tasks per node, else the
          *        agents in the mesh with this agent's IP address.
          */
@@ -172,7 +172,7 @@ class ParDB : public PandoParticipant {
             // message loop does not read, so checking cannot take any other
             // message off the main subscription.
             ctrl_sub(CLOSE_EARLY);
-            db_.set_stop_requested_callback([this]() { return close_early_requested_(); });
+            db_.set_stop_requested_callback([this](bool have_run) { return close_early_requested_(have_run); });
         }
         ParDB(ZMQAddress addr) : ParDB(addr, 2ull*(1ull<<29)) { }
 
@@ -194,13 +194,16 @@ class ParDB : public PandoParticipant {
 
             // Done with our filters and waiting on the rest of the mesh, whose
             // output keeps arriving here until the stage closes: if memory is
-            // over the limit now, ask everyone to stop
+            // over the limit now, ask everyone to stop. We may have run no
+            // filter this pass, and then the request only stops agents that
+            // have (see CloseEarlyState).
             if (state_ == STAGE_PROCESSED && db_.under_memory_pressure())
-                publish_close_early_(STOP_MEM_PRESSURE);
+                publish_close_early_(STOP_MEM_PRESSURE, db_.filters_run_last_pass() > 0);
         }
 
-        /** @brief Ask every agent to end the current pass early (once per pass) */
-        void publish_close_early_(uint8_t reason) {
+        /** @brief Ask every agent to end the current pass early (once per pass)
+         * @param ran_filter whether this agent ran a filter in the pass */
+        void publish_close_early_(uint8_t reason, bool ran_filter) {
             uint64_t pass = db_.stats().pass;
             if (pass == 0 || close_early_sent_pass_ == pass) return;
             close_early_sent_pass_ = pass;
@@ -212,32 +215,33 @@ class ParDB : public PandoParticipant {
             req.agent = addr_ser_;
             req.pass = pass;
             req.reason = reason;
+            req.ran_filter = ran_filter;
             StatsWriter w { CLOSE_EARLY };
             req.serialize(w);
             pub(w.data(), w.size());
         }
 
-        /** @brief Read any CLOSE_EARLY requests and return whether one is
-         * for the current pass
+        /** @brief Read any CLOSE_EARLY requests and return whether they end
+         * the current pass (see CloseEarlyState::should_stop)
          *
          * Every agent advances ProcessStats::pass on the same PROCESS and
          * ALGPROCESS broadcasts, so pass numbers agree across the mesh. (An
          * agent that joins after processing has started can disagree; at
          * worst it then ignores a request or stops one pass early, both of
          * which are safe.)
+         *
+         * @param have_run whether this agent has run a filter in the pass
          */
-        bool close_early_requested_() {
+        bool close_early_requested_(bool have_run) {
             drain_ctrl([this](const char* data, const char* end) {
                 msg_type_t type = unpack_msg(data);
                 if (type != CLOSE_EARLY) return;
                 CloseEarlyRequest req;
                 if (!req.deserialize(data, end)) return;
-                // Publications reach our own subscription too
-                if (req.agent == addr_ser_) return;
-                close_early_pass_ = max(close_early_pass_, req.pass);
+                // Publications reach our own subscription too; record skips them
+                close_early_.record(req, addr_ser_);
             });
-            uint64_t pass = db_.stats().pass;
-            return pass != 0 && close_early_pass_ == pass;
+            return close_early_.should_stop(db_.stats().pass, have_run);
         }
 
         /** @brief Publish a PROGRESS message describing our processing */
@@ -942,10 +946,12 @@ class ParDB : public PandoParticipant {
 
             // We stopped to bound memory, but the other agents' output keeps
             // arriving here until every agent stops and the stage closes, so
-            // ask them to stop too
+            // ask them to stop too. Both reasons apply only after a filter
+            // run, so this pass has made progress here and the others may
+            // stop even if they have run nothing yet.
             uint8_t reason = db_.stats().stop_reason;
             if (reason == STOP_MEM_BUDGET || reason == STOP_MEM_PRESSURE)
-                publish_close_early_(reason);
+                publish_close_early_(reason, true);
 
             finish_db_process();
         }

@@ -225,9 +225,14 @@ class SeqDB {
          * agents_per_node is 0 (auto); unset means 1 */
         function<uint64_t()> agents_per_node_source_;
 
-        /** @brief Asked (at most every check_interval, once a filter has run
-         * this pass) whether another agent wants this pass to end */
-        function<bool()> stop_requested_cb_;
+        /** @brief Asked (at most every check_interval) whether another agent
+         * wants this pass to end. The argument says whether a filter has run
+         * in this pass yet; see set_stop_requested_callback. */
+        function<bool(bool)> stop_requested_cb_;
+
+        /** @brief Filter runs in the current (or, between passes, the last)
+         * run_filters_() */
+        size_t filters_run_last_pass_ = 0;
 
         /** @brief This pass checks MemAvailable against mem_reserve_bytes_ */
         bool mem_pressure_check_ = false;
@@ -244,7 +249,7 @@ class SeqDB {
             stats_.byte_budget = NO_BYTE_BUDGET;
             mem_pressure_check_ = false;
             mem_reserve_bytes_ = 0;
-            // The first timed check happens right after the pass's first run
+            // The first timed check happens right after the pass's first entry
             next_stop_check_ = steady_clock::now();
 
             if (!mem_policy_.enabled()) return;
@@ -269,33 +274,41 @@ class SeqDB {
         /** @brief Decide whether the pass should stop now
          *
          * Called after each entry. max_filters_per_stage_ applies as always.
-         * The memory checks and requests from other agents only apply once at
-         * least one filter has run this pass. That is what guarantees
-         * progress however high memory is when the pass starts: a budget of 0
-         * would otherwise stop a pass before it did anything, and since an
-         * unfinished lap must report "process again", passes would repeat
-         * forever without doing any work. The byte
-         * budget is checked every time (it is just a comparison); reading the
-         * system memory and asking stop_requested_cb_ are rate limited by
-         * check_interval.
+         * The memory checks only apply once at least one filter has run this
+         * pass. That is what guarantees progress however high memory is when
+         * the pass starts: a budget of 0 would otherwise stop a pass before it
+         * did anything, and since an unfinished lap must report "process
+         * again", passes would repeat forever without doing any work.
+         *
+         * Requests from other agents are asked about before any run too, and
+         * stop_requested_cb_ is told whether a filter has run. It may end a
+         * pass that has run nothing here only if the pass made progress
+         * elsewhere (ParDB: the asking agent ran a filter in it; see
+         * CloseEarlyState). The pass still scanned at least one entry, and the
+         * cursor carries over, so no scanning is lost.
+         *
+         * The byte budget is checked every time (it is just a comparison);
+         * reading the system memory and asking stop_requested_cb_ are rate
+         * limited by check_interval.
          *
          * @return a stop_reason_t, STOP_NONE to keep going
          */
         uint8_t check_stop_(size_t num_filters_run) {
             if (num_filters_run >= max_filters_per_stage_) return STOP_MAX_FILTERS;
-            if (num_filters_run == 0) return STOP_NONE;
-            if (stats_.bytes_emitted >= stats_.byte_budget) return STOP_MEM_BUDGET;
-            if (!mem_pressure_check_ && !stop_requested_cb_) return STOP_NONE;
+            bool have_run = num_filters_run > 0;
+            if (have_run && stats_.bytes_emitted >= stats_.byte_budget) return STOP_MEM_BUDGET;
+            bool pressure_check = have_run && mem_pressure_check_;
+            if (!pressure_check && !stop_requested_cb_) return STOP_NONE;
 
             auto now = steady_clock::now();
             if (now < next_stop_check_) return STOP_NONE;
             next_stop_check_ = now + mem_policy_.check_interval;
 
-            if (mem_pressure_check_) {
+            if (pressure_check) {
                 MemInfo mem = meminfo_source_();
                 if (mem.ok && mem.available_bytes < mem_reserve_bytes_) return STOP_MEM_PRESSURE;
             }
-            if (stop_requested_cb_ && stop_requested_cb_()) return STOP_REMOTE;
+            if (stop_requested_cb_ && stop_requested_cb_(have_run)) return STOP_REMOTE;
             return STOP_NONE;
         }
 
@@ -361,6 +374,7 @@ class SeqDB {
             // are checked after all filters have been offered an entry, so a
             // pass can go over them by up to one entry's worth of filter runs.
             size_t num_filters_run = 0;
+            filters_run_last_pass_ = 0;
             begin_stop_checks_();
 
             // Look up each SINGLE_ENTRY filter's counters once, not per entry
@@ -424,6 +438,7 @@ class SeqDB {
                                 counters->run_ns += duration_cast<nanoseconds>(steady_clock::now() - start).count();
                                 ++counters->ran;
                                 ++num_filters_run;
+                                ++filters_run_last_pass_;
                             }
 
                             delete access;
@@ -434,6 +449,14 @@ class SeqDB {
                     report_progress_if_due_();
 
                     uint8_t reason = check_stop_(num_filters_run);
+                    // A remote stop can come before any run. If it comes on
+                    // the last entry of a lap that began at the first key, the
+                    // lap is complete and ran nothing: let the end-of-lap
+                    // handling below report that we are done, rather than
+                    // stopping and asking for another pass.
+                    if (reason != STOP_NONE && num_filters_run == 0 && lap_from_start
+                            && scan_pos_ >= scan_keys_.size())
+                        reason = STOP_NONE;
                     if (reason != STOP_NONE) {
                         #ifdef VERBOSE
                         cerr << "breaking early: " << stop_reason_name(reason) << " (cursor at " << scan_pos_ << "/"
@@ -441,10 +464,13 @@ class SeqDB {
                              << stats_.bytes_emitted << " bytes emitted)" << endl;
                         #endif
                         // Keep the cursor; the next pass continues from here.
-                        // Every reason requires at least one filter run (the
-                        // run limit is >= 1, and check_stop_ checks nothing
-                        // else before a run), so returning true (process
-                        // again) is correct and the next pass makes progress.
+                        // The lap is unfinished, so returning true (process
+                        // again) is correct. Passes still make progress: the
+                        // run limit and memory checks need a run here (the
+                        // limit is >= 1), and a remote stop before any run
+                        // is only honored if the pass ran a filter elsewhere
+                        // (see check_stop_). Either way at least one entry
+                        // was scanned, so the cursor has moved.
                         stats_.stopped_early = scan_pos_ < scan_keys_.size();
                         stats_.stop_reason = reason;
                         return true;
@@ -976,12 +1002,24 @@ class SeqDB {
         }
 
         /** @brief Set a check for requests (e.g. from other agents) to end the
-         * current pass early. It is called while filters run, at most every
-         * check_interval (from the memory policy, which need not be enabled
-         * for this) and only once a filter has run this pass. */
-        void set_stop_requested_callback(function<bool()> cb) {
+         * current pass early. It is called while filters run, after an entry,
+         * at most every check_interval (from the memory policy, which need not
+         * be enabled for this). Its argument says whether a filter has run in
+         * this pass yet.
+         *
+         * Returning true before any run here ends a pass that did nothing on
+         * this DB (it keeps its cursor and reports "process again"). Do that
+         * only if the pass made progress elsewhere, e.g. the asking agent ran
+         * a filter in it; otherwise passes could repeat forever without any
+         * work. ParDB's callback follows that rule (see CloseEarlyState). */
+        void set_stop_requested_callback(function<bool(bool have_run)> cb) {
             stop_requested_cb_ = move(cb);
         }
+
+        /** @brief Filter runs in the last run_filters_() (the current one,
+         * while it runs). ParDB reads it after its pass's filters, to say in a
+         * CLOSE_EARLY whether it ran any. */
+        size_t filters_run_last_pass() const { return filters_run_last_pass_; }
 
         /** @brief Whether system memory is above the limit right now. Uses
          * the reserve computed when the last pass started; false if the

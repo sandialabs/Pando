@@ -22,7 +22,8 @@ struct ParDBOptions {
     /** @brief When to end a processing pass early to bound memory (see
      * memory_policy.hpp); enabled by default, MemoryPolicy::disabled() turns
      * it off. Requests from other agents to close early are honored either
-     * way, once a filter has run in the pass. An agents_per_node of 0 uses
+     * way: right away if the asking agent ran a filter in the pass, else once
+     * a filter has run here (see CloseEarlyState). An agents_per_node of 0 uses
      * Slurm's tasks per node, else the agents in the mesh with this agent's
      * IP address. */
     MemoryPolicy mem_policy;
