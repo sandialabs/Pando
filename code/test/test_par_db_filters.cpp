@@ -1081,6 +1081,44 @@ TEST(process_request_ends_after_one_empty_pass) {
     TEST_PASS
 }
 
+// An agent built from ParDBOptions uses its settings: with one filter run
+// per pass, each "A" entry takes a pass of its own
+TEST(pardb_from_options) {
+    g_idx = 0;
+    const size_t n = 4;
+    ParDBOptions opts;
+    opts.max_filters_per_stage = 1;
+    opts.mem_policy = MemoryPolicy::disabled();
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr, 2ull*(1ull<<29), opts };
+    ParDBClient c1 { db1_addr };
+    vector<ZMQAddress> addrs { db1_addr };
+    this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 1);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_new_entry");
+    for (size_t k = 0; k < n; ++k) {
+        DBEntry<> e; e.set_key({1, (vtx_t)(10+k), 0});
+        e.add_tag("A").add_to_value("v"+to_string(k));
+        c1.add_entry(e);
+    }
+    EQ(c1.db_size(), n);
+
+    c1.process();
+    wait(addrs);
+
+    EQ(db1.db().passes_started() >= n, true);
+    size_t done = 0;
+    for (auto & entry : c1.get_entries())
+        if (entry.has_tag("A") && entry.has_tag("test_pardb_filters_new_entry:done")) ++done;
+    EQ(done, n);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1104,6 +1142,7 @@ TESTS_BEGIN
     RUN_TEST(in_out_edges_bad_order)
     RUN_TEST(subscribing_consensus)
     RUN_TEST(process_request_ends_after_one_empty_pass)
+    RUN_TEST(pardb_from_options)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END
