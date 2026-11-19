@@ -300,6 +300,15 @@ class SeqDB {
             return STOP_NONE;
         }
 
+        /** @brief The scan fetches entries from the map in blocks of this many
+         * keys, one request per block (see set_scan_block_keys) */
+        size_t scan_block_keys_ = DEFAULT_SCAN_BLOCK_KEYS;
+        /** @brief ...and a block's reply stops growing past about this many
+         * bytes, so databases with large values (e.g. whole blocks of a
+         * blockchain) do not get huge replies; the rest of the block is
+         * fetched with the next request */
+        static constexpr size_t SCAN_BLOCK_BYTES = 16u << 20;
+
         /** @brief Start the next pass on a fresh snapshot, freeing the old one */
         void reset_scan_() {
             vector<dbkey_t>().swap(scan_keys_);
@@ -392,11 +401,25 @@ class SeqDB {
                 stats_.keys_scanned = scan_pos_;
 
                 while (scan_pos_ < scan_keys_.size()) {
-                    dbkey_t key = scan_keys_[scan_pos_++];
-                    // The snapshot can be older than this pass; skip anything gone
-                    auto [entry, exists] = db_.retrieve_if_exists(key); //TODO also batch retrievals
+                  // Fetch the next block of entries with one request to the
+                  // map, instead of one request per key. The block is not kept
+                  // past this pass: a stage close can change any entry.
+                  size_t block_begin = scan_pos_;
+                  size_t block_keys = 0;
+                  vector<DBEntry<>> block = db_.retrieve_entries_by_keys(scan_keys_, block_begin,
+                      scan_block_keys_, SCAN_BLOCK_BYTES, block_keys);
+                  size_t next_in_block = 0;
+
+                  for (size_t p = block_begin; p < block_begin + block_keys; ++p) {
+                    dbkey_t key = scan_keys_[p];
+                    scan_pos_ = p + 1;
+                    // The snapshot can be older than this pass; skip anything
+                    // gone (the block holds only the keys that still exist,
+                    // in key order)
+                    bool exists = next_in_block < block.size() && block[next_in_block].get_key() == key;
                     ++entries_examined_;
                     if (exists) {
+                        DBEntry<>& entry = block[next_in_block++];
                         #ifdef VERBOSE
                         if (++i % 10000 == 0) {
                             cerr << "I have processed " << i << " entries this pass (cursor at " << scan_pos_ << "/"
@@ -441,15 +464,17 @@ class SeqDB {
                              << scan_keys_.size() << ", " << num_filters_run << " filters run, "
                              << stats_.bytes_emitted << " bytes emitted)" << endl;
                         #endif
-                        // Keep the cursor; the next pass continues from here.
-                        // Every reason requires at least one filter run (the
-                        // run limit is >= 1, and check_stop_ checks nothing
-                        // else before a run), so returning true (process
-                        // again) is correct and the next pass makes progress.
+                        // Keep the cursor; the next pass continues from here
+                        // (fetching the rest of this block again). Every
+                        // reason requires at least one filter run (the run
+                        // limit is >= 1, and check_stop_ checks nothing else
+                        // before a run), so returning true (process again) is
+                        // correct and the next pass makes progress.
                         stats_.stopped_early = scan_pos_ < scan_keys_.size();
                         stats_.stop_reason = reason;
                         return true;
                     }
+                  }
                 }
 
                 // Reached the end of the snapshot
@@ -1006,6 +1031,21 @@ class SeqDB {
          * total (each entry fetched by a processing pass counts once)
          */
         size_t entries_examined() const { return entries_examined_; }
+
+        /** @brief Default number of keys the scan fetches per request */
+        static constexpr size_t DEFAULT_SCAN_BLOCK_KEYS = 4096;
+
+        /** @brief Set how many keys the filter scan fetches from the map per
+         * request. Larger blocks mean fewer requests; each block's entries are
+         * held in memory while it is scanned (its reply is capped at about
+         * SCAN_BLOCK_BYTES whatever the block size). */
+        void set_scan_block_keys(size_t n) {
+            if (n == 0) throw invalid_argument("scan_block_keys must be at least 1");
+            scan_block_keys_ = n;
+        }
+
+        /** @brief Return how many keys the filter scan fetches per request */
+        size_t scan_block_keys() const { return scan_block_keys_; }
 
         /** @brief Whether changes are staged, waiting for a stage close */
         bool has_staged_changes() const {

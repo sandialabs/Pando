@@ -213,6 +213,55 @@ class PandoMap : public PandoParticipant {
             delete [] msg;
         }
 
+        /** @brief Look up whole entries (keys, tags and values) for a run of keys
+         *
+         * Request: [size_t count][size_t max_bytes][count x dbkey_t]
+         * Reply:   [size_t keys_covered][entry]...
+         *
+         * The keys are looked up in order. Keys that do not exist are skipped,
+         * and the entries that do exist are serialized in key order. Once the
+         * reply would grow past max_bytes, no more keys are looked up, so a
+         * reply never holds much more than max_bytes (it always covers at
+         * least one key, however large its entry). keys_covered says how many
+         * of the requested keys the reply accounts for; the caller asks again
+         * for the rest. A malformed request is answered with keys_covered = 0.
+         */
+        void recv_map_get_entries_by_keys(zmq_socket_t sock, const char* data, const char* end) {
+            size_t num_keys = 0, max_bytes = 0;
+            bool ok = (size_t)(end - data) >= 2*sizeof(size_t);
+            if (ok) {
+                unpack_single(data, num_keys);
+                unpack_single(data, max_bytes);
+                ok = num_keys <= (size_t)(end - data) / sizeof(dbkey_t) &&
+                     (size_t)(end - data) == num_keys * sizeof(dbkey_t);
+            }
+            if (!ok) num_keys = 0;
+
+            vector<const DBEntry<Alloc>*> found;
+            size_t msg_size = sizeof(size_t);
+            size_t covered = 0;
+            for (; covered < num_keys; ++covered) {
+                if (covered > 0 && msg_size >= max_bytes) break;
+                dbkey_t key;
+                unpack_single(data, key);
+                auto it = map_.find(key);
+                if (it == map_.end()) continue;
+                it->second.set_key(key);
+                found.push_back(&(it->second));
+                msg_size += it->second.serialize_size();
+            }
+
+            char* msg = new char[msg_size];
+            char *msg_ptr = msg;
+            pack_single(msg_ptr, covered);
+            for (auto entry : found)
+                entry->serialize(msg_ptr);
+
+            ZMQChatterbox::send(sock, msg, msg_size);
+
+            delete [] msg;
+        }
+
         void recv_map_does_key_exist(zmq_socket_t sock, const char* data, [[maybe_unused]] const char* end) {
             dbkey_t key;
             unpack_single(data, key);
@@ -300,6 +349,8 @@ class PandoMap : public PandoParticipant {
                 recv_map_get_entries(sock, data, end);
             else if (type == MAP_GET_TAGS_BY_KEYS)
                 recv_map_get_tags_by_keys(sock, data, end);
+            else if (type == MAP_GET_ENTRIES_BY_KEYS)
+                recv_map_get_entries_by_keys(sock, data, end);
             else if (type == MAP_DOES_KEY_EXIST)
                 recv_map_does_key_exist(sock, data, end);
             else if (type == MAP_RETRIEVE_VALUES)

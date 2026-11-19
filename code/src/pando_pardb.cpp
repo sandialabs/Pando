@@ -55,7 +55,7 @@ int main_(int argc, char **argv) {
 
     if (argc < 2) {
         cerr << "Usage: pando_pardb bind-addr [seed-addr] [-M<mem in GB>] [--skip-group-filters] [--max-filters-per-stage=N]\n"
-            "                   [--write-batch-bytes=N]\n"
+            "                   [--write-batch-bytes=N] [--scan-block-keys=N]\n"
             "                   [--mem-limit-pct=P] [--mem-pass-budget-mb=N] [--mem-budget-fraction=F]\n"
             "                   [--agents-per-node=N]\n"
             "\n"
@@ -69,6 +69,8 @@ int main_(int argc, char **argv) {
             "  --write-batch-bytes=N : while filters run, send each agent's writes in messages\n"
             "                          of about N bytes instead of one message per write\n"
             "                          (default 262144; 0 = one message per write)\n"
+            "  --scan-block-keys=N : keys the filter scan fetches from the map per request\n"
+            "                          (default 4096; each reply is also capped at ~16 MB)\n"
             "\n"
             "Memory limits:\n"
             "  Filter output is held in memory until the stage closes. A processing pass ends\n"
@@ -104,6 +106,8 @@ int main_(int argc, char **argv) {
     const string max_filters_flag = "--max-filters-per-stage=";
     size_t write_batch_bytes = ParDB::DEFAULT_WRITE_BATCH_BYTES;
     const string write_batch_flag = "--write-batch-bytes=";
+    size_t scan_block_keys = 0;  // 0 = SeqDB default
+    const string scan_block_flag = "--scan-block-keys=";
     const string mem_limit_flag = "--mem-limit-pct=";
     const string mem_budget_flag = "--mem-pass-budget-mb=";
     const string mem_fraction_flag = "--mem-budget-fraction=";
@@ -132,6 +136,9 @@ int main_(int argc, char **argv) {
             if (string(val) == "0") write_batch_bytes = 0;
             else if (!parse_positive_u64(val, n)) return bad(write_batch_flag, val, "a non-negative integer");
             else write_batch_bytes = n;
+        } else if ((val = flag_val(arg, scan_block_flag))) {
+            if (!parse_positive_u64(val, n)) return bad(scan_block_flag, val, "a positive integer");
+            scan_block_keys = n;
         } else if ((val = flag_val(arg, mem_limit_flag))) {
             if (!parse_double_in(val, 0, 100, mem_policy.limit_pct, true)) return bad(mem_limit_flag, val, "a percent in [0, 100]");
         } else if ((val = flag_val(arg, mem_budget_flag))) {
@@ -153,7 +160,8 @@ int main_(int argc, char **argv) {
 
     cerr << "[Pando] [DEBUG] Bind addr=" << bind_addr.get_conn_str(bind_addr, REQUEST) << " memory=" << sz
          << " max_filters_per_stage=" << (max_filters_per_stage ? to_string(max_filters_per_stage) : string("unlimited"))
-         << " write_batch_bytes=" << (write_batch_bytes ? to_string(write_batch_bytes) : string("off")) << endl;
+         << " write_batch_bytes=" << (write_batch_bytes ? to_string(write_batch_bytes) : string("off"))
+         << " scan_block_keys=" << (scan_block_keys ? to_string(scan_block_keys) : string("default")) << endl;
     if (mem_policy.enabled()) {
         cerr << "[Pando] [DEBUG] Memory limits: limit_pct=" << (mem_policy.limit_pct > 0 ? to_string(mem_policy.limit_pct) : string("off"))
              << " pass_budget_bytes=" << (mem_policy.pass_budget_bytes ? to_string(mem_policy.pass_budget_bytes) : string("off"))
@@ -167,6 +175,7 @@ int main_(int argc, char **argv) {
     opts.max_filters_per_stage = max_filters_per_stage;
     opts.mem_policy = mem_policy;
     opts.write_batch_bytes = write_batch_bytes;
+    opts.scan_block_keys = scan_block_keys;
     ParDBThread db { bind_addr, sz, opts };
 
     if (seed_addr.size() != 0) {

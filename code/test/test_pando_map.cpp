@@ -351,6 +351,89 @@ TEST(large_msg) {
 
 }
 
+// Whole entries for a run of keys in one request: values and tags exact,
+// missing keys skipped, and a reply that stops at about max_bytes still
+// covers at least one key
+TEST(retrieve_entries_by_keys) {
+    ZMQAddress map_addr {"127.0.0.1", ++g_idx};
+    ParDBThread<PandoMap> m {map_addr};
+    PandoMapClient c {map_addr, map_addr};
+
+    // Every third key does not exist
+    size_t num_keys = 1500;
+    vector<dbkey_t> keys;
+    for (chain_info_t i = 0; i < num_keys; i++) {
+        dbkey_t key {i, 3, 4};
+        keys.push_back(key);
+        if (i % 3 == 2) continue;
+        DBEntry<> e;
+        e.value() = string(100 + i, (char)('a' + i % 26));
+        e.add_tag("tag").add_tag("i=" + to_string(i));
+        e.set_key(key);
+        c.insert(move(e));
+    }
+
+    // Unlimited bytes: one request covers the whole run, in key order
+    {
+        size_t covered = 0;
+        auto entries = c.retrieve_entries_by_keys(keys, 0, keys.size(), (size_t)-1, covered);
+        EQ(covered, num_keys);
+        EQ(entries.size(), num_keys - num_keys / 3);
+        size_t n = 0;
+        for (chain_info_t i = 0; i < num_keys; i++) {
+            if (i % 3 == 2) continue;
+            auto & e = entries[n++];
+            EQ(e.get_key() == (dbkey_t{i, 3, 4}), true);
+            EQ(e.value() == string(100 + i, (char)('a' + i % 26)), true);
+            EQ(e.tags().size(), 2);
+            EQ(e.has_tag("i=" + to_string(i)), true);
+        }
+    }
+
+    // A small byte limit: each reply covers fewer keys; asking again from
+    // where the last one stopped still gets every entry exactly once
+    {
+        size_t begin = 0, total = 0, requests = 0;
+        while (begin < keys.size()) {
+            size_t covered = 0;
+            auto entries = c.retrieve_entries_by_keys(keys, begin, 4096, 2000, covered);
+            EQ(covered >= 1, true);
+            for (auto & e : entries) {
+                EQ(e.get_key().a >= begin && e.get_key().a < begin + covered, true);
+                ++total;
+            }
+            begin += covered;
+            ++requests;
+        }
+        EQ(total, num_keys - num_keys / 3);
+        EQ(requests > 10, true);
+    }
+
+    // One entry larger than the limit is still returned, alone
+    {
+        DBEntry<> big;
+        big.value() = string(100000, 'z');
+        big.set_key({9999, 3, 4});
+        c.insert(move(big));
+        vector<dbkey_t> two { {9999, 3, 4}, {0, 3, 4} };
+        size_t covered = 0;
+        auto entries = c.retrieve_entries_by_keys(two, 0, 2, 1000, covered);
+        EQ(covered, 1);
+        EQ(entries.size(), 1);
+        EQ(entries[0].value().size(), 100000);
+    }
+
+    // Asking past the end returns nothing
+    {
+        size_t covered = 7;
+        auto entries = c.retrieve_entries_by_keys(keys, keys.size(), 10, 1000, covered);
+        EQ(covered, 0);
+        EQ(entries.size(), 0);
+    }
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
     RUN_TEST(insert_retrieve)
@@ -360,6 +443,7 @@ TESTS_BEGIN
     RUN_TEST(get_keys_ipc_large)
     RUN_TEST(retrieve_all)
     RUN_TEST(retrieve_tags_by_keys)
+    RUN_TEST(retrieve_entries_by_keys)
     //RUN_TEST(start_stop_quickly) //FIXME does this test even make sense? fails on ubuntu
     RUN_TEST(retrieve_if_exists)
     RUN_TEST(insert_multiple)
