@@ -11,7 +11,10 @@
  *
  *  - Byte budget: at the start of each pass, the budget is a fraction of the
  *    node's memory headroom (MemAvailable above the reserve the limit leaves),
- *    split over the agents on the node, and/or a fixed number of bytes. The
+ *    split over the agents on the node, and/or a fixed number of bytes.
+ *    "The node's memory" is limited by the process's cgroup when it has a
+ *    memory limit (read_effective_meminfo): under Slurm, the job's --mem is
+ *    what the job is killed at, and it can be well below the node's memory. The
  *    pass stops once its filters have emitted that many bytes of output.
  *  - Pressure: the pass also stops if MemAvailable drops below the reserve
  *    while it runs (e.g. because of other agents or other processes).
@@ -27,6 +30,7 @@
  * Kept free of DB and ZeroMQ dependencies so it can be tested on its own.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -76,6 +80,150 @@ inline MemInfo read_meminfo(const std::string& path = "/proc/meminfo") {
     std::ifstream in { path };
     if (!in) return MemInfo{};
     return parse_meminfo(in);
+}
+
+/** @brief A memory limit from this process's cgroup (e.g. a Slurm job's --mem) */
+struct CgroupMemory {
+    /** false if no limit was found (no cgroup, files not readable, or unlimited) */
+    bool ok = false;
+    uint64_t limit_bytes = 0;
+    /** Memory charged to the cgroup with the limit, minus its file page cache
+     * (active and inactive), which the kernel reclaims before the cgroup
+     * reaches its limit, so it compares with MemAvailable, which also counts
+     * page cache as available. Shared memory (tmpfs, such as a /scratch in
+     * RAM) is not on these lists, and stays counted as used. */
+    uint64_t used_bytes = 0;
+};
+
+/** @brief Read the first number in a file; "max" (cgroup v2) means unlimited
+ * @return false if the file cannot be read */
+inline bool read_cgroup_value_(const std::string& path, uint64_t& value, bool& unlimited) {
+    std::ifstream in { path };
+    std::string tok;
+    if (!(in >> tok)) return false;
+    unlimited = (tok == "max");
+    if (unlimited) return true;
+    for (char c : tok) if (c < '0' || c > '9') return false;
+    value = std::strtoull(tok.c_str(), nullptr, 10);
+    // cgroup v1 writes "no limit" as a huge page-aligned number
+    if (value >= (1ull << 60)) unlimited = true;
+    return true;
+}
+
+/** @brief The file page cache (active plus inactive file pages) in a
+ * memory.stat file; 0 if absent
+ *
+ * Both lists count: pages a process reads twice (or that reclaim finds
+ * recently used) move to the active list, but they stay clean page cache
+ * that the kernel drops when the cgroup nears its limit, and MemAvailable
+ * counts both lists as available. Counting only the inactive list made the
+ * job look far fuller than it was once its files had been read more than
+ * once. cgroup v1 gives each key also as total_* (this cgroup and its
+ * descendants), which is preferred. */
+inline uint64_t read_cgroup_file_pages_(const std::string& path) {
+    std::ifstream in { path };
+    std::string k;
+    uint64_t v;
+    uint64_t active = 0, inactive = 0, total_active = 0, total_inactive = 0;
+    bool have_total = false;
+    while (in >> k >> v) {
+        if (k == "active_file") active = v;
+        else if (k == "inactive_file") inactive = v;
+        else if (k == "total_active_file") { total_active = v; have_total = true; }
+        else if (k == "total_inactive_file") { total_inactive = v; have_total = true; }
+    }
+    return have_total ? total_active + total_inactive : active + inactive;
+}
+
+/** @brief Find the tightest memory limit on the path from a cgroup up to the
+ * root of its hierarchy
+ *
+ * Limits are often set on an ancestor rather than the process's own cgroup
+ * (Slurm sets --mem on the job or step, the process is in a task cgroup), so
+ * every level is checked, and usage is taken from the cgroup that has the
+ * tightest limit.
+ *
+ * @param proc_cgroup the contents of /proc/self/cgroup
+ * @param root where the cgroup file systems are mounted
+ */
+inline CgroupMemory find_cgroup_memory(const std::string& proc_cgroup, const std::string& root = "/sys/fs/cgroup") {
+    // Lines are "hierarchy-id:controllers:path"
+    std::string v2_path, v1_path;
+    bool have_v2 = false, have_v1 = false;
+    std::istringstream lines { proc_cgroup };
+    std::string line;
+    while (std::getline(lines, line)) {
+        size_t c1 = line.find(':');
+        size_t c2 = c1 == std::string::npos ? std::string::npos : line.find(':', c1 + 1);
+        if (c2 == std::string::npos) continue;
+        std::string id = line.substr(0, c1), ctrls = line.substr(c1 + 1, c2 - c1 - 1), path = line.substr(c2 + 1);
+        if (id == "0" && ctrls.empty()) { v2_path = path; have_v2 = true; }
+        else {
+            std::istringstream cs { ctrls };
+            std::string ctrl;
+            while (std::getline(cs, ctrl, ','))
+                if (ctrl == "memory") { v1_path = path; have_v1 = true; }
+        }
+    }
+
+    auto walk = [](std::string base, std::string path, const char* limit_file, const char* usage_file) {
+        CgroupMemory best;
+        while (true) {
+            std::string dir = base + (path == "/" ? "" : path);
+            uint64_t limit = 0;
+            bool unlimited = false;
+            if (read_cgroup_value_(dir + "/" + limit_file, limit, unlimited) && !unlimited &&
+                    (!best.ok || limit < best.limit_bytes)) {
+                uint64_t usage = 0;
+                bool usage_unlimited = false;
+                if (read_cgroup_value_(dir + "/" + usage_file, usage, usage_unlimited)) {
+                    uint64_t file_pages = read_cgroup_file_pages_(dir + "/memory.stat");
+                    best.ok = true;
+                    best.limit_bytes = limit;
+                    best.used_bytes = usage > file_pages ? usage - file_pages : 0;
+                }
+            }
+            if (path.empty() || path == "/") break;
+            size_t slash = path.find_last_of('/');
+            path = slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash);
+        }
+        return best;
+    };
+
+    if (have_v2) {
+        CgroupMemory m = walk(root, v2_path, "memory.max", "memory.current");
+        if (m.ok) return m;
+    }
+    if (have_v1)
+        return walk(root + "/memory", v1_path, "memory.limit_in_bytes", "memory.usage_in_bytes");
+    return CgroupMemory{};
+}
+
+/** @brief Memory as the node's and the cgroup's limits allow together: the
+ * smaller total, and the smaller amount available */
+inline MemInfo apply_cgroup_limit(const MemInfo& node, const CgroupMemory& cg) {
+    if (!cg.ok) return node;
+    MemInfo m;
+    m.ok = true;
+    uint64_t cg_avail = cg.limit_bytes > cg.used_bytes ? cg.limit_bytes - cg.used_bytes : 0;
+    m.total_bytes = node.ok ? std::min(node.total_bytes, cg.limit_bytes) : cg.limit_bytes;
+    m.available_bytes = node.ok ? std::min(node.available_bytes, cg_avail) : cg_avail;
+    if (m.available_bytes > m.total_bytes) m.available_bytes = m.total_bytes;
+    return m;
+}
+
+/** @brief This process's memory: the node's (/proc/meminfo), limited by its
+ * cgroup's memory limit if it has one (under Slurm, the job's --mem, which is
+ * what the job is killed at) */
+inline MemInfo read_effective_meminfo(const std::string& meminfo_path = "/proc/meminfo",
+                                      const std::string& proc_cgroup_path = "/proc/self/cgroup",
+                                      const std::string& cgroup_root = "/sys/fs/cgroup") {
+    MemInfo node = read_meminfo(meminfo_path);
+    std::ifstream in { proc_cgroup_path };
+    if (!in) return node;
+    std::stringstream text;
+    text << in.rdbuf();
+    return apply_cgroup_limit(node, find_cgroup_memory(text.str(), cgroup_root));
 }
 
 /** @brief When to end a processing pass early to bound memory (see above)
