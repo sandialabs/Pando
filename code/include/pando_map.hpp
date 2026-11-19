@@ -368,9 +368,7 @@ class PandoMap : public PandoParticipant {
             DBEntry<Alloc> new_entry {alloc_};
             new_entry.value().assign(entry.value());
             new_entry.set_key(entry.get_key());
-            for (auto& tag : entry.tags()) {
-                new_entry.add_tag(tag);
-            }
+            new_entry.copy_tags_from(entry);
 
             return new_entry;
         }
@@ -379,9 +377,7 @@ class PandoMap : public PandoParticipant {
             DBEntry<> new_entry;
             new_entry.value().assign(entry.value());
             new_entry.set_key(entry.get_key());
-            for (auto& tag : entry.tags()) {
-                new_entry.add_tag(tag);
-            }
+            new_entry.copy_tags_from(entry);
 
             return new_entry;
         }
