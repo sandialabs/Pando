@@ -88,8 +88,10 @@ int main_(int argc, char **argv) {
             "  Filter output is held in memory until the stage closes. A processing pass ends\n"
             "  early (and asks every agent to do the same) so the stage closes and the output\n"
             "  is moved to the map before memory runs out.\n"
-            "  --mem-limit-pct=P : keep node memory use below P% (0 <= P <= 100, default 90;\n"
-            "                      0 turns this off). Each pass may emit a share of the\n"
+            "  --mem-limit-pct=P : keep memory use below P% (0 <= P <= 100, default 90; 0\n"
+            "                      turns this off) of the node's memory, or of this job's\n"
+            "                      cgroup memory limit (e.g. Slurm's --mem) if lower.\n"
+            "                      Each pass may emit a share of the\n"
             "                      headroom left when it starts, and stops if memory use goes\n"
             "                      over P% while it runs\n"
             "  --mem-pass-budget-mb=N : also emit at most N MiB of output per pass (the\n"
@@ -193,6 +195,12 @@ int main_(int argc, char **argv) {
              << " pass_budget_bytes=" << (mem_policy.pass_budget_bytes ? to_string(mem_policy.pass_budget_bytes) : string("off"))
              << " budget_fraction=" << mem_policy.budget_fraction
              << " agents_per_node=" << (mem_policy.agents_per_node ? to_string(mem_policy.agents_per_node) : string("auto")) << endl;
+        MemInfo node = read_meminfo(), effective = read_effective_meminfo();
+        if (effective.ok)
+            cerr << "[Pando] [DEBUG] Memory: " << (effective.total_bytes >> 20) << " MiB total, "
+                 << (effective.available_bytes >> 20) << " MiB available ("
+                 << (node.ok && effective.total_bytes < node.total_bytes ? "limited by this job's cgroup" : "the node's")
+                 << ")" << endl;
     } else {
         cerr << "[Pando] [DEBUG] Memory limits: off" << endl;
     }

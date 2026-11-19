@@ -2,6 +2,9 @@
 // memory, the per-pass budget, and the CLOSE_EARLY payload. How SeqDB and
 // ParDB use them is tested in test_seq_db and test_filter_stats.
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -264,6 +267,140 @@ TEST(stop_reason_names) {
     TEST_PASS
 }
 
+// --- Memory limits from cgroups (find_cgroup_memory, apply_cgroup_limit) ---
+
+static const uint64_t MiB_ = 1ull << 20;
+
+// A scratch directory holding a fake cgroup file system
+struct FakeCgroupRoot {
+    std::string dir;
+    FakeCgroupRoot() {
+        char tmpl[] = "/tmp/pando_cgroup_test_XXXXXX";
+        if (!mkdtemp(tmpl)) throw std::runtime_error("mkdtemp failed");
+        dir = tmpl;
+    }
+    ~FakeCgroupRoot() { std::filesystem::remove_all(dir); }
+    void write(const std::string& rel, const std::string& text) {
+        std::filesystem::path f = dir + "/" + rel;
+        std::filesystem::create_directories(f.parent_path());
+        std::ofstream(f) << text;
+    }
+};
+
+// cgroup v2: the limit is on an ancestor (the job), not the process's own
+// cgroup (the task); usage leaves out inactive file pages
+TEST(cgroup_v2_limit_on_ancestor) {
+    FakeCgroupRoot r;
+    r.write("memory.max", "max\n");
+    r.write("slurm/job_1/memory.max", std::to_string(1024*MiB_) + "\n");
+    r.write("slurm/job_1/memory.current", std::to_string(512*MiB_) + "\n");
+    r.write("slurm/job_1/memory.stat", "anon 1\ninactive_file " + std::to_string(128*MiB_) + "\nactive_file 5\n");
+    r.write("slurm/job_1/step_0/memory.max", "max\n");
+    r.write("slurm/job_1/step_0/memory.current", "1\n");
+    CgroupMemory cg = find_cgroup_memory("0::/slurm/job_1/step_0\n", r.dir);
+    EQ(cg.ok, true);
+    EQ(cg.limit_bytes, 1024*MiB_);
+    EQ(cg.used_bytes, 384*MiB_);
+
+    MemInfo node; node.ok = true; node.total_bytes = 400*1024*MiB_; node.available_bytes = 300*1024*MiB_;
+    MemInfo m = apply_cgroup_limit(node, cg);
+    EQ(m.ok, true);
+    EQ(m.total_bytes, 1024*MiB_);
+    EQ(m.available_bytes, 640*MiB_);
+
+    TEST_PASS
+}
+
+// The tightest of several limits on the path wins
+TEST(cgroup_v2_tightest_limit) {
+    FakeCgroupRoot r;
+    r.write("a/memory.max", std::to_string(2048*MiB_));
+    r.write("a/memory.current", std::to_string(100*MiB_));
+    r.write("a/b/memory.max", std::to_string(512*MiB_));
+    r.write("a/b/memory.current", std::to_string(200*MiB_));
+    CgroupMemory cg = find_cgroup_memory("0::/a/b\n", r.dir);
+    EQ(cg.ok, true);
+    EQ(cg.limit_bytes, 512*MiB_);
+    EQ(cg.used_bytes, 200*MiB_);
+
+    TEST_PASS
+}
+
+// cgroup v1: the memory controller's own hierarchy, and its "no limit" value
+TEST(cgroup_v1_limit) {
+    FakeCgroupRoot r;
+    r.write("memory/memory.limit_in_bytes", "9223372036854771712\n");
+    r.write("memory/slurm/job_2/memory.limit_in_bytes", std::to_string(2048*MiB_));
+    r.write("memory/slurm/job_2/memory.usage_in_bytes", std::to_string(1024*MiB_));
+    r.write("memory/slurm/job_2/memory.stat", "cache 9\ntotal_inactive_file " + std::to_string(24*MiB_) + "\n");
+    CgroupMemory cg = find_cgroup_memory("12:pids:/x\n4:cpuset,memory:/slurm/job_2\n", r.dir);
+    EQ(cg.ok, true);
+    EQ(cg.limit_bytes, 2048*MiB_);
+    EQ(cg.used_bytes, 1000*MiB_);
+
+    TEST_PASS
+}
+
+// No limit anywhere, no cgroup, or unreadable files: the node's memory is used
+TEST(cgroup_without_limit) {
+    FakeCgroupRoot r;
+    r.write("memory.max", "max\n");
+    r.write("u/memory.max", "max\n");
+    EQ(find_cgroup_memory("0::/u\n", r.dir).ok, false);
+    EQ(find_cgroup_memory("", r.dir).ok, false);
+    EQ(find_cgroup_memory("0::/does/not/exist\n", r.dir).ok, false);
+    EQ(find_cgroup_memory("0::/u\n", r.dir + "/missing").ok, false);
+
+    MemInfo node; node.ok = true; node.total_bytes = 100; node.available_bytes = 60;
+    MemInfo m = apply_cgroup_limit(node, CgroupMemory{});
+    EQ(m.total_bytes, 100);
+    EQ(m.available_bytes, 60);
+
+    TEST_PASS
+}
+
+// Usage at or over the limit leaves nothing available; a cgroup larger than
+// the node changes nothing; the node's free memory still bounds a roomy cgroup
+TEST(cgroup_limit_edges) {
+    MemInfo node; node.ok = true; node.total_bytes = 1000; node.available_bytes = 300;
+    CgroupMemory full; full.ok = true; full.limit_bytes = 500; full.used_bytes = 600;
+    MemInfo m = apply_cgroup_limit(node, full);
+    EQ(m.total_bytes, 500);
+    EQ(m.available_bytes, 0);
+
+    CgroupMemory big; big.ok = true; big.limit_bytes = 5000; big.used_bytes = 10;
+    m = apply_cgroup_limit(node, big);
+    EQ(m.total_bytes, 1000);
+    EQ(m.available_bytes, 300);
+
+    MemInfo none;    // node memory unreadable: the cgroup alone
+    m = apply_cgroup_limit(none, full);
+    EQ(m.ok, true);
+    EQ(m.total_bytes, 500);
+
+    TEST_PASS
+}
+
+// The whole read, from files
+TEST(effective_meminfo_from_files) {
+    FakeCgroupRoot r;
+    r.write("proc_meminfo", "MemTotal:  4194304 kB\nMemFree: 1 kB\nMemAvailable:  2097152 kB\n");
+    r.write("proc_cgroup", "0::/job\n");
+    r.write("cg/job/memory.max", std::to_string(1024*MiB_));
+    r.write("cg/job/memory.current", std::to_string(256*MiB_));
+    MemInfo m = read_effective_meminfo(r.dir + "/proc_meminfo", r.dir + "/proc_cgroup", r.dir + "/cg");
+    EQ(m.ok, true);
+    EQ(m.total_bytes, 1024*MiB_);
+    EQ(m.available_bytes, 768*MiB_);
+
+    // Without a cgroup file, the node's memory
+    m = read_effective_meminfo(r.dir + "/proc_meminfo", r.dir + "/no_such_file", r.dir + "/cg");
+    EQ(m.total_bytes, 4096*MiB_);
+    EQ(m.available_bytes, 2048*MiB_);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     RUN_TEST(parse_meminfo_basic)
     RUN_TEST(parse_meminfo_incomplete)
@@ -275,4 +412,10 @@ TESTS_BEGIN
     RUN_TEST(agents_sharing_ip)
     RUN_TEST(close_early_round_trip)
     RUN_TEST(stop_reason_names)
+    RUN_TEST(cgroup_v2_limit_on_ancestor)
+    RUN_TEST(cgroup_v2_tightest_limit)
+    RUN_TEST(cgroup_v1_limit)
+    RUN_TEST(cgroup_without_limit)
+    RUN_TEST(cgroup_limit_edges)
+    RUN_TEST(effective_meminfo_from_files)
 TESTS_END

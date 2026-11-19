@@ -230,7 +230,7 @@ class SeqDB {
         MemoryPolicy mem_policy_;
 
         /** @brief Where the system memory is read from (replaceable for tests) */
-        function<MemInfo()> meminfo_source_ = []() { return read_meminfo(); };
+        function<MemInfo()> meminfo_source_ = []() { return read_effective_meminfo(); };
 
         /** @brief Works out the agents sharing the node when the policy's
          * agents_per_node is 0 (auto); unset means 1 */
