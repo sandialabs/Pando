@@ -361,6 +361,12 @@ class ParDB : public PandoParticipant {
         /** @brief Returns the size of the sequential DB */
         size_t db_size() { return db_.size(); }
 
+        /** @brief Processing passes this agent has started (for tests) */
+        uint64_t passes_started() const { return db_.stats().pass; }
+
+        /** @brief Entries this agent has offered to its filters (for tests) */
+        size_t entries_examined() const { return db_.entries_examined(); }
+
         /** @brief Adds an entry to the global DB */
         void add_entry(DBEntry<> entry) {
             //Before we forward the entry, make sure it no longer has the INITIAL_KEY
@@ -1127,6 +1133,16 @@ class ParDB : public PandoParticipant {
         /** @brief Call process on the internal DB */
         void recv_process(zmq_socket_t sock, [[maybe_unused]] const char* data, [[maybe_unused]] const char* end) {
             has_alg_processed_ = false;
+
+            // What this agent reports before its filters run: whether the last
+            // stage close left changes staged. Applying an entry at a close
+            // can release a subscription, and the release (a tag removal) is
+            // only staged then, to be applied at this pass's close; the entry
+            // it makes eligible needs one more pass after that. Otherwise
+            // nothing is staged now, and the report must not repeat the last
+            // pass's answer: that made every request end with two passes that
+            // ran no filter instead of one.
+            local_process_again_ = db_.has_staged_changes();
 
             // First, enter STAGE_BEGIN
             db_.stats().begin_pass(PASS_SINGLE);
