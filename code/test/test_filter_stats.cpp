@@ -378,13 +378,15 @@ TEST(par_db_publishes_stats) {
 // An agent that ends a pass to bound memory asks every agent to end it
 // (CLOSE_EARLY), since their output fills its queues until the stage closes.
 // db1 has a 1-byte budget, so it stops after every filter run and asks the
-// others to stop; db2 has no limits of its own but honors the requests. The
-// filter takes ~2ms per entry, so db2 is still busy when a request arrives.
+// others to stop; db2 has no limits of its own but honors the requests. Since
+// db1 ran a filter in each pass it asks to end, db2 may stop even before
+// running one itself (see CloseEarlyState). The filter takes ~2ms per entry,
+// so db2 is still busy when a request arrives.
 TEST(par_db_close_early) {
     MemoryPolicy tiny = MemoryPolicy::disabled();
     tiny.pass_budget_bytes = 1;
     tiny.check_interval = chrono::milliseconds(0);
-    // No limits of its own, but honors requests (after its first run)
+    // No limits of its own, but honors requests (db1's, even before a run)
     MemoryPolicy follower = MemoryPolicy::disabled();
     follower.check_interval = chrono::milliseconds(0);
     EQ(follower.enabled(), false);
@@ -471,8 +473,8 @@ TEST(par_db_close_early) {
     // db2 was asked to stop and did, and never stopped for any other reason
     EQ(db2_remote_stops >= 1, true);
     EQ(db2_other_stops, 0);
-    // In pass 1 db2 stopped well before running on all of its entries
-    EQ(db2_pass1_ran >= 1, true);
+    // In pass 1 db2 stopped well before running on all of its entries. (It
+    // may have run none: db1's request lets it stop before a run.)
     EQ(db2_pass1_ran < on_db2, true);
 
     TEST_PASS

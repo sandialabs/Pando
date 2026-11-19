@@ -22,11 +22,19 @@
  *
  * In ParDB, an agent that stops for either memory reason also asks every
  * agent to close early (CLOSE_EARLY), since the others' output fills its
- * queues until the stage closes.
+ * queues until the stage closes. A request says whether its sender ran a
+ * filter in the pass. If it did, the pass has made progress somewhere, so
+ * the others honor the request even before running a filter themselves
+ * (keeping their cursors, so no scanning is lost). If it did not (a request
+ * sent while waiting at the barrier, see ParDB::custom_heartbeat), only
+ * agents that have run a filter honor it; otherwise persistent memory
+ * pressure could end every pass before anything ran, forever. See
+ * CloseEarlyState.
  *
  * Kept free of DB and ZeroMQ dependencies so it can be tested on its own.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -236,11 +244,16 @@ struct CloseEarlyRequest {
     uint64_t pass = 0;
     /** Why the agent stopped (STOP_MEM_BUDGET or STOP_MEM_PRESSURE) */
     uint8_t reason = STOP_NONE;
+    /** Whether the asking agent ran a filter in this pass. If so, the pass
+     * has made progress, and agents that have not run a filter yet may stop
+     * too (see CloseEarlyState). */
+    bool ran_filter = false;
 
     void serialize(StatsWriter& w) const {
         w.put(agent);
         w.put(pass);
         w.put(reason);
+        w.put((uint8_t)(ran_filter ? 1 : 0));
     }
 
     /** @brief Parse a payload (after the message type); false if malformed */
@@ -249,7 +262,44 @@ struct CloseEarlyRequest {
         agent = r.get<addr_t>();
         pass = r.get<uint64_t>();
         reason = r.get<uint8_t>();
-        return r.ok() && r.done();
+        uint8_t ran = r.get<uint8_t>();
+        ran_filter = ran != 0;
+        return r.ok() && r.done() && ran <= 1;
+    }
+};
+
+/** @brief The CLOSE_EARLY requests an agent has received, and whether they
+ * end its current pass
+ *
+ * Requests are remembered by pass number, since one can arrive before this
+ * agent starts that pass. A request ends the pass:
+ *  - always, if its sender ran a filter in the pass: the pass has made
+ *    progress on the sender, so this agent may stop before running any
+ *    filter (it keeps its cursor and continues in the next pass);
+ *  - otherwise, only once this agent has run a filter in the pass. Requests
+ *    from agents that ran nothing (sent under memory pressure while waiting
+ *    at the barrier) could otherwise end every pass before any filter ran,
+ *    and processing would never finish.
+ */
+struct CloseEarlyState {
+    /** Highest pass any other agent asked to close early; 0 if none */
+    uint64_t any_pass = 0;
+    /** Highest pass an agent that had run a filter asked to close early */
+    uint64_t progress_pass = 0;
+
+    /** @brief Remember a request; self's own requests (publications reach
+     * the sender's subscription too) are ignored */
+    void record(const CloseEarlyRequest& req, addr_t self) {
+        if (req.agent == self) return;
+        any_pass = std::max(any_pass, req.pass);
+        if (req.ran_filter) progress_pass = std::max(progress_pass, req.pass);
+    }
+
+    /** @brief Whether the received requests end pass `pass`
+     * @param have_run whether this agent has run a filter in the pass */
+    bool should_stop(uint64_t pass, bool have_run) const {
+        if (pass == 0) return false;
+        return progress_pass == pass || (have_run && any_pass == pass);
     }
 };
 

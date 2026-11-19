@@ -1,6 +1,7 @@
 // The memory policy's building blocks (memory_policy.hpp): reading system
-// memory, the per-pass budget, and the CLOSE_EARLY payload. How SeqDB and
-// ParDB use them is tested in test_seq_db and test_filter_stats.
+// memory, the per-pass budget, the CLOSE_EARLY payload, and which received
+// requests end a pass. How SeqDB and ParDB use them is tested in test_seq_db
+// and test_filter_stats.
 
 #include <iostream>
 #include <sstream>
@@ -227,6 +228,7 @@ TEST(close_early_round_trip) {
     r.agent = 0x123456789abcull;
     r.pass = 42;
     r.reason = STOP_MEM_PRESSURE;
+    r.ran_filter = true;
     StatsWriter w { CLOSE_EARLY };
     r.serialize(w);
 
@@ -238,6 +240,7 @@ TEST(close_early_round_trip) {
     EQ(q.agent, r.agent);
     EQ(q.pass, 42);
     EQ(q.reason, STOP_MEM_PRESSURE);
+    EQ(q.ran_filter, true);
 
     // Truncations and trailing garbage are rejected
     for (size_t len = 1; len < w.size(); ++len) {
@@ -248,6 +251,121 @@ TEST(close_early_round_trip) {
     extra.push_back('x');
     CloseEarlyRequest t;
     EQ(t.deserialize(extra.data()+1, extra.data()+extra.size()), false);
+
+    // ran_filter = false round-trips too
+    {
+        CloseEarlyRequest f = r;
+        f.ran_filter = false;
+        StatsWriter wf { CLOSE_EARLY };
+        f.serialize(wf);
+        EQ(wf.size(), w.size());
+        CloseEarlyRequest g;
+        g.ran_filter = true;
+        EQ(g.deserialize(wf.data()+1, wf.data()+wf.size()), true);
+        EQ(g.ran_filter, false);
+        EQ(g.pass, 42);
+    }
+
+    // ran_filter is the last byte; anything but 0 or 1 is malformed
+    {
+        string bad { w.data(), w.size() };
+        bad.back() = 2;
+        CloseEarlyRequest b;
+        EQ(b.deserialize(bad.data()+1, bad.data()+bad.size()), false);
+    }
+
+    TEST_PASS
+}
+
+// Which received CLOSE_EARLY requests end a pass: a request from an agent
+// that ran a filter in the pass ends it even before we run one; a request
+// from an agent that ran nothing ends it only once we have run one
+TEST(close_early_state) {
+    const addr_t self = 0x1111, other = 0x2222, third = 0x3333;
+    auto req = [](addr_t agent, uint64_t pass, bool ran) {
+        CloseEarlyRequest r;
+        r.agent = agent;
+        r.pass = pass;
+        r.reason = ran ? STOP_MEM_BUDGET : STOP_MEM_PRESSURE;
+        r.ran_filter = ran;
+        return r;
+    };
+
+    // Nothing received: never stop
+    {
+        CloseEarlyState s;
+        EQ(s.should_stop(1, false), false);
+        EQ(s.should_stop(1, true), false);
+    }
+
+    // From an agent that ran a filter: stop, whether or not we have run
+    {
+        CloseEarlyState s;
+        s.record(req(other, 3, true), self);
+        EQ(s.should_stop(3, false), true);
+        EQ(s.should_stop(3, true), true);
+        // Only for that pass
+        EQ(s.should_stop(2, true), false);
+        EQ(s.should_stop(4, true), false);
+        EQ(s.should_stop(4, false), false);
+    }
+
+    // From an agent that ran nothing: stop only once we have run
+    {
+        CloseEarlyState s;
+        s.record(req(other, 3, false), self);
+        EQ(s.should_stop(3, false), false);
+        EQ(s.should_stop(3, true), true);
+        EQ(s.should_stop(4, true), false);
+        // A later request for the same pass from an agent that ran upgrades it
+        s.record(req(third, 3, true), self);
+        EQ(s.should_stop(3, false), true);
+    }
+
+    // Our own requests (they reach our subscription too) are ignored
+    {
+        CloseEarlyState s;
+        s.record(req(self, 5, true), self);
+        s.record(req(self, 5, false), self);
+        EQ(s.should_stop(5, false), false);
+        EQ(s.should_stop(5, true), false);
+    }
+
+    // A request can arrive before we start its pass, and still applies then
+    {
+        CloseEarlyState s;
+        s.record(req(other, 7, true), self);
+        EQ(s.should_stop(6, false), false);
+        EQ(s.should_stop(7, false), true);
+    }
+
+    // The highest pass wins: an older request arriving late does not undo a
+    // newer one, and a stale one does not apply to the current pass
+    {
+        CloseEarlyState s;
+        s.record(req(other, 9, true), self);
+        s.record(req(third, 8, true), self);
+        EQ(s.should_stop(9, false), true);
+        EQ(s.should_stop(8, true), false);
+    }
+
+    // The two kinds are tracked separately: an agent that ran nothing asking
+    // for a newer pass does not let an older request apply to it before a run
+    {
+        CloseEarlyState s;
+        s.record(req(other, 4, true), self);
+        s.record(req(third, 5, false), self);
+        EQ(s.should_stop(5, false), false);
+        EQ(s.should_stop(5, true), true);
+        EQ(s.should_stop(4, false), true);
+    }
+
+    // Pass 0 (before any processing) never stops
+    {
+        CloseEarlyState s;
+        s.record(req(other, 0, true), self);
+        EQ(s.should_stop(0, true), false);
+    }
 
     TEST_PASS
 }
@@ -274,5 +392,6 @@ TESTS_BEGIN
     RUN_TEST(slurm_tasks_per_node)
     RUN_TEST(agents_sharing_ip)
     RUN_TEST(close_early_round_trip)
+    RUN_TEST(close_early_state)
     RUN_TEST(stop_reason_names)
 TESTS_END

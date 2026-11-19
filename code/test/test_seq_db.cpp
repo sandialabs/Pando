@@ -1613,10 +1613,11 @@ TEST(mem_budget_from_headroom) {
 }
 
 // A stop request (as ParDB uses for other agents' CLOSE_EARLY) is honored
-// even without a memory policy of our own, but never before a filter has
-// run in the pass: entries the filter does not run on (the "B"s, which the
-// scan meets in hash order, often before any "A") must not end a pass that
-// has done nothing
+// even without a memory policy of our own. The callback is told whether a
+// filter has run in the pass; this one stops only once one has, as ParDB does
+// for a request from an agent that ran nothing (see CloseEarlyState). Entries
+// the filter does not run on (the "B"s, which the scan meets in hash order,
+// often before any "A") then never end a pass that has done nothing.
 TEST(stop_requested_after_a_run) {
     g_TEST_max_filters_runs = 0;
     SeqDB d;
@@ -1625,12 +1626,13 @@ TEST(stop_requested_after_a_run) {
     d.set_memory_policy(p);
     EQ(d.memory_policy().enabled(), false);
 
-    size_t runs_at_pass_start = 0, calls = 0;
-    bool called_before_a_run = false;
-    d.set_stop_requested_callback([&]() {
-        ++calls;
-        if (g_TEST_max_filters_runs == runs_at_pass_start) called_before_a_run = true;
-        return true;
+    size_t runs_at_pass_start = 0, calls_after_run = 0;
+    bool have_run_wrong = false;
+    d.set_stop_requested_callback([&](bool have_run) {
+        // have_run is exactly "a filter has run in this pass"
+        if (have_run != (g_TEST_max_filters_runs > runs_at_pass_start)) have_run_wrong = true;
+        if (have_run) ++calls_after_run;
+        return have_run;
     });
     add_a_entries(d, 10);
     for (int k = 0; k < 10; ++k) { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
@@ -1646,9 +1648,9 @@ TEST(stop_requested_after_a_run) {
     // Every pass that ran stopped right after its one run
     NOPRINT_EQ(runs, (vector<size_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
     EQ(count_a_done(d), 10);
-    EQ(called_before_a_run, false);
-    // Once per pass that ran; the last pass ran nothing and never asked
-    EQ(calls, 10);
+    EQ(have_run_wrong, false);
+    // Asked after a run once per pass that ran (it stopped right then)
+    EQ(calls_after_run, 10);
 
     auto& h = d.stats().history;
     EQ(h.size(), 11);
@@ -1657,6 +1659,104 @@ TEST(stop_requested_after_a_run) {
         EQ(h[i].byte_budget, NO_BYTE_BUDGET);
     }
     EQ(h[10].stop_reason, STOP_NONE);
+
+    TEST_PASS
+}
+
+// A stop request that may end a pass before any filter has run (as ParDB
+// honors one from an agent that ran a filter in the pass) stops right after
+// the pass's first entry, runnable or not. Nothing is lost: the cursor
+// carries over, so each such pass scans one more entry, every "A" is still
+// filtered once, and processing ends once the requests stop.
+TEST(stop_requested_before_a_run) {
+    g_TEST_max_filters_runs = 0;
+    SeqDB d;
+    MemoryPolicy p = MemoryPolicy::disabled();
+    p.check_interval = chrono::milliseconds(0);
+    d.set_memory_policy(p);
+
+    // The asking agent stays busy for the first 30 checks, then stops asking
+    size_t calls = 0;
+    const size_t asking_calls = 30;
+    d.set_stop_requested_callback([&](bool) { return ++calls <= asking_calls; });
+    add_a_entries(d, 10);
+    for (int k = 0; k < 10; ++k) { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
+    d.install_filter(make_shared<Filter>(&g_TEST_a_done_fi));
+
+    // While asked, every pass examines exactly one entry: 20 passes for the
+    // first lap, then 10 into the second
+    vector<size_t> examined;
+    vector<bool> again;
+    while (true) {
+        size_t before = d.entries_examined();
+        bool more = d.process_once();
+        examined.push_back(d.entries_examined() - before);
+        again.push_back(more);
+        if (!more) break;
+        if (examined.size() > 60) TEST_FAIL
+    }
+    EQ(examined.size(), asking_calls + 1);
+    for (size_t i = 0; i < asking_calls; ++i) {
+        EQ(examined[i], 1);
+        EQ(again[i], true);
+    }
+    EQ(count_a_done(d), 10);
+    EQ(g_TEST_max_filters_runs, 10);
+
+    // Every asked pass stopped for the request; 10 of them (the "B"s of the
+    // first lap) and all 10 of the second lap had run nothing
+    auto& h = d.stats().history;
+    EQ(h.size(), asking_calls + 1);
+    size_t remote_no_run = 0, remote_run = 0;
+    for (size_t i = 0; i < asking_calls; ++i) {
+        EQ(h[i].stop_reason, STOP_REMOTE);
+        uint64_t ran = h[i].filters.at("TEST_max_filters").ran;
+        if (ran == 0) ++remote_no_run;
+        else { EQ(ran, 1); ++remote_run; }
+    }
+    EQ(remote_run, 10);
+    EQ(remote_no_run, 20);
+
+    // The last pass began mid-lap with nothing to run: it finished that lap,
+    // then a full fresh one, and reported done
+    EQ(h.back().stop_reason, STOP_NONE);
+    EQ(h.back().filters.at("TEST_max_filters").ran, 0);
+    EQ(examined.back(), 10 + 20);
+
+    TEST_PASS
+}
+
+// A stop request on the last entry of a lap that began at the first key and
+// ran nothing does not ask for another pass: the lap is complete, so the
+// pass reports done, as it would have without the request
+TEST(stop_requested_on_last_entry_reports_done) {
+    g_TEST_max_filters_runs = 0;
+    SeqDB d;
+    MemoryPolicy p = MemoryPolicy::disabled();
+    p.check_interval = chrono::milliseconds(0);
+    d.set_memory_policy(p);
+
+    const size_t n = 5;
+    size_t calls = 0;
+    // Asked once per entry; only the check after the last entry says stop
+    d.set_stop_requested_callback([&](bool) { return ++calls == n; });
+    for (size_t k = 0; k < n; ++k) { DBEntry<> e; e.clear().add_tag("B"); d.add_entry(e); }
+    d.install_filter(make_shared<Filter>(&g_TEST_a_done_fi));
+
+    EQ(d.process_once(), false);
+    EQ(calls, n);
+    EQ(d.entries_examined(), n);
+    EQ(d.stats().history.back().stop_reason, STOP_NONE);
+    EQ(g_TEST_max_filters_runs, 0);
+
+    // A stop before the last entry still ends the pass, which then asks
+    // for another
+    calls = 0;
+    d.set_stop_requested_callback([&](bool) { return ++calls == 1; });
+    EQ(d.process_once(), true);
+    EQ(d.stats().history.back().stop_reason, STOP_REMOTE);
+    EQ(d.process_once(), false);
+    EQ(d.stats().history.back().stop_reason, STOP_NONE);
 
     TEST_PASS
 }
@@ -2086,6 +2186,8 @@ TESTS_BEGIN
     RUN_TEST(mem_pressure_stops_pass)
     RUN_TEST(mem_budget_from_headroom)
     RUN_TEST(stop_requested_after_a_run)
+    RUN_TEST(stop_requested_before_a_run)
+    RUN_TEST(stop_requested_on_last_entry_reports_done)
     RUN_TEST(mem_bytes_count_each_output)
     RUN_TEST(mem_budget_same_result)
     RUN_TEST(get_entries_by_keys_local)
