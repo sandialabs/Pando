@@ -1,6 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <exception>
+#include <stdexcept>
 #include <list>
+#include <memory>
 #include <vector>
 #include <thread>
 
@@ -29,6 +33,7 @@ void s_ref_remove_tag(fn_ref, dbkey_t, string);
 void s_ref_update_entry_val(fn_ref, dbkey_t, string);
 void s_ref_subscribe_to_entry(fn_ref, dbkey_t, dbkey_t, string);
 void s_ref_get_entry_by_key(fn_ref, dbkey_t, char**);
+void s_ref_get_entries_by_keys(fn_ref, size_t, const dbkey_t*, char**);
 
 /** @brief Contains the parallel (distributed) database
  *
@@ -112,6 +117,10 @@ class ParDB : public PandoParticipant {
             return opts;
         }
 
+        /** @brief Most keys get_entries_by_keys puts in one request to one
+         * agent (see set_max_keys_per_request) */
+        size_t max_keys_per_request_ = 65536;
+
     public:
         /** @brief Initialize the parallel DB
          *
@@ -138,7 +147,8 @@ class ParDB : public PandoParticipant {
                     s_ref_remove_tag,
                     s_ref_update_entry_val,
                     s_ref_subscribe_to_entry,
-                    s_ref_get_entry_by_key
+                    s_ref_get_entry_by_key,
+                    s_ref_get_entries_by_keys
                 ),
                 db_(db_refs_, addr_ser_, sz),
                 state_(PRELOAD),
@@ -496,8 +506,27 @@ class ParDB : public PandoParticipant {
         }
 
 
-        /** @brief Lookup an entry by key */
+        /** @brief Lookup an entry by key
+         *
+         * A key this agent owns is read from its own PandoMap (through the
+         * ParDB thread's map client, idle whenever a filter runs) instead of
+         * through its own responder. The result is the same either way:
+         * - a missing key or an empty value leaves *res unchanged (callers
+         *   set it to nullptr first), as the remote path's "\0" comparison
+         *   does;
+         * - otherwise *res is a malloc'd copy, cut at the first NUL byte
+         *   (strcpy), as the remote path does.
+         */
         void get_entry_by_key(dbkey_t key, char** res) {
+            if (has_ownership(key)) {
+                string value;
+                if (!db_.get_value_if_exists(key, value) || value.empty()) return;
+                *res = (char*)malloc(sizeof(char)*value.size()+1);
+                if (*res == nullptr) throw runtime_error("Unable to allocate memory");
+                strcpy(*res, value.c_str());
+                return;
+            }
+
             // Serialize the key and tag
             size_t msg_size = sizeof(msg_type_t)+sizeof(dbkey_t);
             char msg[msg_size];
@@ -526,6 +555,169 @@ class ParDB : public PandoParticipant {
             if (*res == nullptr) throw runtime_error("Unable to allocate memory");
             strcpy(*res, value.c_str());
         }
+
+        /** @brief Look up many keys with one blocking call
+         *
+         * Keys are grouped by the agent that owns them. One request is sent
+         * to every other owner's responder before any reply is awaited, so
+         * the owners look their keys up in parallel; each answers its whole
+         * group with a single PandoMap lookup. Keys this agent owns are read
+         * directly from its own PandoMap while the other owners work, rather
+         * than through its own responder.
+         *
+         * values[i] receives a malloc'd, NUL-terminated copy of the value
+         * for keys[i] (the caller frees it), or nullptr if the key does not
+         * exist. An empty value gives an empty string, not nullptr. Keys may
+         * repeat. On error every value is freed and set to nullptr before the
+         * exception is thrown.
+         */
+        void get_entries_by_keys(size_t n, const dbkey_t* keys, char** values) {
+            for (size_t i = 0; i < n; ++i) values[i] = nullptr;
+            if (n == 0) return;
+
+            // Group the positions of the keys by owning agent, keeping this
+            // agent's own keys apart
+            unordered_map<addr_t, vector<size_t>> by_owner;
+            vector<size_t> local_idx;
+            for (size_t i = 0; i < n; ++i) {
+                addr_t owner = lookup_agent(keys[i]);
+                if (owner == addr_ser_) local_idx.push_back(i);
+                else by_owner[owner].push_back(i);
+            }
+
+            // Each owner's keys are sent in requests of at most
+            // max_keys_per_request_ keys. Every owner's first request goes
+            // out before any reply is awaited; after each reply, that owner
+            // is sent its next request.
+            using req_it = decltype(find_req(keys[0], true));
+            struct owner_t {
+                req_it req;                   // the owner's responder
+                const vector<size_t>* idx;    // positions of its keys
+                size_t next = 0;              // first position of the next request
+                size_t cur = 0;               // first position of the request in flight
+                bool in_flight = false;       // a request was sent and its reply not read
+            };
+
+            // The first error (a failed send, a bad reply, or the local
+            // lookup). After an error no new request is sent, but every
+            // request already sent is still read, so no responder socket is
+            // left with an unread reply; then all values are freed and the
+            // error is rethrown.
+            exception_ptr error;
+
+            auto send_next = [&](owner_t& o) {
+                size_t b = o.next;
+                size_t e = min(b + max_keys_per_request_, o.idx->size());
+                size_t count = e - b;
+
+                size_t msg_size = sizeof(msg_type_t) + sizeof(size_t) + count*sizeof(dbkey_t);
+                // Freed even if the send throws. Not zero-filled (unlike
+                // vector<char>(n) or make_unique<char[]>(n)): every byte is
+                // written below before it is sent.
+                unique_ptr<char[]> msg(new char[msg_size]);
+                char* msg_ptr = msg.get();
+                pack_msg(msg_ptr, GET_ENTRIES_BY_KEYS);
+                pack_single(msg_ptr, count);
+                for (size_t j = b; j < e; ++j) pack_single(msg_ptr, keys[(*o.idx)[j]]);
+
+                o.req->send(msg.get(), msg_size);
+
+                o.cur = b;
+                o.next = e;
+            };
+
+            vector<owner_t> owners;
+            owners.reserve(by_owner.size());
+            for (auto & [owner, idx] : by_owner) {
+                owner_t o;
+                o.req = find_req(keys[idx[0]], true);
+                o.idx = &idx;
+                owners.push_back(o);
+            }
+            for (auto & o : owners) {
+                if (error) break;
+                try {
+                    send_next(o);
+                    o.in_flight = true;
+                } catch (...) {
+                    error = current_exception();
+                }
+            }
+
+            // While the other owners work, read this agent's own keys from its
+            // PandoMap. This uses the ParDB thread's own map client, which is
+            // idle whenever a filter runs. Call the SeqDB worker directly: the
+            // virtual get_entry_values_by_keys on db_ comes back here.
+            // An error is held until every remote reply has been read.
+            // Local keys are read in the same size of request as remote ones.
+            if (!error) try {
+                vector<dbkey_t> local_keys;
+                vector<char*> local_values;
+                for (size_t b = 0; b < local_idx.size(); b += max_keys_per_request_) {
+                    size_t e = min(b + max_keys_per_request_, local_idx.size());
+                    local_keys.clear();
+                    for (size_t j = b; j < e; ++j) local_keys.push_back(keys[local_idx[j]]);
+                    local_values.assign(e - b, nullptr);
+                    db_.get_entry_values_by_keys_worker(local_keys.size(), local_keys.data(), local_values.data());
+                    for (size_t j = b; j < e; ++j) values[local_idx[j]] = local_values[j - b];
+                }
+            } catch (...) {
+                error = current_exception();
+            }
+
+            // Collect the replies owner by owner in turns. Each reply is
+            // parsed into values and freed as soon as it is read, so at most
+            // one reply is held at a time; then that owner is sent its next
+            // request.
+            bool any_in_flight = true;
+            while (any_in_flight) {
+                any_in_flight = false;
+                for (auto & o : owners) {
+                    if (!o.in_flight) continue;
+                    o.in_flight = false;
+                    // A failed read (e.g. EINTR from a signal) must not stop the
+                    // other owners' replies from being read; it is recorded like
+                    // any other error. That one socket cannot be recovered.
+                    try {
+                        ZMQMessage msg = o.req->read();
+                        if (!error) {
+                            const char* data = msg.data();
+                            unpack_values_reply(data, data + msg.size(), o.next - o.cur,
+                                                o.idx->data() + o.cur, values);
+                        }
+                    } catch (...) {
+                        if (!error) error = current_exception();
+                    } // the reply is freed here
+                    if (!error && o.next < o.idx->size()) {
+                        try {
+                            send_next(o);
+                            o.in_flight = true;
+                        } catch (...) {
+                            error = current_exception();
+                        }
+                    }
+                    any_in_flight |= o.in_flight;
+                }
+            }
+
+            if (error) {
+                for (size_t i = 0; i < n; ++i) { free(values[i]); values[i] = nullptr; }
+                rethrow_exception(error);
+            }
+        }
+
+        /** @brief Set the most keys get_entries_by_keys sends to one agent in
+         * one request (default 65536). A larger lookup is split into several
+         * requests to that agent; the caller still makes one call. This
+         * bounds the size of each request and reply message.
+         */
+        void set_max_keys_per_request(size_t n) {
+            if (n == 0) throw invalid_argument("max_keys_per_request must be at least 1");
+            max_keys_per_request_ = n;
+        }
+
+        /** @brief Return the most keys get_entries_by_keys sends in one request */
+        size_t max_keys_per_request() const { return max_keys_per_request_; }
 
         /** @brief Broadcast the message to add a filter directory to the internal DB */
         void recv_add_filter_dir_broadcast(zmq_socket_t sock, const char* data, const char* end) {
@@ -1613,5 +1805,9 @@ void s_ref_subscribe_to_entry(fn_ref r, dbkey_t my_key, dbkey_t wait_key, string
 void s_ref_get_entry_by_key(fn_ref r, dbkey_t search_key, char** res) {
     ParDB* db = (ParDB*)r;
     db->get_entry_by_key(search_key, res);
+}
+void s_ref_get_entries_by_keys(fn_ref r, size_t n, const dbkey_t* keys, char** values) {
+    ParDB* db = (ParDB*)r;
+    db->get_entries_by_keys(n, keys, values);
 }
 }

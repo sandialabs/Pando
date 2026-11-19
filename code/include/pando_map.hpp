@@ -226,6 +226,63 @@ class PandoMap : public PandoParticipant {
             ZMQChatterbox::send(sock, msg, msg_size);
         }
 
+        /** @brief Look up the values for a batch of keys
+         *
+         * Request: <size_t n> <n x dbkey_t>
+         * Reply:   <size_t n> then for each key, in order:
+         *          <bool exists> <size_t len> <len bytes of value>
+         *          (len is 0 and no bytes follow if the key does not exist)
+         * Only values are returned, not tags.
+         */
+        void recv_map_retrieve_values(zmq_socket_t sock, const char* data, const char* end) {
+            // A malformed request (too short, or a key count that does not
+            // match its size) gets a reply with no values. The caller's parser
+            // rejects that (wrong number of values), so it gets an error
+            // instead of waiting forever, and nothing past the message is read.
+            size_t n = 0;
+            bool valid = (size_t)(end - data) >= sizeof(size_t);
+            if (valid) {
+                unpack_single(data, n);
+                valid = (size_t)(end - data) == n*sizeof(dbkey_t);
+            }
+            if (!valid) {
+                size_t zero = 0;
+                ZMQChatterbox::send(sock, (const char*)&zero, sizeof(zero));
+                return;
+            }
+            const char* keys_data = data;
+
+            // Find each entry once and size the reply
+            vector<DBEntry<Alloc>*> found(n, nullptr);
+            size_t msg_size = sizeof(size_t);
+            for (size_t i = 0; i < n; ++i) {
+                dbkey_t key;
+                unpack_single(keys_data, key);
+                auto it = map_.find(key);
+                if (it != map_.end()) found[i] = &(it->second);
+                msg_size += sizeof(bool) + sizeof(size_t) + (found[i] ? found[i]->value().size() : 0);
+            }
+
+            // Build the reply directly in a ZeroMQ message, so the values are
+            // copied once (from the map into the message) rather than into a
+            // buffer and then again into a message by zmq_send
+            ZMQMessage out {sock, msg_size};
+            char* msg_ptr = out.edit_data();
+            pack_single(msg_ptr, n);
+            for (size_t i = 0; i < n; ++i) {
+                bool exists = found[i] != nullptr;
+                size_t len = exists ? found[i]->value().size() : 0;
+                pack_single(msg_ptr, exists);
+                pack_single(msg_ptr, len);
+                if (len) {
+                    memcpy(msg_ptr, found[i]->value().data(), len);
+                    msg_ptr += len;
+                }
+            }
+
+            out.send();
+        }
+
         void process_msg(msg_type_t type, zmq_socket_t sock, const char *data, const char* end) {
             if (type == MAP_INSERT) 
                 recv_map_insert(sock, data, end);
@@ -245,6 +302,8 @@ class PandoMap : public PandoParticipant {
                 recv_map_get_tags_by_keys(sock, data, end);
             else if (type == MAP_DOES_KEY_EXIST)
                 recv_map_does_key_exist(sock, data, end);
+            else if (type == MAP_RETRIEVE_VALUES)
+                recv_map_retrieve_values(sock, data, end);
             else
                 throw runtime_error("Unknown message type");
         }

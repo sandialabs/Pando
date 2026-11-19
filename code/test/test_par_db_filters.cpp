@@ -1119,6 +1119,127 @@ TEST(pardb_from_options) {
     TEST_PASS
 }
 
+// A filter on one agent looks up n keys owned by all three agents (and a
+// missing one) with one batched call. The agent running the filter owns
+// some of the keys itself, which it reads from its own PandoMap. With a
+// small n, each owner's reply is only a few bytes (small enough for ZeroMQ
+// to keep inside the message object). With a small max_keys_per_request,
+// each owner's keys are split over several requests.
+TEST(filter_get_entries_by_keys, size_t n, size_t max_keys_per_request) {
+    g_idx = 0;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr };
+    elga::ZMQAddress db3_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db3 { db3_addr };
+
+    if (max_keys_per_request != 0) {
+        // Set on every agent: whichever owns the "Q" entry runs the filter
+        db1.db().set_max_keys_per_request(max_keys_per_request);
+        db2.db().set_max_keys_per_request(max_keys_per_request);
+        db3.db().set_max_keys_per_request(max_keys_per_request);
+    }
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    ParDBClient c3 { db3_addr };
+
+    vector<ZMQAddress> addrs { db1_addr, db2_addr, db3_addr };
+
+    c2.add_neighbor(db1_addr);
+    c3.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 3 || c2.num_neighbors() != 3 || c3.num_neighbors() != 3); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 3);
+    EQ(c2.num_neighbors(), 3);
+    EQ(c3.num_neighbors(), 3);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_get_entries");
+
+    // Values at {30, i, 0} = i, spread over the agents (placement hashes (a, b))
+    for (size_t i = 0; i < n; ++i) {
+        DBEntry<> e; e.set_key({30, (vtx_t)i, 0});
+        e.add_tag("value"); e.value() = to_string(i);
+        c1.add_entry(e);
+    }
+    { DBEntry<> e; e.set_key({30, 5000, 0}); e.add_tag("value"); c1.add_entry(e); }   // empty value
+    { DBEntry<> e; e.set_key({32, 0, 0}); e.add_tag("Q"); e.value() = to_string(n); c1.add_entry(e); }
+
+    // Wait for forwarded entries to reach their owners
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() + c3.db_size() != n + 2; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size() + c3.db_size(), n + 2);
+    // With many keys, they really are spread over all three agents
+    if (n >= 100) EQ(c1.db_size() > 0 && c2.db_size() > 0 && c3.db_size() > 0, true);
+
+    c1.process();
+    wait(addrs);
+
+    string summary;
+    for (auto* c : {&c1, &c2, &c3})
+        for (auto & entry : c->get_entries())
+            if (entry.get_key() == dbkey_t{33, 0, 0}) summary = entry.value();
+    EQ(summary, "ok=" + to_string(n) + "/" + to_string(n) + " missing=1 dup=1 empty=1");
+
+    TEST_PASS
+}
+
+// get_entry_by_key gives the same results for keys the calling agent owns
+// (read from its own PandoMap) as for keys another agent owns (through that
+// agent's responder): values, empty values reported as missing, and keys
+// that do not exist
+TEST(filter_get_entry_by_key_local_and_remote) {
+    g_idx = 0;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+
+    vector<ZMQAddress> addrs { db1_addr, db2_addr };
+
+    c1.add_neighbor(db2_addr);
+    this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 2);
+    EQ(c2.num_neighbors(), 2);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_get_entry_many");
+
+    size_t n = 200;
+    for (size_t i = 0; i < n; ++i) {
+        DBEntry<> e; e.set_key({34, (vtx_t)i, 0}); e.add_tag("value");
+        if (i % 5 != 0) e.value() = "v" + to_string(i);    // every 5th value is empty
+        c1.add_entry(e);
+    }
+    { DBEntry<> e; e.set_key({37, 0, 0}); e.add_tag("Q1"); e.value() = to_string(n); c1.add_entry(e); }
+
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() != n + 1; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size(), n + 1);
+    // Both agents own some of the keys, so both paths are used
+    EQ(c1.db_size() > 0 && c2.db_size() > 0, true);
+
+    c1.process();
+    wait(addrs);
+
+    string summary;
+    for (auto* c : {&c1, &c2})
+        for (auto & entry : c->get_entries())
+            if (entry.get_key() == dbkey_t{36, 0, 0}) summary = entry.value();
+    EQ(summary, "ok=" + to_string(2*n) + "/" + to_string(2*n));
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1143,6 +1264,10 @@ TESTS_BEGIN
     RUN_TEST(subscribing_consensus)
     RUN_TEST(process_request_ends_after_one_empty_pass)
     RUN_TEST(pardb_from_options)
+    RUN_TEST(filter_get_entries_by_keys, 2000, 0)
+    RUN_TEST(filter_get_entries_by_keys, 2, 0)
+    RUN_TEST(filter_get_entries_by_keys, 2000, 7)
+    RUN_TEST(filter_get_entry_by_key_local_and_remote)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END

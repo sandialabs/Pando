@@ -46,6 +46,7 @@ extern "C" {
 static void s_SeqDB_new_entry(const fn* s_this, ...);
 static void s_SeqDB_get_entry_by_tags(const fn* s_this, ...);
 static void s_SeqDB_get_entry_by_key(const fn* s_this, ...);
+static void s_SeqDB_get_entries_by_keys(const fn* s_this, ...);
 static void s_SeqDB_get_entries_by_tags(const fn* s_this, ...);
 static void s_SeqDB_add_tag(const fn* s_this, ...);
 static void s_SeqDB_remove_tag(const fn* s_this, ...);
@@ -1110,6 +1111,9 @@ class SeqDB {
             access->get_entry_by_key.state = this;
             access->get_entry_by_key.run = &s_SeqDB_get_entry_by_key;
 
+            access->get_entries_by_keys.state = this;
+            access->get_entries_by_keys.run = &s_SeqDB_get_entries_by_keys;
+
             access->get_entries_by_tags.state = this;
             access->get_entries_by_tags.run = &s_SeqDB_get_entries_by_tags;
         }
@@ -1210,6 +1214,52 @@ class SeqDB {
         /** @brief Get the value of the entry that has key search_key */
         virtual void get_entry_value_by_key(dbkey_t search_key, char **res) {
             get_entry_value_by_key_worker(search_key, res);
+        }
+
+        /** @brief Read one value from this DB's own map, with its exact
+         * length (values may contain NUL bytes)
+         * @return false if the key does not exist
+         */
+        bool get_value_if_exists(dbkey_t key, string& value) {
+            ZMQMessage resp = db_.retrieve_values_raw(1, &key);
+            const char* data = resp.data();
+            const char* end = data + resp.size();
+            if ((size_t)(end - data) < 2*sizeof(size_t) + sizeof(bool)) throw runtime_error("values reply: too short");
+            size_t count;
+            bool exists;
+            size_t len;
+            unpack_single(data, count);
+            unpack_single(data, exists);
+            unpack_single(data, len);
+            if (count != 1 || (size_t)(end - data) < len) throw runtime_error("values reply: malformed");
+            value.assign(data, len);
+            return exists;
+        }
+
+        /** @brief Get the values for n keys with one request to the map
+         *
+         * values[i] receives a malloc'd, NUL-terminated copy of the value for
+         * keys[i] (the caller frees it), or nullptr if the key does not exist.
+         * An empty value gives an empty string, not nullptr. Keys may repeat.
+         */
+        void get_entry_values_by_keys_worker(size_t n, const dbkey_t* keys, char** values) {
+            for (size_t i = 0; i < n; ++i) values[i] = nullptr;
+            if (n == 0) return;
+
+            ZMQMessage resp = db_.retrieve_values_raw(n, keys);
+            const char* data = resp.data();
+            try {
+                unpack_values_reply(data, data + resp.size(), n, nullptr, values);
+            } catch (...) {
+                for (size_t i = 0; i < n; ++i) { free(values[i]); values[i] = nullptr; }
+                throw;
+            }
+        }
+
+        /** @brief Get the values for n keys (see get_entry_values_by_keys_worker);
+         * ParDB's version asks every owning agent at once */
+        virtual void get_entry_values_by_keys(size_t n, const dbkey_t* keys, char** values) {
+            get_entry_values_by_keys_worker(n, keys, values);
         }
 
 
@@ -1407,6 +1457,19 @@ static void s_SeqDB_get_entry_by_tags(const fn* s_this, ...) {
 
     pando::SeqDB* db = (pando::SeqDB*)s_this->state;
     db->get_entry_value_by_tags(search_tags, res);
+}
+
+static void s_SeqDB_get_entries_by_keys(const fn* s_this, ...) {
+    // Arguments: size_t n, const dbkey_t* keys, char** values
+    va_list args;
+    va_start(args, s_this);
+    size_t n = va_arg(args, size_t);
+    const dbkey_t* keys = va_arg(args, const dbkey_t*);
+    char** values = va_arg(args, char**);
+    va_end(args);
+
+    pando::SeqDB* db = (pando::SeqDB*)s_this->state;
+    db->get_entry_values_by_keys(n, keys, values);
 }
 
 static void s_SeqDB_get_entry_by_key(const fn* s_this, ...) {

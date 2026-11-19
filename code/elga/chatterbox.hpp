@@ -39,9 +39,15 @@ namespace elga {
         private:
             zmq_msg_t msg_part_;
             zmq_socket_t sock_;
-            int size_;
+            /** Size in bytes. size_t, not int: zmq_msg_recv/zmq_msg_send
+             *  return an int clamped to INT_MAX, so sizes are taken from
+             *  zmq_msg_size() instead */
+            size_t size_;
             char *data_;
             bool closed_;
+
+            /** Take over that's message, leaving that empty (used by moves) */
+            void take_(ZMQMessage& that);
 
         public:
             /** Read a message from a socket */
@@ -60,7 +66,7 @@ namespace elga {
             ZMQMessage& operator=(ZMQMessage&& that);
 
             /** Get the message size */
-            size_t size() const { return (size_t)size_; }
+            size_t size() const { return size_; }
 
             /** Access the message data */
             const char *data() const { return data_; }
@@ -71,8 +77,13 @@ namespace elga {
             /** Access and change message data */
             char *edit_data() { return data_; }
 
-            /** Send the message */
+            /** Send the message on the socket it was created for */
             void send();
+            /** Send the message on another socket, e.g. to forward a message
+             *  received on one socket without copying it. ZeroMQ takes over
+             *  the buffer, so this message is empty (and closed) afterwards;
+             *  sending it again throws. */
+            void send(zmq_socket_t sock);
     };
 
     /** Handles requests to servers */

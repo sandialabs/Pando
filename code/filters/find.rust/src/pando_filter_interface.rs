@@ -1350,6 +1350,8 @@ pub struct DBAccess {
     pub value: *const ::std::os::raw::c_char,
     #[doc = " Members specific for GROUP_ENTRIES filters"]
     pub group: *mut ::std::os::raw::c_void,
+    #[doc = " Look up many keys with one blocking request:\n    run(fn*, size_t n, const dbkey_t* keys, char** values)\n  values[i] is set to a malloc'd, NUL-terminated copy of the value for\n  keys[i] (free it), or NULL if the key does not exist. The keys are\n  sent to all of their owning agents at once.\n  (Kept last so filters built before it was added still work.)"]
+    pub get_entries_by_keys: fn_,
 }
 #[test]
 fn bindgen_test_layout_DBAccess() {
@@ -1357,7 +1359,7 @@ fn bindgen_test_layout_DBAccess() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<DBAccess>(),
-        264usize,
+        288usize,
         concat!("Size of: ", stringify!(DBAccess))
     );
     assert_eq!(
@@ -1493,6 +1495,16 @@ fn bindgen_test_layout_DBAccess() {
             stringify!(DBAccess),
             "::",
             stringify!(group)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).get_entries_by_keys) as usize - ptr as usize },
+        264usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(DBAccess),
+            "::",
+            stringify!(get_entries_by_keys)
         )
     );
 }

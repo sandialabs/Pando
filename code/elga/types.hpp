@@ -115,6 +115,8 @@ using it_t = int32_t;
  * stage can close and staged memory is freed. Only received on the dedicated
  * control subscription (ZMQChatterbox::ctrl_sub), never by the main loop. */
 #define CLOSE_EARLY                   0xd7
+#define GET_ENTRIES_BY_KEYS           0xd8
+#define MAP_RETRIEVE_VALUES           0xd9
 #define WANT_HEARTBEAT                0xfe
 #define HEARTBEAT                     0xff
 

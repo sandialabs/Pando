@@ -33,6 +33,9 @@ cdef extern from "filter.hpp":
 
         void* group
 
+        # Batched lookup: run(fn*, size_t n, const dbkey_t* keys, char** values)
+        fn get_entries_by_keys
+
     cdef chain_info_t pack_chain_info(uint32_t a, uint16_t b, uint16_t c)
     cdef uint32_t get_blockchain_key(const char* blockchain)
 
