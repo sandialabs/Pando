@@ -109,6 +109,11 @@ class ParDB : public PandoParticipant {
             return n;
         }
 
+        static ParDBOptions with_continuous_processing_(ParDBOptions opts, bool continuous_processing) {
+            opts.continuous_processing = continuous_processing;
+            return opts;
+        }
+
         static ParDBOptions with_write_batch_bytes_(ParDBOptions opts, size_t write_batch_bytes) {
             opts.write_batch_bytes = write_batch_bytes;
             return opts;
@@ -196,11 +201,12 @@ class ParDB : public PandoParticipant {
                 ParDB(addr, sz, make_options_(skip_group_filters, max_filters_per_stage, mem_policy)) { }
 
         /** @brief Initialize the parallel DB, setting the write batch flush size
-         * (see set_write_batch_bytes; 0 turns batching off) */
+         * (see set_write_batch_bytes; 0 turns batching off) and whether
+         * processing is continuous (see SeqDB::set_continuous_processing) */
         ParDB(ZMQAddress addr, size_t sz, bool skip_group_filters, size_t max_filters_per_stage,
-              size_t write_batch_bytes) :
-                ParDB(addr, sz, with_write_batch_bytes_(make_options_(skip_group_filters, max_filters_per_stage,
-                                                                      MemoryPolicy{}), write_batch_bytes)) { }
+              size_t write_batch_bytes, bool continuous_processing=true) :
+                ParDB(addr, sz, with_continuous_processing_(with_write_batch_bytes_(make_options_(skip_group_filters,
+                      max_filters_per_stage, MemoryPolicy{}), write_batch_bytes), continuous_processing)) { }
 
         /** @brief Initialize the parallel DB with the given settings (see ParDBOptions) */
         ParDB(ZMQAddress addr, size_t sz, const ParDBOptions& opts) :
@@ -235,6 +241,7 @@ class ParDB : public PandoParticipant {
             if (skip_group_filters_) db_.disable_group_filters();
             if (opts.max_filters_per_stage != 0) db_.set_max_filters_per_stage(opts.max_filters_per_stage);
             if (opts.scan_block_keys != 0) db_.set_scan_block_keys(opts.scan_block_keys);
+            db_.set_continuous_processing(opts.continuous_processing);
             db_.set_memory_policy(opts.mem_policy);
             slurm_tasks_per_node_ = slurm_tasks_per_node();
             db_.set_agents_per_node_source([this]() { return agents_on_node_(); });
@@ -455,6 +462,9 @@ class ParDB : public PandoParticipant {
 
         /** @brief Keys the filter scan fetches from the map per request */
         size_t scan_block_keys() const { return db_.scan_block_keys(); }
+
+        /** @brief Whether a process request keeps sweeping until nothing runs */
+        bool continuous_processing() const { return db_.continuous_processing(); }
 
         /** @brief Processing passes this agent has started (for tests) */
         uint64_t passes_started() const { return db_.stats().pass; }
@@ -1386,7 +1396,7 @@ class ParDB : public PandoParticipant {
                 if (synchronizer_process_again_) {
                     synchronizer_process_again_ = false;
                     has_alg_processed_ = false;
-                    broadcast_process();
+                    broadcast_process(false);
                 } else {
                     // move everyone into the alg db process
                     // Filter installs are broadcast to every agent, so the
@@ -1497,13 +1507,23 @@ class ParDB : public PandoParticipant {
             else throw runtime_error("End barrier at unknown stage");
         }
 
-        void broadcast_process() {
-            msg_type_t msg = PROCESS;
-            pub((char*)&msg, sizeof(msg));
+        /** @brief Start a processing pass on every agent (and self)
+         *
+         * @param new_request true for the first pass of a process request
+         *        from a client, false for another pass the synchronizer
+         *        starts to continue the same request. Each request starts a
+         *        new sweep over the entries (see SeqDB::start_new_sweep).
+         */
+        void broadcast_process(bool new_request = true) {
+            char msg[sizeof(msg_type_t) + sizeof(uint8_t)];
+            char* msg_ptr = msg;
+            pack_msg(msg_ptr, PROCESS);
+            pack_single(msg_ptr, (uint8_t)(new_request ? 1 : 0));
+            pub(msg, sizeof(msg));
 
             //also send to self
             auto req = get_req(addr_.serialize());
-            req->send(PROCESS);
+            req->send(msg, sizeof(msg));
         }
 
         void broadcast_algprocess() {
@@ -1523,7 +1543,7 @@ class ParDB : public PandoParticipant {
             // where that returns false, but really we're already processing)
             set_state_(STAGE_BEGIN);
 
-            broadcast_process();
+            broadcast_process(true);
 
             // If necessary, respond with an acknowledgement
             if (ZMQRequester::is_reqrep_sock(sock))
@@ -1531,8 +1551,13 @@ class ParDB : public PandoParticipant {
         }
 
         /** @brief Call process on the internal DB */
-        void recv_process(zmq_socket_t sock, [[maybe_unused]] const char* data, [[maybe_unused]] const char* end) {
+        void recv_process(zmq_socket_t sock, const char* data, const char* end) {
             has_alg_processed_ = false;
+
+            // The first pass of a client's request starts a new sweep. (A
+            // PROCESS without the flag byte is treated as a new request.)
+            bool new_request = (data == end) || (*data != 0);
+            if (new_request) db_.start_new_sweep();
 
             // What this agent reports before its filters run: whether the last
             // stage close left changes staged. Applying an entry at a close

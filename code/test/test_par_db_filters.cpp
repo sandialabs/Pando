@@ -1613,6 +1613,202 @@ TEST(forward_writes_to_owner) {
     TEST_PASS
 }
 
+// Run test_pardb_filters_new_entry (on entries tagged "A") on 3 agents with
+// continuous processing on or off (once = off) and the given filter runs per pass, check that every "A" entry
+// was filtered, and report how many passes the request took (every agent
+// takes part in every pass) and whether each agent offered each of its
+// entries to the filters exactly once
+static int run_sweep(const string& build_dir, bool once, size_t max_filters,
+                     uint64_t& passes, bool& each_entry_once, size_t scan_block_keys = 0) {
+    g_idx = 0;
+    const size_t n = 12;
+    const size_t sz = 2ull*(1ull<<29);
+    ParDBOptions opts;
+    opts.max_filters_per_stage = max_filters;
+    opts.continuous_processing = !once;
+    opts.scan_block_keys = scan_block_keys;
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr, sz, opts };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr, sz, opts };
+    elga::ZMQAddress db3_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db3 { db3_addr, sz, opts };
+    EQ(db1.db().continuous_processing(), !once);
+    EQ(db1.db().scan_block_keys(), scan_block_keys ? scan_block_keys : SeqDB::DEFAULT_SCAN_BLOCK_KEYS);
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    ParDBClient c3 { db3_addr };
+    vector<ZMQAddress> addrs { db1_addr, db2_addr, db3_addr };
+
+    c2.add_neighbor(db1_addr);
+    c3.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 3 || c2.num_neighbors() != 3 || c3.num_neighbors() != 3); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 3);
+    EQ(c2.num_neighbors(), 3);
+    EQ(c3.num_neighbors(), 3);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_new_entry");
+
+    for (size_t k = 0; k < n; ++k) {
+        DBEntry<> e; e.set_key({1, (vtx_t)(10+k), 0});
+        e.add_tag("A").add_to_value("v"+to_string(k));
+        c1.add_entry(e);
+    }
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() + c3.db_size() != n; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size() + c3.db_size(), n);
+    size_t initial[3] = { c1.db_size(), c2.db_size(), c3.db_size() };
+
+    c1.process();
+    wait(addrs);
+
+    passes = db1.db().passes_started();
+    EQ(db2.db().passes_started(), passes);
+    EQ(db3.db().passes_started(), passes);
+    each_entry_once = db1.db().entries_examined() == initial[0] &&
+                      db2.db().entries_examined() == initial[1] &&
+                      db3.db().entries_examined() == initial[2];
+
+    // Every "A" entry was filtered, and the filter's output {2,2,2} exists
+    size_t done = 0;
+    bool new_entry_found = false;
+    for (auto* c : {&c1, &c2, &c3})
+        for (auto & entry : c->get_entries()) {
+            if (entry.has_tag("A") && entry.has_tag("test_pardb_filters_new_entry:done")) ++done;
+            if (entry.get_key() == dbkey_t{2,2,2}) new_entry_found = true;
+        }
+    EQ(done, n);
+    EQ(new_entry_found, true);
+
+    TEST_PASS
+}
+
+// Continuous processing: the pass that runs the filters is followed by exactly one
+// pass that checks nothing else became eligible (there used to be two: the
+// barrier before the filters ran repeated the previous pass's answer).
+// Continuous processing off: the pass that runs the filters is the only one, and each entry is
+// offered to the filters exactly once.
+TEST(process_request_passes) {
+    uint64_t passes;
+    bool each_once;
+
+    EQ(run_sweep(build_dir, false, 0, passes, each_once), 0);
+    EQ(passes, 2);
+
+    EQ(run_sweep(build_dir, true, 0, passes, each_once), 0);
+    EQ(passes, 1);
+    EQ(each_once, true);
+
+    TEST_PASS
+}
+
+// With one filter run per pass a sweep spans several passes. Continuous processing off
+// still offers each entry exactly once: an agent that has finished its sweep
+// does not rescan while the others finish theirs, and reaching the limit on
+// the last entry ends the sweep instead of starting another. Continuous processing
+// takes as many passes here (its check that nothing else became eligible is
+// a full extra lap inside the last pass), but rescans the entries to do it.
+TEST(process_request_passes_with_filter_limit) {
+    uint64_t passes_once, passes_continuous;
+    bool each_once;
+
+    EQ(run_sweep(build_dir, true, 1, passes_once, each_once), 0);
+    EQ(each_once, true);
+    // 12 entries on 3 agents: some agent has at least 4, one per pass
+    EQ(passes_once >= 4, true);
+
+    EQ(run_sweep(build_dir, false, 1, passes_continuous, each_once), 0);
+    EQ(each_once, false);
+    EQ(passes_continuous >= passes_once, true);
+
+    // The same with 2-key scan blocks, so passes stop inside blocks
+    uint64_t passes_small_blocks;
+    EQ(run_sweep(build_dir, true, 1, passes_small_blocks, each_once, 2), 0);
+    EQ(each_once, true);
+
+    TEST_PASS
+}
+
+// Continuous processing off, across agents: tag_other (on "Y" entries) tags the matching
+// "X" entry, possibly on another agent, so on_tag_b can run on it. With
+// continuous processing one request runs both; with it off, the first request only runs
+// tag_other and the second request (a new sweep) runs on_tag_b
+static int run_chain(const string& build_dir, bool once, size_t& b_done_first, size_t& b_done_second) {
+    g_idx = 0;
+    const size_t pairs = 10;
+    const size_t sz = 2ull*(1ull<<29);
+
+    elga::ZMQAddress db1_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db1 { db1_addr, sz, false, 0, ParDB::DEFAULT_WRITE_BATCH_BYTES, !once };
+    elga::ZMQAddress db2_addr { "127.0.0.1", g_idx+=inc_amount };
+    ParDBThread db2 { db2_addr, sz, false, 0, ParDB::DEFAULT_WRITE_BATCH_BYTES, !once };
+    vector<ZMQAddress> addrs { db1_addr, db2_addr };
+
+    ParDBClient c1 { db1_addr };
+    ParDBClient c2 { db2_addr };
+    c2.add_neighbor(db1_addr);
+    for (int t = 0; t < 100 && (c1.num_neighbors() != 2 || c2.num_neighbors() != 2); ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.num_neighbors(), 2);
+    EQ(c2.num_neighbors(), 2);
+
+    c1.add_filter_dir(build_dir+"/test/filters");
+    this_thread::sleep_for(chrono::milliseconds(50));
+    c1.install_filter("test_pardb_filters_tag_other");
+    c1.install_filter("test_pardb_filters_on_tag_b");
+
+    for (size_t k = 0; k < pairs; ++k) {
+        { DBEntry<> e; e.set_key({80, (vtx_t)k, 0}); e.add_tag("Y"); e.value() = "y"; c1.add_entry(e); }
+        { DBEntry<> e; e.set_key({81, (vtx_t)k, 0}); e.add_tag("X"); e.value() = "x"; c1.add_entry(e); }
+    }
+    for (int t = 0; t < 100 && c1.db_size() + c2.db_size() != 2*pairs; ++t)
+        this_thread::sleep_for(chrono::milliseconds(50));
+    EQ(c1.db_size() + c2.db_size(), 2*pairs);
+
+    auto count_b_done = [&]() {
+        size_t done = 0;
+        for (auto* c : {&c1, &c2})
+            for (auto & entry : c->get_entries())
+                if (entry.has_tag("X") && entry.has_tag("test_pardb_filters_on_tag_b:done")) ++done;
+        return done;
+    };
+
+    c1.process();
+    wait(addrs);
+    b_done_first = count_b_done();
+    // tag_other ran on every Y either way
+    size_t y_done = 0;
+    for (auto* c : {&c1, &c2})
+        for (auto & entry : c->get_entries())
+            if (entry.has_tag("Y") && entry.has_tag("test_pardb_filters_tag_other:done")) ++y_done;
+    EQ(y_done, pairs);
+
+    c1.process();
+    wait(addrs);
+    b_done_second = count_b_done();
+
+    TEST_PASS
+}
+
+TEST(continuous_processing_off_leaves_follow_ups_for_next_request) {
+    size_t first, second;
+
+    EQ(run_chain(build_dir, false, first, second), 0);
+    EQ(first, 10);
+    EQ(second, 10);
+
+    EQ(run_chain(build_dir, true, first, second), 0);
+    EQ(first, 0);
+    EQ(second, 10);
+
+    TEST_PASS
+}
+
 TESTS_BEGIN
     elga::ZMQChatterbox::Setup();
 
@@ -1645,6 +1841,9 @@ TESTS_BEGIN
     RUN_TEST(filter_get_entries_by_keys, 2, 0)
     RUN_TEST(filter_get_entries_by_keys, 2000, 7)
     RUN_TEST(filter_get_entry_by_key_local_and_remote)
+    RUN_TEST(process_request_passes)
+    RUN_TEST(process_request_passes_with_filter_limit)
+    RUN_TEST(continuous_processing_off_leaves_follow_ups_for_next_request)
 
     elga::ZMQChatterbox::Teardown();
 TESTS_END
