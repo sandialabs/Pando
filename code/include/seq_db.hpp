@@ -20,6 +20,8 @@
 #include <functional>
 #include <string_view>
 #include <system_error>
+#include <sys/resource.h>   // DEBUG-IMPORT
+#include <unistd.h>         // DEBUG-IMPORT
 #include "absl/container/flat_hash_map.h"
 #include "Python.h"
 
@@ -1670,6 +1672,68 @@ class SeqDB {
             return (size_t)(p - start);
         }
 
+        // DEBUG-IMPORT begin: phase timing for import_db; remove before merging
+        //
+        // Prints one line per phase to stderr:
+        //   [import-debug] host pid file phase=<name> wall=<s> cpu=<s> majflt=<n> MB/s=<file size / wall>
+        // majflt counts page faults that waited for the file (pages not yet
+        // in the page cache), so a phase with many of them was reading the
+        // file; one with few was CPU/memory work. Set PANDO_IMPORT_PREREAD=1
+        // to first fault in the whole file in its own phase ("preread"), so
+        // its wall time is the raw read speed and the later phases run from
+        // the page cache (if the node has the memory to keep it).
+        struct ImportDebug_ {
+            string tag;
+            size_t file_size = 0;
+            steady_clock::time_point t0, t_start;
+            double cpu0 = 0;
+            long majflt0 = 0, minflt0 = 0;
+
+            static void usage_(double& cpu, long& majflt, long& minflt) {
+                rusage ru;
+                getrusage(RUSAGE_SELF, &ru);
+                cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec*1e-6
+                    + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec*1e-6;
+                majflt = ru.ru_majflt;
+                minflt = ru.ru_minflt;
+            }
+            static double epoch_() {
+                return duration<double>(system_clock::now().time_since_epoch()).count();
+            }
+
+            explicit ImportDebug_(const string& fn) {
+                char host[256] = {0};
+                gethostname(host, sizeof(host) - 1);
+                tag = string("[import-debug] ") + host + " pid=" + to_string(getpid()) + " " + fn;
+                t_start = t0 = steady_clock::now();
+                usage_(cpu0, majflt0, minflt0);
+                cerr << tag << " phase=start epoch=" << to_string(epoch_()) << endl;
+            }
+
+            void phase(const char* name, const string& extra = "") {
+                auto t = steady_clock::now();
+                double cpu; long majflt, minflt;
+                usage_(cpu, majflt, minflt);
+                double wall = duration<double>(t - t0).count();
+                cerr << tag << " phase=" << name
+                     << " wall=" << wall << " cpu=" << (cpu - cpu0)
+                     << " majflt=" << (majflt - majflt0) << " minflt=" << (minflt - minflt0)
+                     << " MB/s=" << (wall > 0 ? file_size / 1e6 / wall : 0.0);
+                if (!extra.empty()) cerr << " " << extra;
+                cerr << endl;
+                t0 = t; cpu0 = cpu; majflt0 = majflt; minflt0 = minflt;
+            }
+
+            ~ImportDebug_() {
+                double wall = duration<double>(steady_clock::now() - t_start).count();
+                cerr << tag << " phase=total wall=" << wall << " size=" << file_size
+                     << " MB/s=" << (wall > 0 ? file_size / 1e6 / wall : 0.0)
+                     << " epoch=" << to_string(epoch_())
+                     << (std::uncaught_exceptions() ? " (threw)" : "") << endl;
+            }
+        };
+        // DEBUG-IMPORT end
+
         /** @brief Import entries from a file written by export_db
          *
          * Entries are inserted by the PandoMap straight from the mapped file
@@ -1688,10 +1752,22 @@ class SeqDB {
          * not called for them.
          */
         void import_db(string import_fn) {
+            ImportDebug_ dbg {import_fn};   // DEBUG-IMPORT
             pigo::ROFile in_f {import_fn};
             const char* const begin = in_f.fp();
             const char* ser = begin;
             const char* end = ser + in_f.size();
+            dbg.file_size = in_f.size();    // DEBUG-IMPORT
+            dbg.phase("open");              // DEBUG-IMPORT (mmap + madvise WILLNEED)
+
+            // DEBUG-IMPORT begin
+            if (const char* pre = getenv("PANDO_IMPORT_PREREAD"); pre && *pre && *pre != '0') {
+                volatile unsigned char sink = 0;
+                long page = sysconf(_SC_PAGESIZE);
+                for (const char* q = begin; q < end; q += page) sink = sink + (unsigned char)*q;
+                dbg.phase("preread");
+            }
+            // DEBUG-IMPORT end
 
             auto bad_file = [&](const string& why) {
                 return runtime_error("import_db: " + import_fn + " is malformed (" + why + ")");
@@ -1728,10 +1804,13 @@ class SeqDB {
             }
             if (ser != end)
                 throw bad_file(to_string(end - ser) + " bytes after the last entry");
+            dbg.phase("validate", "entries=" + to_string(entries.size()));    // DEBUG-IMPORT
 
             if (entries.empty()) return;
 
             vector<size_t> skipped = db_.insert_from_buffer(entries.data(), entries.size());
+            dbg.phase("map_insert", "skipped=" + to_string(skipped.size()));  // DEBUG-IMPORT
+            double dbg_merge_s = 0;         // DEBUG-IMPORT
 
             // In file order, so repeated keys merge in the same order as
             // adding the entries one at a time would
@@ -1740,8 +1819,10 @@ class SeqDB {
                 const char* p = entries[i];
                 if (next_skipped < skipped.size() && skipped[next_skipped] == i) {
                     ++next_skipped;
+                    auto dbg_t = steady_clock::now();   // DEBUG-IMPORT
                     DBEntry<> e(p);
                     add_entry(move(e));
+                    dbg_merge_s += duration<double>(steady_clock::now() - dbg_t).count();  // DEBUG-IMPORT
                     continue;
                 }
 
@@ -1756,6 +1837,8 @@ class SeqDB {
                     it->second.insert(key);
                 });
             }
+            // DEBUG-IMPORT: wall here includes merge_s spent in add_entry for skipped entries
+            dbg.phase("tags_subs", "merge_s=" + to_string(dbg_merge_s));
         }
 
         void deserialize_and_add_entries(const char* ser) {
