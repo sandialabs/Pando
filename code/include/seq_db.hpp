@@ -1678,11 +1678,11 @@ class SeqDB {
          * file), or that have no key, go through add_entry as before, so they
          * are merged the same way.
          *
-         * Each entry is read by its own key/value/tag lengths, and the
-         * <entry size> prefix written before it is ignored. The old reader
-         * (deserialize_and_add_entries) did the same, and existing exports
-         * have prefixes that do not match their entries. A mismatch is only
-         * counted and reported as a warning.
+         * The whole file is checked before anything is inserted: every entry
+         * must take exactly the bytes its <entry size> prefix says, and the
+         * last entry must end at the end of the file. A file that fails (for
+         * example, one that was not completely written, so its tail is zeros)
+         * throws runtime_error and leaves the database unchanged.
          *
          * The new entries skip the virtual add_entry: an override of it is
          * not called for them.
@@ -1706,33 +1706,28 @@ class SeqDB {
             // Check every entry before the map reads any of them
             vector<const char*> entries;
             entries.reserve(num_entries);
-            size_t size_mismatches = 0;
             for (size_t i = 0; i < num_entries; ++i) {
-                if ((size_t)(end - ser) < sizeof(size_t))
-                    throw bad_file("truncated before entry " + to_string(i) + " of " + to_string(num_entries));
+                auto bad_entry = [&](const string& why) {
+                    return bad_file("bad entry " + to_string(i) + " of " + to_string(num_entries)
+                            + " at offset " + to_string(ser - begin) + " of " + to_string(end - begin)
+                            + ": " + why);
+                };
+                if ((size_t)(end - ser) < sizeof(size_t)) throw bad_entry("file ends before its size");
                 size_t prefix_size = *(const size_t*)ser; ser += sizeof(size_t);
+                if ((size_t)(end - ser) < prefix_size)
+                    throw bad_entry("size " + to_string(prefix_size) + " runs past the end of the file");
                 size_t entry_size = walk_serialized_entry_(ser, end, [](string_view) {});
                 if (entry_size == 0)
-                    throw bad_file("bad entry " + to_string(i) + " of " + to_string(num_entries)
-                            + " at offset " + to_string(ser - begin) + " of " + to_string(end - begin)
-                            + ": its lengths run past the end of the file; size prefix "
+                    throw bad_entry("its lengths run past the end of the file (size "
+                            + to_string(prefix_size) + ")");
+                if (entry_size != prefix_size)
+                    throw bad_entry("it takes " + to_string(entry_size) + " bytes but its size says "
                             + to_string(prefix_size));
-                if (entry_size != prefix_size) {
-                    if (size_mismatches == 0)
-                        cerr << "[Pando] [WARNING] import_db: " << import_fn << ": entry " << i
-                             << " has size prefix " << prefix_size << " but takes " << entry_size
-                             << " bytes; reading it by its contents" << endl;
-                    ++size_mismatches;
-                }
                 entries.push_back(ser);
                 ser += entry_size;
             }
-            if (size_mismatches > 1)
-                cerr << "[Pando] [WARNING] import_db: " << import_fn << ": " << size_mismatches
-                     << " entries had a size prefix that did not match" << endl;
             if (ser != end)
-                cerr << "[Pando] [WARNING] import_db: " << import_fn << ": " << (end - ser)
-                     << " bytes after the last entry were ignored" << endl;
+                throw bad_file(to_string(end - ser) + " bytes after the last entry");
 
             if (entries.empty()) return;
 

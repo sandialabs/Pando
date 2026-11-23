@@ -1267,23 +1267,28 @@ TEST(import_malformed_file) {
         EQ(import_bytes(bad), true);
     }
 
-    // An entry size prefix that does not match the entry is ignored, as the
-    // old reader did (existing exports have such prefixes): both entries
-    // still import, read by their own lengths
-    for (long delta : {-1L, 1L, 1000L}) {
+    // An entry size that does not match the entry
+    for (long delta : {-1L, 1L}) {
         vector<char> bad = good;
         *(size_t*)(bad.data() + sizeof(size_t)) += delta;
-        {
-            ofstream out {fn, ios::binary};
-            out.write(bad.data(), bad.size());
-        }
-        SeqDB db;
-        db.import_db(fn);
-        EQ(db.size(), 2);
-        EQ(string(db.entries()[(dbkey_t{1,1,1})].value()), string("first"));
-        EQ(string(db.entries()[(dbkey_t{2,2,2})].value()), string("second"));
-        EQ((db.get_entry_by_tags(set<string>{"b"}) == (set<dbkey_t>{dbkey_t{2,2,2}})), true);
-        db.stage_close();
+        EQ(import_bytes(bad), true);
+    }
+
+    // Not completely written: the second entry and everything after it is
+    // zeros (all-zero bytes parse as an empty entry with a 0 size prefix)
+    {
+        size_t second = sizeof(size_t) + sizeof(size_t) + *(size_t*)(good.data() + sizeof(size_t));
+        vector<char> bad = good;
+        fill(bad.begin() + second, bad.end(), 0);
+        bad.resize(bad.size() + 200, 0);
+        EQ(import_bytes(bad), true);
+    }
+
+    // Extra bytes after the last entry
+    {
+        vector<char> bad = good;
+        bad.resize(bad.size() + 8, 0);
+        EQ(import_bytes(bad), true);
     }
 
     // A value length running past the entry
