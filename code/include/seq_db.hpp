@@ -1635,38 +1635,39 @@ class SeqDB {
             serialize_entries(data_ptr, keys);
         }
 
-        /** @brief Walk one serialized DBEntry occupying exactly [p, p + size)
+        /** @brief Walk one serialized DBEntry starting at p, by its own lengths
          *
-         * Calls f(string_view) for each tag. Checks every length against the
-         * bounds, so it is safe on untrusted data.
+         * Calls f(string_view) for each tag. Checks every length against end,
+         * so it is safe on untrusted data.
          *
-         * @return false if the bytes are not exactly one well-formed entry
+         * @return the number of bytes the entry takes, or 0 if its lengths run
+         *         past end (an entry always takes more than 0 bytes)
          */
         template<typename F>
-        static bool walk_serialized_entry_(const char* p, size_t size, F&& f) {
-            const char* end = p + size;
+        static size_t walk_serialized_entry_(const char* p, const char* end, F&& f) {
+            const char* start = p;
             auto read_len = [&](size_t& len) {
                 if ((size_t)(end - p) < sizeof(size_t)) return false;
                 len = *(const size_t*)p; p += sizeof(size_t);
                 return true;
             };
 
-            if (size < sizeof(dbkey_t)) return false;
+            if ((size_t)(end - p) < sizeof(dbkey_t)) return 0;
             p += sizeof(dbkey_t);
 
             size_t val_size;
-            if (!read_len(val_size) || (size_t)(end - p) < val_size) return false;
+            if (!read_len(val_size) || (size_t)(end - p) < val_size) return 0;
             p += val_size;
 
             size_t ntags;
-            if (!read_len(ntags)) return false;
+            if (!read_len(ntags)) return 0;
             for (; ntags > 0; --ntags) {
                 size_t tag_size;
-                if (!read_len(tag_size) || (size_t)(end - p) < tag_size) return false;
+                if (!read_len(tag_size) || (size_t)(end - p) < tag_size) return 0;
                 f(string_view {p, tag_size});
                 p += tag_size;
             }
-            return p == end;
+            return (size_t)(p - start);
         }
 
         /** @brief Import entries from a file written by export_db
@@ -1677,12 +1678,19 @@ class SeqDB {
          * file), or that have no key, go through add_entry as before, so they
          * are merged the same way.
          *
+         * Each entry is read by its own key/value/tag lengths, and the
+         * <entry size> prefix written before it is ignored. The old reader
+         * (deserialize_and_add_entries) did the same, and existing exports
+         * have prefixes that do not match their entries. A mismatch is only
+         * counted and reported as a warning.
+         *
          * The new entries skip the virtual add_entry: an override of it is
          * not called for them.
          */
         void import_db(string import_fn) {
             pigo::ROFile in_f {import_fn};
-            const char* ser = in_f.fp();
+            const char* const begin = in_f.fp();
+            const char* ser = begin;
             const char* end = ser + in_f.size();
 
             auto bad_file = [&](const string& why) {
@@ -1698,15 +1706,33 @@ class SeqDB {
             // Check every entry before the map reads any of them
             vector<const char*> entries;
             entries.reserve(num_entries);
+            size_t size_mismatches = 0;
             for (size_t i = 0; i < num_entries; ++i) {
-                if ((size_t)(end - ser) < sizeof(size_t)) throw bad_file("truncated entry size");
-                size_t entry_size = *(const size_t*)ser; ser += sizeof(size_t);
-                if ((size_t)(end - ser) < entry_size ||
-                        !walk_serialized_entry_(ser, entry_size, [](string_view) {}))
-                    throw bad_file("bad entry " + to_string(i));
+                if ((size_t)(end - ser) < sizeof(size_t))
+                    throw bad_file("truncated before entry " + to_string(i) + " of " + to_string(num_entries));
+                size_t prefix_size = *(const size_t*)ser; ser += sizeof(size_t);
+                size_t entry_size = walk_serialized_entry_(ser, end, [](string_view) {});
+                if (entry_size == 0)
+                    throw bad_file("bad entry " + to_string(i) + " of " + to_string(num_entries)
+                            + " at offset " + to_string(ser - begin) + " of " + to_string(end - begin)
+                            + ": its lengths run past the end of the file; size prefix "
+                            + to_string(prefix_size));
+                if (entry_size != prefix_size) {
+                    if (size_mismatches == 0)
+                        cerr << "[Pando] [WARNING] import_db: " << import_fn << ": entry " << i
+                             << " has size prefix " << prefix_size << " but takes " << entry_size
+                             << " bytes; reading it by its contents" << endl;
+                    ++size_mismatches;
+                }
                 entries.push_back(ser);
                 ser += entry_size;
             }
+            if (size_mismatches > 1)
+                cerr << "[Pando] [WARNING] import_db: " << import_fn << ": " << size_mismatches
+                     << " entries had a size prefix that did not match" << endl;
+            if (ser != end)
+                cerr << "[Pando] [WARNING] import_db: " << import_fn << ": " << (end - ser)
+                     << " bytes after the last entry were ignored" << endl;
 
             if (entries.empty()) return;
 
@@ -1728,8 +1754,7 @@ class SeqDB {
                 // does for a new key
                 dbkey_t key = *(const dbkey_t*)p;
                 handle_subscriptions(key);
-                size_t entry_size = *(const size_t*)(p - sizeof(size_t));
-                walk_serialized_entry_(p, entry_size, [&](string_view tag) {
+                walk_serialized_entry_(p, end, [&](string_view tag) {
                     auto it = entries_by_tag_.find(tag);
                     if (it == entries_by_tag_.end())
                         it = entries_by_tag_.emplace(string{tag}, set<dbkey_t>{}).first;

@@ -1267,11 +1267,23 @@ TEST(import_malformed_file) {
         EQ(import_bytes(bad), true);
     }
 
-    // An entry size that does not match the entry
-    {
+    // An entry size prefix that does not match the entry is ignored, as the
+    // old reader did (existing exports have such prefixes): both entries
+    // still import, read by their own lengths
+    for (long delta : {-1L, 1L, 1000L}) {
         vector<char> bad = good;
-        *(size_t*)(bad.data() + sizeof(size_t)) -= 1;
-        EQ(import_bytes(bad), true);
+        *(size_t*)(bad.data() + sizeof(size_t)) += delta;
+        {
+            ofstream out {fn, ios::binary};
+            out.write(bad.data(), bad.size());
+        }
+        SeqDB db;
+        db.import_db(fn);
+        EQ(db.size(), 2);
+        EQ(string(db.entries()[(dbkey_t{1,1,1})].value()), string("first"));
+        EQ(string(db.entries()[(dbkey_t{2,2,2})].value()), string("second"));
+        EQ((db.get_entry_by_tags(set<string>{"b"}) == (set<dbkey_t>{dbkey_t{2,2,2}})), true);
+        db.stage_close();
     }
 
     // A value length running past the entry
