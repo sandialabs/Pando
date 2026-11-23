@@ -20,8 +20,15 @@
 #include <functional>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <sys/resource.h>   // DEBUG-IMPORT
-#include <unistd.h>         // DEBUG-IMPORT
+#include <sstream>          // DEBUG-IMPORT
 #include "absl/container/flat_hash_map.h"
 #include "Python.h"
 
@@ -1672,145 +1679,388 @@ class SeqDB {
             return (size_t)(p - start);
         }
 
-        // DEBUG-IMPORT begin: phase timing for import_db; remove before merging
+        // DEBUG-IMPORT begin: timing for import_db; remove before merging
         //
-        // Prints one line per phase to stderr:
-        //   [import-debug] host pid file phase=<name> wall=<s> cpu=<s> majflt=<n> MB/s=<file size / wall>
-        // majflt counts page faults that waited for the file (pages not yet
-        // in the page cache), so a phase with many of them was reading the
-        // file; one with few was CPU/memory work. Set PANDO_IMPORT_PREREAD=1
-        // to first fault in the whole file in its own phase ("preread"), so
-        // its wall time is the raw read speed and the later phases run from
-        // the page cache (if the node has the memory to keep it).
+        // Prints to stderr, one line each (lines are written whole, so lines
+        // from different processes sharing the job's stderr do not mix):
+        //   [import-debug] host pid file phase=start epoch=<s>
+        //   [import-debug] host pid file phase=total wall=<s> cpu=<s> size=<bytes> MB/s=<size/wall>
+        //       block_mb=<n> blocks=<n> entries=<n> read_s=<s> wait_s=<s> parse_s=<s>
+        //       insert_s=<s> post_s=<s> merge_s=<s> epoch=<s> [(threw)]
+        // read_s: time the reader thread spent in pread (the filesystem)
+        // wait_s: time the import thread waited for the reader to fill a block
+        //         (if this is most of wall, the import is bound by reading)
+        // parse_s: checking entries; insert_s: PandoMap inserting new keys;
+        // post_s: tag index + subscriptions + merges (merge_s is the merge part)
         struct ImportDebug_ {
             string tag;
-            size_t file_size = 0;
-            steady_clock::time_point t0, t_start;
+            size_t file_size = 0, block_bytes = 0, blocks = 0, entries = 0;
+            double read_s = 0, wait_s = 0, parse_s = 0, insert_s = 0, post_s = 0, merge_s = 0;
+            steady_clock::time_point t_start;
             double cpu0 = 0;
-            long majflt0 = 0, minflt0 = 0;
 
-            static void usage_(double& cpu, long& majflt, long& minflt) {
+            static double cpu_() {
                 rusage ru;
                 getrusage(RUSAGE_SELF, &ru);
-                cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec*1e-6
-                    + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec*1e-6;
-                majflt = ru.ru_majflt;
-                minflt = ru.ru_minflt;
+                return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec*1e-6
+                     + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec*1e-6;
             }
             static double epoch_() {
                 return duration<double>(system_clock::now().time_since_epoch()).count();
+            }
+            static double since_(steady_clock::time_point t) {
+                return duration<double>(steady_clock::now() - t).count();
+            }
+            static void emit_(const string& line) {
+                string l = line + "\n";
+                fwrite(l.data(), 1, l.size(), stderr);
+                fflush(stderr);
             }
 
             explicit ImportDebug_(const string& fn) {
                 char host[256] = {0};
                 gethostname(host, sizeof(host) - 1);
                 tag = string("[import-debug] ") + host + " pid=" + to_string(getpid()) + " " + fn;
-                t_start = t0 = steady_clock::now();
-                usage_(cpu0, majflt0, minflt0);
-                cerr << tag << " phase=start epoch=" << to_string(epoch_()) << endl;
-            }
-
-            void phase(const char* name, const string& extra = "") {
-                auto t = steady_clock::now();
-                double cpu; long majflt, minflt;
-                usage_(cpu, majflt, minflt);
-                double wall = duration<double>(t - t0).count();
-                cerr << tag << " phase=" << name
-                     << " wall=" << wall << " cpu=" << (cpu - cpu0)
-                     << " majflt=" << (majflt - majflt0) << " minflt=" << (minflt - minflt0)
-                     << " MB/s=" << (wall > 0 ? file_size / 1e6 / wall : 0.0);
-                if (!extra.empty()) cerr << " " << extra;
-                cerr << endl;
-                t0 = t; cpu0 = cpu; majflt0 = majflt; minflt0 = minflt;
+                t_start = steady_clock::now();
+                cpu0 = cpu_();
+                emit_(tag + " phase=start epoch=" + to_string(epoch_()));
             }
 
             ~ImportDebug_() {
-                double wall = duration<double>(steady_clock::now() - t_start).count();
-                cerr << tag << " phase=total wall=" << wall << " size=" << file_size
-                     << " MB/s=" << (wall > 0 ? file_size / 1e6 / wall : 0.0)
-                     << " epoch=" << to_string(epoch_())
-                     << (std::uncaught_exceptions() ? " (threw)" : "") << endl;
+                double wall = since_(t_start);
+                ostringstream o;
+                o << tag << " phase=total wall=" << wall << " cpu=" << (cpu_() - cpu0)
+                  << " size=" << file_size
+                  << " MB/s=" << (wall > 0 ? file_size / 1e6 / wall : 0.0)
+                  << " block_mb=" << block_bytes / (1 << 20) << " blocks=" << blocks
+                  << " entries=" << entries
+                  << " read_s=" << read_s << " wait_s=" << wait_s << " parse_s=" << parse_s
+                  << " insert_s=" << insert_s << " post_s=" << post_s << " merge_s=" << merge_s
+                  << " epoch=" << to_string(epoch_())
+                  << (std::uncaught_exceptions() ? " (threw)" : "");
+                emit_(o.str());
             }
         };
         // DEBUG-IMPORT end
 
+        /** @brief Reads a file front to back in blocks on its own thread
+         *
+         * The import thread takes filled blocks with next() and hands each one
+         * back with give_back() once nothing points into it, so reading the
+         * next blocks overlaps with inserting the current one. Memory is
+         * bounded by nbufs blocks. Blocks already used are dropped from the
+         * page cache, so many imports on a node do not fill memory with it.
+         */
+        class ImportReader_ {
+            public:
+                struct Block {
+                    unique_ptr<char[]> buf;
+                    size_t off = 0;     // file offset of buf[0]
+                    size_t len = 0;
+                };
+
+                ImportReader_(const string& fn, size_t block_bytes, size_t nbufs = 3)
+                        : fn_(fn), block_bytes_(block_bytes) {
+                    fd_ = open(fn.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fd_ < 0) throw system_error(errno, generic_category(), "import_db: cannot open " + fn);
+                    struct stat st;
+                    if (fstat(fd_, &st) != 0) {
+                        int err = errno;
+                        close(fd_);
+                        throw system_error(err, generic_category(), "import_db: cannot stat " + fn);
+                    }
+                    size_ = (size_t)st.st_size;
+                    posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+                    for (size_t i = 0; i < nbufs; ++i)
+                        free_.push_back(Block {unique_ptr<char[]>(new char[block_bytes_]), 0, 0});
+                }
+
+                ~ImportReader_() {
+                    {
+                        lock_guard<mutex> l {m_};
+                        stop_ = true;
+                    }
+                    cv_.notify_all();
+                    if (th_.joinable()) th_.join();
+                    if (read_s_out_) *read_s_out_ = read_s_;     // DEBUG-IMPORT
+                    close(fd_);
+                }
+
+                size_t size() const { return size_; }
+
+                /** @brief Read exactly n bytes at off (before start() only) */
+                void read_at(size_t off, char* buf, size_t n) { pread_all_(off, buf, n); }
+
+                /** @brief Start reading blocks from file offset off */
+                void start(size_t off) {
+                    next_off_ = off;
+                    th_ = thread([this] { run_(); });
+                }
+
+                /** @brief Wait for the next block; false at the end of the file
+                 *
+                 * Rethrows a read error from the reader thread.
+                 */
+                bool next(Block& b) {
+                    unique_lock<mutex> l {m_};
+                    cv_.wait(l, [&] { return !full_.empty() || done_; });
+                    if (!full_.empty()) {
+                        b = move(full_.front());
+                        full_.pop_front();
+                        return true;
+                    }
+                    if (err_) rethrow_exception(err_);
+                    return false;
+                }
+
+                void give_back(Block&& b) {
+                    if (b.len) posix_fadvise(fd_, (off_t)b.off, (off_t)b.len, POSIX_FADV_DONTNEED);
+                    {
+                        lock_guard<mutex> l {m_};
+                        free_.push_back(move(b));
+                    }
+                    cv_.notify_all();
+                }
+
+                double* read_s_out_ = nullptr;      // DEBUG-IMPORT
+
+            private:
+                void pread_all_(size_t off, char* buf, size_t n) {
+                    while (n > 0) {
+                        ssize_t r = pread(fd_, buf, n, (off_t)off);
+                        if (r < 0) {
+                            if (errno == EINTR) continue;
+                            throw system_error(errno, generic_category(), "import_db: cannot read " + fn_);
+                        }
+                        if (r == 0) throw runtime_error("import_db: " + fn_ + " got shorter while reading it");
+                        buf += r; off += (size_t)r; n -= (size_t)r;
+                    }
+                }
+
+                void run_() {
+                    try {
+                        while (true) {
+                            Block b;
+                            {
+                                unique_lock<mutex> l {m_};
+                                cv_.wait(l, [&] { return stop_ || !free_.empty(); });
+                                if (stop_) return;
+                                b = move(free_.back());
+                                free_.pop_back();
+                            }
+                            if (next_off_ >= size_) {
+                                lock_guard<mutex> l {m_};
+                                done_ = true;
+                                cv_.notify_all();
+                                return;
+                            }
+                            b.off = next_off_;
+                            b.len = min(block_bytes_, size_ - next_off_);
+                            auto t = steady_clock::now();   // DEBUG-IMPORT
+                            pread_all_(b.off, b.buf.get(), b.len);
+                            read_s_ += duration<double>(steady_clock::now() - t).count();  // DEBUG-IMPORT
+                            next_off_ += b.len;
+                            {
+                                lock_guard<mutex> l {m_};
+                                full_.push_back(move(b));
+                                if (next_off_ >= size_) done_ = true;
+                            }
+                            cv_.notify_all();
+                            if (next_off_ >= size_) return;
+                        }
+                    } catch (...) {
+                        lock_guard<mutex> l {m_};
+                        err_ = current_exception();
+                        done_ = true;
+                        cv_.notify_all();
+                    }
+                }
+
+                string fn_;
+                size_t block_bytes_;
+                int fd_ = -1;
+                size_t size_ = 0;
+                size_t next_off_ = 0;      // used by the reader thread only
+                double read_s_ = 0;        // DEBUG-IMPORT (reader thread only)
+
+                mutex m_;
+                condition_variable cv_;
+                deque<Block> full_;
+                vector<Block> free_;
+                bool done_ = false, stop_ = false;
+                exception_ptr err_;
+                thread th_;
+        };
+
+        /** @brief Block size import_db reads files in */
+        static constexpr size_t IMPORT_BLOCK_BYTES = (size_t)128 << 20;
+
         /** @brief Import entries from a file written by export_db
          *
-         * Entries are inserted by the PandoMap straight from the mapped file
-         * (see PandoMapClient::insert_from_buffer), so each value is copied
-         * only once. Entries whose key already exists (or repeats within the
-         * file), or that have no key, go through add_entry as before, so they
-         * are merged the same way.
+         * The file is read in blocks of block_bytes on a separate thread
+         * (ImportReader_), and each block's entries are checked and inserted
+         * while the next blocks are read. New entries are inserted by the
+         * PandoMap straight from the block (see
+         * PandoMapClient::insert_from_buffer), so each value is copied only
+         * once after reading. Entries whose key already exists (or repeats
+         * within the file), or that have no key, go through add_entry as
+         * before, so they are merged the same way and in file order.
          *
-         * The whole file is checked before anything is inserted: every entry
-         * must take exactly the bytes its <entry size> prefix says, and the
-         * last entry must end at the end of the file. A file that fails (for
-         * example, one that was not completely written, so its tail is zeros)
-         * throws runtime_error and leaves the database unchanged.
+         * Every entry must take exactly the bytes its <entry size> prefix
+         * says, and the last entry must end at the end of the file. If not
+         * (for example, a file that was not completely written, so its tail
+         * is zeros), this throws runtime_error. Entries from the blocks before
+         * the bad entry have already been inserted and stay; nothing from the
+         * bad entry's block is inserted. A file smaller than a block is
+         * therefore all or nothing.
          *
          * The new entries skip the virtual add_entry: an override of it is
          * not called for them.
          */
-        void import_db(string import_fn) {
+        void import_db(string import_fn, size_t block_bytes = IMPORT_BLOCK_BYTES) {
             ImportDebug_ dbg {import_fn};   // DEBUG-IMPORT
-            pigo::ROFile in_f {import_fn};
-            const char* const begin = in_f.fp();
-            const char* ser = begin;
-            const char* end = ser + in_f.size();
-            dbg.file_size = in_f.size();    // DEBUG-IMPORT
-            dbg.phase("open");              // DEBUG-IMPORT (mmap + madvise WILLNEED)
-
-            // DEBUG-IMPORT begin
-            if (const char* pre = getenv("PANDO_IMPORT_PREREAD"); pre && *pre && *pre != '0') {
-                volatile unsigned char sink = 0;
-                long page = sysconf(_SC_PAGESIZE);
-                for (const char* q = begin; q < end; q += page) sink = sink + (unsigned char)*q;
-                dbg.phase("preread");
-            }
+            // DEBUG-IMPORT begin: block size override for tuning runs
+            if (const char* mb = getenv("PANDO_IMPORT_BLOCK_MB"); mb && atol(mb) > 0)
+                block_bytes = (size_t)atol(mb) << 20;
+            dbg.block_bytes = block_bytes;
             // DEBUG-IMPORT end
+            if (block_bytes == 0) throw invalid_argument("import_db: block_bytes must be > 0");
+
+            ImportReader_ reader {import_fn, block_bytes};
+            reader.read_s_out_ = &dbg.read_s;   // DEBUG-IMPORT
+            const size_t file_size = reader.size();
+            dbg.file_size = file_size;          // DEBUG-IMPORT
 
             auto bad_file = [&](const string& why) {
                 return runtime_error("import_db: " + import_fn + " is malformed (" + why + ")");
             };
 
-            if ((size_t)(end - ser) < sizeof(size_t)) throw bad_file("no entry count");
-            size_t num_entries = *(const size_t*)ser; ser += sizeof(size_t);
-            // Each entry takes at least its size prefix, so this bounds the
-            // reserve below against a garbage count
-            if (num_entries > (size_t)(end - ser) / sizeof(size_t)) throw bad_file("entry count too large");
+            if (file_size < sizeof(size_t)) throw bad_file("no entry count");
+            size_t num_entries;
+            reader.read_at(0, (char*)&num_entries, sizeof(size_t));
+            // Each entry takes at least its size prefix, so this bounds a
+            // garbage count
+            if (num_entries > (file_size - sizeof(size_t)) / sizeof(size_t))
+                throw bad_file("entry count too large");
+            reader.start(sizeof(size_t));
 
-            // Check every entry before the map reads any of them
-            vector<const char*> entries;
-            entries.reserve(num_entries);
-            for (size_t i = 0; i < num_entries; ++i) {
-                auto bad_entry = [&](const string& why) {
-                    return bad_file("bad entry " + to_string(i) + " of " + to_string(num_entries)
-                            + " at offset " + to_string(ser - begin) + " of " + to_string(end - begin)
-                            + ": " + why);
-                };
-                if ((size_t)(end - ser) < sizeof(size_t)) throw bad_entry("file ends before its size");
-                size_t prefix_size = *(const size_t*)ser; ser += sizeof(size_t);
-                if ((size_t)(end - ser) < prefix_size)
-                    throw bad_entry("size " + to_string(prefix_size) + " runs past the end of the file");
-                size_t entry_size = walk_serialized_entry_(ser, end, [](string_view) {});
+            size_t n_done = 0;          // entries checked so far
+            size_t entry_off = 0;       // file offset of the current entry's size prefix
+            auto bad_entry = [&](const string& why) {
+                return bad_file("bad entry " + to_string(n_done) + " of " + to_string(num_entries)
+                        + " at offset " + to_string(entry_off + sizeof(size_t)) + " of "
+                        + to_string(file_size) + ": " + why);
+            };
+            // Check the entry of prefix_size bytes at p (its prefix is at p - 8)
+            auto check_entry = [&](const char* p, size_t prefix_size) {
+                size_t entry_size = walk_serialized_entry_(p, p + prefix_size, [](string_view) {});
                 if (entry_size == 0)
-                    throw bad_entry("its lengths run past the end of the file (size "
-                            + to_string(prefix_size) + ")");
+                    throw bad_entry("its contents do not fit in its size " + to_string(prefix_size));
                 if (entry_size != prefix_size)
                     throw bad_entry("it takes " + to_string(entry_size) + " bytes but its size says "
                             + to_string(prefix_size));
-                entries.push_back(ser);
-                ser += entry_size;
-            }
-            if (ser != end)
-                throw bad_file(to_string(end - ser) + " bytes after the last entry");
-            dbg.phase("validate", "entries=" + to_string(entries.size()));    // DEBUG-IMPORT
+            };
+            // Check a size prefix read at entry_off
+            auto check_prefix = [&](size_t prefix_size) {
+                if (file_size - (entry_off + sizeof(size_t)) < prefix_size)
+                    throw bad_entry("size " + to_string(prefix_size) + " runs past the end of the file");
+            };
 
+            // An entry that straddles blocks is assembled here, prefix included
+            vector<char> carry;
+            size_t carry_need = 0;      // 0: no entry is being assembled
+
+            vector<const char*> batch;
+            vector<vector<char>> batch_owned;   // assembled entries in batch
+
+            ImportReader_::Block b;
+            while (true) {
+                auto t_wait = steady_clock::now();              // DEBUG-IMPORT
+                bool got = reader.next(b);
+                dbg.wait_s += ImportDebug_::since_(t_wait);     // DEBUG-IMPORT
+                if (!got) break;
+                ++dbg.blocks;                                    // DEBUG-IMPORT
+                auto t_parse = steady_clock::now();             // DEBUG-IMPORT
+
+                const char* p = b.buf.get();
+                const char* bend = p + b.len;
+                while (p < bend) {
+                    if (carry_need) {
+                        size_t take = min((size_t)(bend - p), carry_need - carry.size());
+                        carry.insert(carry.end(), p, p + take);
+                        p += take;
+                        if (carry.size() < carry_need) continue;
+                        if (carry_need == sizeof(size_t)) {
+                            // Only the prefix was missing: now the entry's size is known
+                            size_t prefix_size = *(const size_t*)carry.data();
+                            check_prefix(prefix_size);
+                            carry_need = sizeof(size_t) + prefix_size;
+                            if (carry.size() < carry_need) continue;
+                        }
+                        const char* e = carry.data() + sizeof(size_t);
+                        check_entry(e, carry_need - sizeof(size_t));
+                        batch_owned.push_back(move(carry));
+                        batch.push_back(batch_owned.back().data() + sizeof(size_t));
+                        carry = vector<char>();
+                        carry_need = 0;
+                        ++n_done;
+                        continue;
+                    }
+
+                    entry_off = b.off + (size_t)(p - b.buf.get());
+                    if (n_done == num_entries)
+                        throw bad_file(to_string(file_size - entry_off) + " bytes after the last entry");
+
+                    if ((size_t)(bend - p) < sizeof(size_t)) {
+                        // The prefix itself straddles blocks
+                        carry_need = sizeof(size_t);
+                        continue;
+                    }
+                    size_t prefix_size = *(const size_t*)p;
+                    check_prefix(prefix_size);
+                    if ((size_t)(bend - p) - sizeof(size_t) >= prefix_size) {
+                        check_entry(p + sizeof(size_t), prefix_size);
+                        batch.push_back(p + sizeof(size_t));
+                        p += sizeof(size_t) + prefix_size;
+                        ++n_done;
+                    } else {
+                        // Assemble it from this and the following blocks. It
+                        // grows only as bytes arrive, so a garbage size does
+                        // not allocate it all up front
+                        carry_need = sizeof(size_t) + prefix_size;
+                        carry.reserve(min(carry_need, 2*block_bytes));
+                    }
+                }
+                dbg.parse_s += ImportDebug_::since_(t_parse);   // DEBUG-IMPORT
+
+                import_batch_(batch, dbg);
+                dbg.entries += batch.size();                    // DEBUG-IMPORT
+                batch.clear();
+                batch_owned.clear();
+                reader.give_back(move(b));
+            }
+
+            if (carry_need) {
+                if (carry_need == sizeof(size_t)) throw bad_entry("file ends before its size");
+                throw bad_entry("file ends partway through it");
+            }
+            if (n_done < num_entries) {
+                entry_off = file_size - sizeof(size_t);
+                throw bad_file("file ends after " + to_string(n_done) + " of "
+                        + to_string(num_entries) + " entries");
+            }
+        }
+
+    private:
+        /** @brief Insert checked entries (pointers to serialized entries,
+         * each with its size prefix just before it), in order */
+        void import_batch_(const vector<const char*>& entries, ImportDebug_& dbg) {
             if (entries.empty()) return;
 
+            auto t_insert = steady_clock::now();                // DEBUG-IMPORT
             vector<size_t> skipped = db_.insert_from_buffer(entries.data(), entries.size());
-            dbg.phase("map_insert", "skipped=" + to_string(skipped.size()));  // DEBUG-IMPORT
-            double dbg_merge_s = 0;         // DEBUG-IMPORT
+            dbg.insert_s += ImportDebug_::since_(t_insert);     // DEBUG-IMPORT
+            auto t_post = steady_clock::now();                  // DEBUG-IMPORT
 
             // In file order, so repeated keys merge in the same order as
             // adding the entries one at a time would
@@ -1822,7 +2072,7 @@ class SeqDB {
                     auto dbg_t = steady_clock::now();   // DEBUG-IMPORT
                     DBEntry<> e(p);
                     add_entry(move(e));
-                    dbg_merge_s += duration<double>(steady_clock::now() - dbg_t).count();  // DEBUG-IMPORT
+                    dbg.merge_s += ImportDebug_::since_(dbg_t);     // DEBUG-IMPORT
                     continue;
                 }
 
@@ -1830,17 +2080,18 @@ class SeqDB {
                 // does for a new key
                 dbkey_t key = *(const dbkey_t*)p;
                 handle_subscriptions(key);
-                walk_serialized_entry_(p, end, [&](string_view tag) {
+                size_t entry_size = *(const size_t*)(p - sizeof(size_t));
+                walk_serialized_entry_(p, p + entry_size, [&](string_view tag) {
                     auto it = entries_by_tag_.find(tag);
                     if (it == entries_by_tag_.end())
                         it = entries_by_tag_.emplace(string{tag}, set<dbkey_t>{}).first;
                     it->second.insert(key);
                 });
             }
-            // DEBUG-IMPORT: wall here includes merge_s spent in add_entry for skipped entries
-            dbg.phase("tags_subs", "merge_s=" + to_string(dbg_merge_s));
+            dbg.post_s += ImportDebug_::since_(t_post);         // DEBUG-IMPORT
         }
 
+    public:
         void deserialize_and_add_entries(const char* ser) {
             size_t num_entries = *(const size_t*)ser; ser += sizeof(size_t);
 

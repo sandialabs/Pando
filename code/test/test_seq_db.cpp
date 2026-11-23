@@ -1246,15 +1246,31 @@ TEST(import_malformed_file) {
             ofstream out {fn, ios::binary};
             out.write(bytes.data(), bytes.size());
         }
-        SeqDB db;
-        bool threw = false;
-        try {
-            db.import_db(fn);
-        } catch (runtime_error&) {
-            threw = true;
+        // The file fits in one block, so nothing from it is inserted
+        bool ok;
+        {
+            SeqDB db;
+            bool threw = false;
+            try {
+                db.import_db(fn);
+            } catch (runtime_error&) {
+                threw = true;
+            }
+            ok = threw && db.size() == 0;
         }
-        // Nothing is inserted from a file that fails the check
-        return threw && db.size() == 0;
+        // Read in small blocks (entries and prefixes straddling blocks), it
+        // must still be caught
+        for (size_t block : {1, 3, 8, 13, 64}) {
+            SeqDB db;
+            bool threw = false;
+            try {
+                db.import_db(fn, block);
+            } catch (runtime_error&) {
+                threw = true;
+            }
+            ok = ok && threw;
+        }
+        return ok;
     };
 
     // Truncated in the middle of the last entry
@@ -1298,6 +1314,112 @@ TEST(import_malformed_file) {
         EQ(import_bytes(bad), true);
     }
 
+    remove(fn.c_str());
+
+    TEST_PASS
+}
+
+TEST(import_block_sizes) {
+    // The same file read in blocks of any size (so entries, and their size
+    // prefixes, straddle blocks; some entries span many blocks) imports the
+    // same as adding each entry with add_entry
+    const string fn = "exported_blocks";
+    dbkey_t k1 {1,1,1}, k2 {2,2,2}, k3 {3,3,3}, k4 {4,4,4};
+    const string big(5000, 'v');
+
+    auto file_entries = [&]() {
+        vector<DBEntry<>> v;
+        v.push_back(make_entry(k1, "foo", {"x"}));
+        v.push_back(make_entry(k2, "file k2", {"y", "yy"}));
+        v.push_back(make_entry(k3, big, {"big", string(300, 't')}));
+        v.push_back(make_entry(k1, "bar", {"z"}));
+        v.push_back(make_entry(k4, "", {}));
+        v.push_back(make_entry(k3, "more", {}));
+        return v;
+    };
+    auto entries = file_entries();
+    write_import_file(fn, entries);
+
+    SeqDB expected;
+    expected.add_entry(make_entry(k2, "pre k2", {"p"}));
+    for (auto& e : file_entries()) expected.add_entry(move(e));
+    auto want = expected.entries();
+
+    for (size_t block : {(size_t)1, (size_t)2, (size_t)7, (size_t)8, (size_t)9, (size_t)31,
+                         (size_t)100, (size_t)4096, (size_t)6000, SeqDB::IMPORT_BLOCK_BYTES}) {
+        SeqDB db;
+        db.add_entry(make_entry(k2, "pre k2", {"p"}));
+        db.import_db(fn, block);
+
+        EQ(db.size(), expected.size());
+        auto got = db.entries();
+        for (dbkey_t k : {k1, k2, k3, k4}) {
+            EQ(got.count(k), 1);
+            EQ(string(got[k].value()) == string(want[k].value()), true);
+            EQ(got[k].tags() == want[k].tags(), true);
+            for (auto& tag : want[k].tags())
+                EQ(db.get_entry_by_tags(set<string>{tag}).count(k), 1);
+        }
+        db.stage_close();
+    }
+    remove(fn.c_str());
+
+    TEST_PASS
+}
+
+TEST(import_bad_tail_keeps_earlier_blocks) {
+    // A file whose data stops partway (zeros from the third entry on): the
+    // import throws, and entries from the blocks before the bad entry have
+    // been inserted (they are not rolled back)
+    const string fn = "exported_bad_tail";
+    vector<DBEntry<>> entries;
+    entries.push_back(make_entry({1,1,1}, "first", {"a"}));
+    entries.push_back(make_entry({2,2,2}, "second", {"b"}));
+    entries.push_back(make_entry({3,3,3}, "third", {"c"}));
+    write_import_file(fn, entries);
+
+    vector<char> bytes;
+    {
+        ifstream in {fn, ios::binary};
+        bytes.assign(istreambuf_iterator<char>(in), istreambuf_iterator<char>());
+    }
+    size_t third = sizeof(size_t);
+    for (int i = 0; i < 2; ++i) third += sizeof(size_t) + *(size_t*)(bytes.data() + third);
+    fill(bytes.begin() + third, bytes.end(), 0);
+    {
+        ofstream out {fn, ios::binary};
+        out.write(bytes.data(), bytes.size());
+    }
+
+    // Blocks of 1 byte: each entry is inserted with the block it ends in, so
+    // both good entries are in before the zeros are reached
+    {
+        SeqDB db;
+        bool threw = false;
+        try {
+            db.import_db(fn, 1);
+        } catch (runtime_error&) {
+            threw = true;
+        }
+        EQ(threw, true);
+        EQ(db.size(), 2);
+        EQ((db.get_entry_by_tags(set<string>{"a"}) == (set<dbkey_t>{dbkey_t{1,1,1}})), true);
+        EQ((db.get_entry_by_tags(set<string>{"b"}) == (set<dbkey_t>{dbkey_t{2,2,2}})), true);
+        db.stage_close();
+    }
+
+    // The whole file in one block: nothing is inserted
+    {
+        SeqDB db;
+        bool threw = false;
+        try {
+            db.import_db(fn);
+        } catch (runtime_error&) {
+            threw = true;
+        }
+        EQ(threw, true);
+        EQ(db.size(), 0);
+    }
     remove(fn.c_str());
 
     TEST_PASS
@@ -2547,6 +2669,8 @@ TESTS_BEGIN
     RUN_TEST(import_merges_like_add_entry)
     RUN_TEST(import_handles_subscriptions)
     RUN_TEST(import_malformed_file)
+    RUN_TEST(import_block_sizes)
+    RUN_TEST(import_bad_tail_keeps_earlier_blocks)
     RUN_TEST(max_filters_per_stage)
     RUN_TEST(max_filters_per_stage_rejects_zero)
     RUN_TEST(max_filters_per_stage_default_unlimited)
