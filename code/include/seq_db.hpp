@@ -20,6 +20,13 @@
 #include <functional>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "absl/container/flat_hash_map.h"
 #include "Python.h"
 
@@ -1635,14 +1642,362 @@ class SeqDB {
             serialize_entries(data_ptr, keys);
         }
 
-        void import_db(string import_fn) {
-            pigo::ROFile in_f {import_fn};
-            const char* data_ptr = in_f.fp();
+        /** @brief Walk one serialized DBEntry starting at p, by its own lengths
+         *
+         * Calls f(string_view) for each tag. Checks every length against end,
+         * so it is safe on untrusted data.
+         *
+         * @return the number of bytes the entry takes, or 0 if its lengths run
+         *         past end (an entry always takes more than 0 bytes)
+         */
+        template<typename F>
+        static size_t walk_serialized_entry_(const char* p, const char* end, F&& f) {
+            const char* start = p;
+            auto read_len = [&](size_t& len) {
+                if ((size_t)(end - p) < sizeof(size_t)) return false;
+                len = *(const size_t*)p; p += sizeof(size_t);
+                return true;
+            };
 
-            deserialize_and_add_entries(data_ptr);
+            if ((size_t)(end - p) < sizeof(dbkey_t)) return 0;
+            p += sizeof(dbkey_t);
 
+            size_t val_size;
+            if (!read_len(val_size) || (size_t)(end - p) < val_size) return 0;
+            p += val_size;
+
+            size_t ntags;
+            if (!read_len(ntags)) return 0;
+            for (; ntags > 0; --ntags) {
+                size_t tag_size;
+                if (!read_len(tag_size) || (size_t)(end - p) < tag_size) return 0;
+                f(string_view {p, tag_size});
+                p += tag_size;
+            }
+            return (size_t)(p - start);
         }
 
+        /** @brief Reads a file front to back in blocks on its own thread
+         *
+         * The import thread takes filled blocks with next() and hands each one
+         * back with give_back() once nothing points into it, so reading the
+         * next blocks overlaps with inserting the current one. Memory is
+         * bounded by nbufs blocks. Blocks already used are dropped from the
+         * page cache, so many imports on a node do not fill memory with it.
+         */
+        class ImportReader_ {
+            public:
+                struct Block {
+                    unique_ptr<char[]> buf;
+                    size_t off = 0;     // file offset of buf[0]
+                    size_t len = 0;
+                };
+
+                ImportReader_(const string& fn, size_t block_bytes, size_t nbufs = 3)
+                        : fn_(fn), block_bytes_(block_bytes) {
+                    fd_ = open(fn.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fd_ < 0) throw system_error(errno, generic_category(), "import_db: cannot open " + fn);
+                    struct stat st;
+                    if (fstat(fd_, &st) != 0) {
+                        int err = errno;
+                        close(fd_);
+                        throw system_error(err, generic_category(), "import_db: cannot stat " + fn);
+                    }
+                    size_ = (size_t)st.st_size;
+                    posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+                    for (size_t i = 0; i < nbufs; ++i)
+                        free_.push_back(Block {unique_ptr<char[]>(new char[block_bytes_]), 0, 0});
+                }
+
+                ~ImportReader_() {
+                    {
+                        lock_guard<mutex> l {m_};
+                        stop_ = true;
+                    }
+                    cv_.notify_all();
+                    if (th_.joinable()) th_.join();
+                    close(fd_);
+                }
+
+                size_t size() const { return size_; }
+
+                /** @brief Read exactly n bytes at off (before start() only) */
+                void read_at(size_t off, char* buf, size_t n) { pread_all_(off, buf, n); }
+
+                /** @brief Start reading blocks from file offset off */
+                void start(size_t off) {
+                    next_off_ = off;
+                    th_ = thread([this] { run_(); });
+                }
+
+                /** @brief Wait for the next block; false at the end of the file
+                 *
+                 * Rethrows a read error from the reader thread.
+                 */
+                bool next(Block& b) {
+                    unique_lock<mutex> l {m_};
+                    cv_.wait(l, [&] { return !full_.empty() || done_; });
+                    if (!full_.empty()) {
+                        b = move(full_.front());
+                        full_.pop_front();
+                        return true;
+                    }
+                    if (err_) rethrow_exception(err_);
+                    return false;
+                }
+
+                void give_back(Block&& b) {
+                    if (b.len) posix_fadvise(fd_, (off_t)b.off, (off_t)b.len, POSIX_FADV_DONTNEED);
+                    {
+                        lock_guard<mutex> l {m_};
+                        free_.push_back(move(b));
+                    }
+                    cv_.notify_all();
+                }
+
+
+            private:
+                void pread_all_(size_t off, char* buf, size_t n) {
+                    while (n > 0) {
+                        ssize_t r = pread(fd_, buf, n, (off_t)off);
+                        if (r < 0) {
+                            if (errno == EINTR) continue;
+                            throw system_error(errno, generic_category(), "import_db: cannot read " + fn_);
+                        }
+                        if (r == 0) throw runtime_error("import_db: " + fn_ + " got shorter while reading it");
+                        buf += r; off += (size_t)r; n -= (size_t)r;
+                    }
+                }
+
+                void run_() {
+                    try {
+                        while (true) {
+                            Block b;
+                            {
+                                unique_lock<mutex> l {m_};
+                                cv_.wait(l, [&] { return stop_ || !free_.empty(); });
+                                if (stop_) return;
+                                b = move(free_.back());
+                                free_.pop_back();
+                            }
+                            if (next_off_ >= size_) {
+                                lock_guard<mutex> l {m_};
+                                done_ = true;
+                                cv_.notify_all();
+                                return;
+                            }
+                            b.off = next_off_;
+                            b.len = min(block_bytes_, size_ - next_off_);
+                            pread_all_(b.off, b.buf.get(), b.len);
+                            next_off_ += b.len;
+                            {
+                                lock_guard<mutex> l {m_};
+                                full_.push_back(move(b));
+                                if (next_off_ >= size_) done_ = true;
+                            }
+                            cv_.notify_all();
+                            if (next_off_ >= size_) return;
+                        }
+                    } catch (...) {
+                        lock_guard<mutex> l {m_};
+                        err_ = current_exception();
+                        done_ = true;
+                        cv_.notify_all();
+                    }
+                }
+
+                string fn_;
+                size_t block_bytes_;
+                int fd_ = -1;
+                size_t size_ = 0;
+                size_t next_off_ = 0;      // used by the reader thread only
+
+                mutex m_;
+                condition_variable cv_;
+                deque<Block> full_;
+                vector<Block> free_;
+                bool done_ = false, stop_ = false;
+                exception_ptr err_;
+                thread th_;
+        };
+
+        /** @brief Block size import_db reads files in */
+        static constexpr size_t IMPORT_BLOCK_BYTES = (size_t)128 << 20;
+
+        /** @brief Import entries from a file written by export_db
+         *
+         * The file is read in blocks of block_bytes on a separate thread
+         * (ImportReader_), and each block's entries are checked and inserted
+         * while the next blocks are read. New entries are inserted by the
+         * PandoMap straight from the block (see
+         * PandoMapClient::insert_from_buffer), so each value is copied only
+         * once after reading. Entries whose key already exists (or repeats
+         * within the file), or that have no key, go through add_entry as
+         * before, so they are merged the same way and in file order.
+         *
+         * Every entry must take exactly the bytes its <entry size> prefix
+         * says, and the last entry must end at the end of the file. If not
+         * (for example, a file that was not completely written, so its tail
+         * is zeros), this throws runtime_error. Entries from the blocks before
+         * the bad entry have already been inserted and stay; nothing from the
+         * bad entry's block is inserted. A file smaller than a block is
+         * therefore all or nothing.
+         *
+         * The new entries skip the virtual add_entry: an override of it is
+         * not called for them.
+         */
+        void import_db(string import_fn, size_t block_bytes = IMPORT_BLOCK_BYTES) {
+            if (block_bytes == 0) throw invalid_argument("import_db: block_bytes must be > 0");
+
+            ImportReader_ reader {import_fn, block_bytes};
+            const size_t file_size = reader.size();
+
+            auto bad_file = [&](const string& why) {
+                return runtime_error("import_db: " + import_fn + " is malformed (" + why + ")");
+            };
+
+            if (file_size < sizeof(size_t)) throw bad_file("no entry count");
+            size_t num_entries;
+            reader.read_at(0, (char*)&num_entries, sizeof(size_t));
+            // Each entry takes at least its size prefix, so this bounds a
+            // garbage count
+            if (num_entries > (file_size - sizeof(size_t)) / sizeof(size_t))
+                throw bad_file("entry count too large");
+            reader.start(sizeof(size_t));
+
+            size_t n_done = 0;          // entries checked so far
+            size_t entry_off = 0;       // file offset of the current entry's size prefix
+            auto bad_entry = [&](const string& why) {
+                return bad_file("bad entry " + to_string(n_done) + " of " + to_string(num_entries)
+                        + " at offset " + to_string(entry_off + sizeof(size_t)) + " of "
+                        + to_string(file_size) + ": " + why);
+            };
+            // Check the entry of prefix_size bytes at p (its prefix is at p - 8)
+            auto check_entry = [&](const char* p, size_t prefix_size) {
+                size_t entry_size = walk_serialized_entry_(p, p + prefix_size, [](string_view) {});
+                if (entry_size == 0)
+                    throw bad_entry("its contents do not fit in its size " + to_string(prefix_size));
+                if (entry_size != prefix_size)
+                    throw bad_entry("it takes " + to_string(entry_size) + " bytes but its size says "
+                            + to_string(prefix_size));
+            };
+            // Check a size prefix read at entry_off
+            auto check_prefix = [&](size_t prefix_size) {
+                if (file_size - (entry_off + sizeof(size_t)) < prefix_size)
+                    throw bad_entry("size " + to_string(prefix_size) + " runs past the end of the file");
+            };
+
+            // An entry that straddles blocks is assembled here, prefix included
+            vector<char> carry;
+            size_t carry_need = 0;      // 0: no entry is being assembled
+
+            vector<const char*> batch;
+            vector<vector<char>> batch_owned;   // assembled entries in batch
+
+            ImportReader_::Block b;
+            while (reader.next(b)) {
+                const char* p = b.buf.get();
+                const char* bend = p + b.len;
+                while (p < bend) {
+                    if (carry_need) {
+                        size_t take = min((size_t)(bend - p), carry_need - carry.size());
+                        carry.insert(carry.end(), p, p + take);
+                        p += take;
+                        if (carry.size() < carry_need) continue;
+                        if (carry_need == sizeof(size_t)) {
+                            // Only the prefix was missing: now the entry's size is known
+                            size_t prefix_size = *(const size_t*)carry.data();
+                            check_prefix(prefix_size);
+                            carry_need = sizeof(size_t) + prefix_size;
+                            if (carry.size() < carry_need) continue;
+                        }
+                        const char* e = carry.data() + sizeof(size_t);
+                        check_entry(e, carry_need - sizeof(size_t));
+                        batch_owned.push_back(move(carry));
+                        batch.push_back(batch_owned.back().data() + sizeof(size_t));
+                        carry = vector<char>();
+                        carry_need = 0;
+                        ++n_done;
+                        continue;
+                    }
+
+                    entry_off = b.off + (size_t)(p - b.buf.get());
+                    if (n_done == num_entries)
+                        throw bad_file(to_string(file_size - entry_off) + " bytes after the last entry");
+
+                    if ((size_t)(bend - p) < sizeof(size_t)) {
+                        // The prefix itself straddles blocks
+                        carry_need = sizeof(size_t);
+                        continue;
+                    }
+                    size_t prefix_size = *(const size_t*)p;
+                    check_prefix(prefix_size);
+                    if ((size_t)(bend - p) - sizeof(size_t) >= prefix_size) {
+                        check_entry(p + sizeof(size_t), prefix_size);
+                        batch.push_back(p + sizeof(size_t));
+                        p += sizeof(size_t) + prefix_size;
+                        ++n_done;
+                    } else {
+                        // Assemble it from this and the following blocks. It
+                        // grows only as bytes arrive, so a garbage size does
+                        // not allocate it all up front
+                        carry_need = sizeof(size_t) + prefix_size;
+                        carry.reserve(min(carry_need, 2*block_bytes));
+                    }
+                }
+
+                import_batch_(batch);
+                batch.clear();
+                batch_owned.clear();
+                reader.give_back(move(b));
+            }
+
+            if (carry_need) {
+                if (carry_need == sizeof(size_t)) throw bad_entry("file ends before its size");
+                throw bad_entry("file ends partway through it");
+            }
+            if (n_done < num_entries) {
+                entry_off = file_size - sizeof(size_t);
+                throw bad_file("file ends after " + to_string(n_done) + " of "
+                        + to_string(num_entries) + " entries");
+            }
+        }
+
+    private:
+        /** @brief Insert checked entries (pointers to serialized entries,
+         * each with its size prefix just before it), in order */
+        void import_batch_(const vector<const char*>& entries) {
+            if (entries.empty()) return;
+
+            vector<size_t> skipped = db_.insert_from_buffer(entries.data(), entries.size());
+
+            // In file order, so repeated keys merge in the same order as
+            // adding the entries one at a time would
+            size_t next_skipped = 0;
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const char* p = entries[i];
+                if (next_skipped < skipped.size() && skipped[next_skipped] == i) {
+                    ++next_skipped;
+                    DBEntry<> e(p);
+                    add_entry(move(e));
+                    continue;
+                }
+
+                // Inserted by the map: do the rest of what prepare_to_add_entry
+                // does for a new key
+                dbkey_t key = *(const dbkey_t*)p;
+                handle_subscriptions(key);
+                size_t entry_size = *(const size_t*)(p - sizeof(size_t));
+                walk_serialized_entry_(p, p + entry_size, [&](string_view tag) {
+                    auto it = entries_by_tag_.find(tag);
+                    if (it == entries_by_tag_.end())
+                        it = entries_by_tag_.emplace(string{tag}, set<dbkey_t>{}).first;
+                    it->second.insert(key);
+                });
+            }
+        }
+
+    public:
         void deserialize_and_add_entries(const char* ser) {
             size_t num_entries = *(const size_t*)ser; ser += sizeof(size_t);
 
