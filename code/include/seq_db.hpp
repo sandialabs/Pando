@@ -27,8 +27,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/resource.h>   // DEBUG-IMPORT
-#include <sstream>          // DEBUG-IMPORT
 #include "absl/container/flat_hash_map.h"
 #include "Python.h"
 
@@ -1679,70 +1677,6 @@ class SeqDB {
             return (size_t)(p - start);
         }
 
-        // DEBUG-IMPORT begin: timing for import_db; remove before merging
-        //
-        // Prints to stderr, one line each (lines are written whole, so lines
-        // from different processes sharing the job's stderr do not mix):
-        //   [import-debug] host pid file phase=start epoch=<s>
-        //   [import-debug] host pid file phase=total wall=<s> cpu=<s> size=<bytes> MB/s=<size/wall>
-        //       block_mb=<n> blocks=<n> entries=<n> read_s=<s> wait_s=<s> parse_s=<s>
-        //       insert_s=<s> post_s=<s> merge_s=<s> epoch=<s> [(threw)]
-        // read_s: time the reader thread spent in pread (the filesystem)
-        // wait_s: time the import thread waited for the reader to fill a block
-        //         (if this is most of wall, the import is bound by reading)
-        // parse_s: checking entries; insert_s: PandoMap inserting new keys;
-        // post_s: tag index + subscriptions + merges (merge_s is the merge part)
-        struct ImportDebug_ {
-            string tag;
-            size_t file_size = 0, block_bytes = 0, blocks = 0, entries = 0;
-            double read_s = 0, wait_s = 0, parse_s = 0, insert_s = 0, post_s = 0, merge_s = 0;
-            steady_clock::time_point t_start;
-            double cpu0 = 0;
-
-            static double cpu_() {
-                rusage ru;
-                getrusage(RUSAGE_SELF, &ru);
-                return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec*1e-6
-                     + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec*1e-6;
-            }
-            static double epoch_() {
-                return duration<double>(system_clock::now().time_since_epoch()).count();
-            }
-            static double since_(steady_clock::time_point t) {
-                return duration<double>(steady_clock::now() - t).count();
-            }
-            static void emit_(const string& line) {
-                string l = line + "\n";
-                fwrite(l.data(), 1, l.size(), stderr);
-                fflush(stderr);
-            }
-
-            explicit ImportDebug_(const string& fn) {
-                char host[256] = {0};
-                gethostname(host, sizeof(host) - 1);
-                tag = string("[import-debug] ") + host + " pid=" + to_string(getpid()) + " " + fn;
-                t_start = steady_clock::now();
-                cpu0 = cpu_();
-                emit_(tag + " phase=start epoch=" + to_string(epoch_()));
-            }
-
-            ~ImportDebug_() {
-                double wall = since_(t_start);
-                ostringstream o;
-                o << tag << " phase=total wall=" << wall << " cpu=" << (cpu_() - cpu0)
-                  << " size=" << file_size
-                  << " MB/s=" << (wall > 0 ? file_size / 1e6 / wall : 0.0)
-                  << " block_mb=" << block_bytes / (1 << 20) << " blocks=" << blocks
-                  << " entries=" << entries
-                  << " read_s=" << read_s << " wait_s=" << wait_s << " parse_s=" << parse_s
-                  << " insert_s=" << insert_s << " post_s=" << post_s << " merge_s=" << merge_s
-                  << " epoch=" << to_string(epoch_())
-                  << (std::uncaught_exceptions() ? " (threw)" : "");
-                emit_(o.str());
-            }
-        };
-        // DEBUG-IMPORT end
-
         /** @brief Reads a file front to back in blocks on its own thread
          *
          * The import thread takes filled blocks with next() and hands each one
@@ -1782,7 +1716,6 @@ class SeqDB {
                     }
                     cv_.notify_all();
                     if (th_.joinable()) th_.join();
-                    if (read_s_out_) *read_s_out_ = read_s_;     // DEBUG-IMPORT
                     close(fd_);
                 }
 
@@ -1822,7 +1755,6 @@ class SeqDB {
                     cv_.notify_all();
                 }
 
-                double* read_s_out_ = nullptr;      // DEBUG-IMPORT
 
             private:
                 void pread_all_(size_t off, char* buf, size_t n) {
@@ -1856,9 +1788,7 @@ class SeqDB {
                             }
                             b.off = next_off_;
                             b.len = min(block_bytes_, size_ - next_off_);
-                            auto t = steady_clock::now();   // DEBUG-IMPORT
                             pread_all_(b.off, b.buf.get(), b.len);
-                            read_s_ += duration<double>(steady_clock::now() - t).count();  // DEBUG-IMPORT
                             next_off_ += b.len;
                             {
                                 lock_guard<mutex> l {m_};
@@ -1881,7 +1811,6 @@ class SeqDB {
                 int fd_ = -1;
                 size_t size_ = 0;
                 size_t next_off_ = 0;      // used by the reader thread only
-                double read_s_ = 0;        // DEBUG-IMPORT (reader thread only)
 
                 mutex m_;
                 condition_variable cv_;
@@ -1918,18 +1847,10 @@ class SeqDB {
          * not called for them.
          */
         void import_db(string import_fn, size_t block_bytes = IMPORT_BLOCK_BYTES) {
-            ImportDebug_ dbg {import_fn};   // DEBUG-IMPORT
-            // DEBUG-IMPORT begin: block size override for tuning runs
-            if (const char* mb = getenv("PANDO_IMPORT_BLOCK_MB"); mb && atol(mb) > 0)
-                block_bytes = (size_t)atol(mb) << 20;
-            dbg.block_bytes = block_bytes;
-            // DEBUG-IMPORT end
             if (block_bytes == 0) throw invalid_argument("import_db: block_bytes must be > 0");
 
             ImportReader_ reader {import_fn, block_bytes};
-            reader.read_s_out_ = &dbg.read_s;   // DEBUG-IMPORT
             const size_t file_size = reader.size();
-            dbg.file_size = file_size;          // DEBUG-IMPORT
 
             auto bad_file = [&](const string& why) {
                 return runtime_error("import_db: " + import_fn + " is malformed (" + why + ")");
@@ -1974,14 +1895,7 @@ class SeqDB {
             vector<vector<char>> batch_owned;   // assembled entries in batch
 
             ImportReader_::Block b;
-            while (true) {
-                auto t_wait = steady_clock::now();              // DEBUG-IMPORT
-                bool got = reader.next(b);
-                dbg.wait_s += ImportDebug_::since_(t_wait);     // DEBUG-IMPORT
-                if (!got) break;
-                ++dbg.blocks;                                    // DEBUG-IMPORT
-                auto t_parse = steady_clock::now();             // DEBUG-IMPORT
-
+            while (reader.next(b)) {
                 const char* p = b.buf.get();
                 const char* bend = p + b.len;
                 while (p < bend) {
@@ -2031,10 +1945,8 @@ class SeqDB {
                         carry.reserve(min(carry_need, 2*block_bytes));
                     }
                 }
-                dbg.parse_s += ImportDebug_::since_(t_parse);   // DEBUG-IMPORT
 
-                import_batch_(batch, dbg);
-                dbg.entries += batch.size();                    // DEBUG-IMPORT
+                import_batch_(batch);
                 batch.clear();
                 batch_owned.clear();
                 reader.give_back(move(b));
@@ -2054,13 +1966,10 @@ class SeqDB {
     private:
         /** @brief Insert checked entries (pointers to serialized entries,
          * each with its size prefix just before it), in order */
-        void import_batch_(const vector<const char*>& entries, ImportDebug_& dbg) {
+        void import_batch_(const vector<const char*>& entries) {
             if (entries.empty()) return;
 
-            auto t_insert = steady_clock::now();                // DEBUG-IMPORT
             vector<size_t> skipped = db_.insert_from_buffer(entries.data(), entries.size());
-            dbg.insert_s += ImportDebug_::since_(t_insert);     // DEBUG-IMPORT
-            auto t_post = steady_clock::now();                  // DEBUG-IMPORT
 
             // In file order, so repeated keys merge in the same order as
             // adding the entries one at a time would
@@ -2069,10 +1978,8 @@ class SeqDB {
                 const char* p = entries[i];
                 if (next_skipped < skipped.size() && skipped[next_skipped] == i) {
                     ++next_skipped;
-                    auto dbg_t = steady_clock::now();   // DEBUG-IMPORT
                     DBEntry<> e(p);
                     add_entry(move(e));
-                    dbg.merge_s += ImportDebug_::since_(dbg_t);     // DEBUG-IMPORT
                     continue;
                 }
 
@@ -2088,7 +1995,6 @@ class SeqDB {
                     it->second.insert(key);
                 });
             }
-            dbg.post_s += ImportDebug_::since_(t_post);         // DEBUG-IMPORT
         }
 
     public:
