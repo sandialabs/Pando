@@ -1,0 +1,113 @@
+#!/bin/bash
+
+set -euo pipefail
+
+#####################
+## Node connection information
+
+# Use the same selection logic for mesh discovery and worker startup.
+if [[ -n "${PANDO_BIND_IP_FILE:-}" ]]; then
+    ip=$(awk 'NF {print $1; exit}' "$PANDO_BIND_IP_FILE")
+
+elif [[ -n "${PANDO_INTERFACE:-}" ]]; then
+    ip=$(
+        ip -o -4 addr show dev "$PANDO_INTERFACE" scope global |
+            awk 'NR == 1 {split($4, address, "/"); print address[1]}'
+    )
+
+else
+    node="${SLURMD_NODENAME:-$(hostname)}"
+    lookup_name="${node}${PANDO_HOST_SUFFIX:-}"
+
+    ip=$( getent ahostsv4 "$lookup_name" | awk 'NR == 1 {print $1}')
+fi
+
+if [[ -z "$ip" || "$ip" == *$'\n'* ]]; then
+    echo "Error: could not select a single IP address on $(hostname)." >&2
+    exit 1
+fi
+
+case "$ip" in
+    127.*|0.0.0.0)
+        echo "Error: unusable Pando address '$ip' on $(hostname)." >&2
+        echo "Set PANDO_HOST_SUFFIX, PANDO_INTERFACE, or PANDO_BIND_IP_FILE." >&2
+        exit 1
+        ;;
+esac
+
+# Used by the batch script to discover the mesh-entry address.
+if [[ "${1:-}" == "--print-ip" ]]; then
+    printf '%s\n' "$ip"
+    exit 0
+fi
+
+#####################
+## Application parameters
+
+PANDO_MESH_ENTRY="$1"
+PANDO_PARDB_BIN="$2"
+
+PARDB_ID=$((SLURM_LOCALID * 3))
+
+echo ">>starting pardb on $(hostname)"
+echo "PARDB_ID=$PARDB_ID"
+echo "PANDO_BIND_ADDRESS=$ip,$PARDB_ID"
+
+#####################
+## Container launch
+
+### Scratch directory selection
+for setting in PANDO_SCRATCH PANDO_CSCRATCH; do
+    case "$setting" in
+        PANDO_SCRATCH)  default_dir=/scratch ;;
+        PANDO_CSCRATCH) default_dir=/cscratch ;;
+    esac
+
+    requested_dir="${!setting:-}"
+
+    if [[ -n "$requested_dir" ]]; then
+        # Explicit override: fail rather than silently choose another path.
+        directory="$requested_dir"
+
+        if ! mkdir -p -- "$directory" ||
+            [[ ! -w "$directory" || ! -x "$directory" ]]; then
+            echo "Error: $setting='$directory' is not usable on $(hostname)." >&2
+            exit 1
+        fi
+    else
+        directory="$default_dir"
+
+        if ! mkdir -p -- "$directory" 2>/dev/null ||
+            [[ ! -w "$directory" || ! -x "$directory" ]]; then
+            directory="/tmp${default_dir}"
+            echo "Warning: $default_dir unavailable; using $directory on $(hostname)." >&2
+
+            if ! mkdir -p -- "$directory" ||
+                [[ ! -w "$directory" || ! -x "$directory" ]]; then
+                echo "Error: fallback directory '$directory' is not usable." >&2
+                exit 1
+            fi
+        fi
+    fi
+
+    printf -v "$setting" '%s' "$directory"
+done
+
+scratch="$PANDO_SCRATCH"
+cscratch="$PANDO_CSCRATCH"
+
+bind_args=(
+    -B "$scratch:/scratch"
+    -B "$cscratch:/cscratch"
+)
+
+if [[ -n "${PANDO_EXTRA_BIND:-}" ]]; then
+    bind_args+=(-B "$PANDO_EXTRA_BIND")
+fi
+
+exec "${PANDO_RUNTIME:-singularity}" run \
+    "${bind_args[@]}" \
+    "$PANDO_PARDB_BIN" \
+    "$ip,$PARDB_ID" \
+    "$PANDO_MESH_ENTRY" \
+    -M300

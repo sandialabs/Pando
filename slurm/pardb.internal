@@ -1,8 +1,0 @@
-PANDO_MESH_ENTRY="$1"; shift
-PANDO_PARDB_BIN="$1"; shift
-PANDO_BIND_IP_FILE="$1"; shift
-
-echo ">>starting pardb"
-PARDB_ID=$(($SLURM_LOCALID * 3))
-echo "PARDB_ID=$PARDB_ID"
-singularity run -B /scratch -B /cscratch "$PANDO_PARDB_BIN" "$(cat "$PANDO_BIND_IP_FILE"),$PARDB_ID" "$PANDO_MESH_ENTRY" -M300
