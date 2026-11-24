@@ -178,12 +178,26 @@ pardb_pid=$!
 
 ### Optional analysis launch
 # Ensure Pando is ready before connecting, or implement retries in analysis.py.
-# Assumes analysis.py is in SCRIPT_DIR; bind additional data paths as needed.
+# Assumes analysis.py is in SCRIPT_DIR. The container receives the same
+# scratch, cscratch, and PANDO_EXTRA_BIND mounts as Pando on $node.
+# readarray -d '' analysis_binds < <(
+#     srun --mpi=none --overlap --exact \
+#         --nodes=1 --ntasks=1 --ntasks-per-node=1 \
+#         --cpus-per-task=1 --nodelist="$node" \
+#         bash "$PANDO_INTERNAL" --print-binds
+# )
+#
+# if (( ${#analysis_binds[@]} < 4 )); then
+#     echo "Error: could not determine analysis bind mounts on $node." >&2
+#     exit 1
+# fi
+#
 # srun --mpi=none --overlap --exact --unbuffered \
-#     --nodes=1 --ntasks=1 \
+#     --nodes=1 --ntasks=1 --nodelist="$node" \
 #     --cpus-per-task="$cpus_per_task" \
 #     --cpu-bind=cores \
 #     "$PANDO_RUNTIME" exec \
+#         "${analysis_binds[@]}" \
 #         --bind "$SCRIPT_DIR:/pando-analysis" \
 #         --pwd /pando-analysis \
 #         "$SCRIPT_DIR/../sifs/pando_python.sif" \

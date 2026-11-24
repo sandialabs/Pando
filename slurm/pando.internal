@@ -42,19 +42,7 @@ if [[ "${1:-}" == "--print-ip" ]]; then
 fi
 
 #####################
-## Application parameters
-
-PANDO_MESH_ENTRY="$1"
-PANDO_PARDB_BIN="$2"
-
-PARDB_ID=$((SLURM_LOCALID * 3))
-
-echo ">>starting pardb on $(hostname)"
-echo "PARDB_ID=$PARDB_ID"
-echo "PANDO_BIND_ADDRESS=$ip,$PARDB_ID"
-
-#####################
-## Container launch
+## Container bind mounts
 
 ### Scratch directory selection
 for setting in PANDO_SCRATCH PANDO_CSCRATCH; do
@@ -104,6 +92,28 @@ bind_args=(
 if [[ -n "${PANDO_EXTRA_BIND:-}" ]]; then
     bind_args+=(-B "$PANDO_EXTRA_BIND")
 fi
+
+# Used by the batch script to give other containers the same bind mounts.
+# Prints NUL-delimited runtime arguments.
+if [[ "${1:-}" == "--print-binds" ]]; then
+    printf '%s\0' "${bind_args[@]}"
+    exit 0
+fi
+
+#####################
+## Application parameters
+
+PANDO_MESH_ENTRY="$1"
+PANDO_PARDB_BIN="$2"
+
+PARDB_ID=$((SLURM_LOCALID * 3))
+
+echo ">>starting pardb on $(hostname)"
+echo "PARDB_ID=$PARDB_ID"
+echo "PANDO_BIND_ADDRESS=$ip,$PARDB_ID"
+
+#####################
+## Container launch
 
 exec "${PANDO_RUNTIME:-singularity}" run \
     "${bind_args[@]}" \
